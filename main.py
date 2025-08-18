@@ -1,7 +1,7 @@
-    import requests
+import requests
 import logging
 
-# Setup logging
+# Setup import
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
 # Bybit endpoint for kline data
