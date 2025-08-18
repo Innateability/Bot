@@ -1,7 +1,9 @@
 import requests
 import logging
+import time
+from datetime import datetime, timedelta
 
-# Setup import
+# Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
 # Bybit endpoint for kline data
@@ -47,20 +49,33 @@ def convert_to_heikin_ashi(candles):
 
     return ha_candles
 
-def main():
-    candles = get_1h_candle()
-    ha_candles = convert_to_heikin_ashi(candles)
-    
-    # Last Heikin Ashi candle
-    ha_open, ha_high, ha_low, ha_close = ha_candles[-1]
+def wait_until_next_hour():
+    """Sleep until the start of the next full hour."""
+    now = datetime.utcnow()
+    next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    wait_seconds = (next_hour - now).total_seconds()
+    logging.info(f"Waiting {wait_seconds:.0f} seconds until {next_hour} (UTC)")
+    time.sleep(wait_seconds)
 
-    # Determine color
-    color = "GREEN" if ha_close >= ha_open else "RED"
+def main_loop():
+    while True:
+        candles = get_1h_candle()
+        ha_candles = convert_to_heikin_ashi(candles)
+        
+        # Last Heikin Ashi candle
+        ha_open, ha_high, ha_low, ha_close = ha_candles[-1]
 
-    logging.info(
-        f"HA Candle (1h TRXUSDT) -> Open: {ha_open:.5f}, High: {ha_high:.5f}, "
-        f"Low: {ha_low:.5f}, Close: {ha_close:.5f} | {color}"
-    )
+        # Determine color
+        color = "GREEN" if ha_close >= ha_open else "RED"
+
+        logging.info(
+            f"HA Candle (1h TRXUSDT) -> Open: {ha_open:.5f}, High: {ha_high:.5f}, "
+            f"Low: {ha_low:.5f}, Close: {ha_close:.5f} | {color}"
+        )
+
+        # Wait until next full hour
+        wait_until_next_hour()
 
 if __name__ == "__main__":
-    main()
+    wait_until_next_hour()  # align to the next hour before starting
+    main_loop()
