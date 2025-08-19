@@ -2,156 +2,200 @@ import requests
 import logging
 import time
 from datetime import datetime, timedelta
+from collections import deque
 
+# -------- Logging --------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
+# -------- Config --------
 URL = "https://api.bybit.com/v5/market/kline"
+SYMBOL = "TRXUSDT"            # change if needed
+FIVE_M_HISTORY = 500          # how many 5m HA candles to keep for SL lookback
+TIMEOUT = 15                  # HTTP timeout (seconds)
+RR_EXTRA = 0.0007             # +0.07% buffer
 
-def get_candles(symbol="TRXUSDT", interval="60", limit=200):
+# -------- API / HA helpers --------
+def get_candles(symbol=SYMBOL, interval="60", limit=200):
+    """Fetch candles from Bybit (newest first)."""
     params = {
         "category": "linear",
         "symbol": symbol,
         "interval": interval,
         "limit": limit
     }
-    r = requests.get(URL, params=params, timeout=15)
+    r = requests.get(URL, params=params, timeout=TIMEOUT)
     r.raise_for_status()
     data = r.json()
-    if "result" not in data or "list" not in data["result"] or not data["result"]["list"]:
-        raise RuntimeError(f"Empty kline response for interval {interval}")
-    return data["result"]["list"]
+    if "result" not in data or "list" not in data["result"]:
+        raise RuntimeError(f"Bad response for interval {interval}: {data}")
+    return data["result"]["list"]  # newest first
 
-def convert_to_heikin_ashi(candles):
+def to_heikin_ashi(raw):
     """
-    Input: raw candles (latest first) -> Output: HA tuples (O,H,L,C,color) in chronological order
+    Convert raw candles (newest first) to Heikin Ashi tuples in CHRONO order:
+    (ha_open, ha_high, ha_low, ha_close, color) where color in {"GREEN","RED"}
     """
-    ha_candles = []
-    for i, c in enumerate(reversed(candles)):  # make chronological
-        open_, high, low, close = map(float, c[1:5])
-        ha_close = (open_ + high + low + close) / 4.0
+    ha = []
+    for i, c in enumerate(reversed(raw)):  # chronological
+        o, h, l, cl = map(float, c[1:5])
+        ha_close = (o + h + l + cl) / 4.0
         if i == 0:
-            ha_open = (open_ + close) / 2.0
+            ha_open = (o + cl) / 2.0
         else:
-            prev_open, _, _, prev_close, _ = ha_candles[-1]
-            ha_open = (prev_open + prev_close) / 2.0
-
-        ha_high = max(high, ha_open, ha_close)
-        ha_low = min(low, ha_open, ha_close)
+            p_open, _, _, p_close, _ = ha[-1]
+            ha_open = (p_open + p_close) / 2.0
+        ha_high = max(h, ha_open, ha_close)
+        ha_low  = min(l, ha_open, ha_close)
         color = "GREEN" if ha_close >= ha_open else "RED"
-
-        ha_candles.append((ha_open, ha_high, ha_low, ha_close, color))
-    return ha_candles
-
-def count_consecutive_colors(ha_candles):
-    """Count consecutive same-color HA candles ending at the last one (chronological list)."""
-    if not ha_candles:
-        return None, 0
-    last_color = ha_candles[-1][4]
-    count = 1
-    for i in range(len(ha_candles) - 2, -1, -1):
-        if ha_candles[i][4] == last_color:
-            count += 1
-        else:
-            break
-    return last_color, count
+        ha.append((ha_open, ha_high, ha_low, ha_close, color))
+    return ha
 
 def wait_until_next_5m():
-    """Sleep until the next exact 5-minute mark: xx:00, :05, :10, ..."""
+    """Block until the next exact 5-minute mark (UTC)."""
     now = datetime.utcnow()
-    minute_block = (now.minute // 5 + 1) * 5
-    if minute_block == 60:
-        next_time = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
+    m = (now.minute // 5 + 1) * 5
+    if m == 60:
+        nxt = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
     else:
-        next_time = now.replace(minute=minute_block, second=0, microsecond=0)
-    wait_seconds = max(0.0, (next_time - now).total_seconds())
-    logging.info(f"⏳ Waiting {wait_seconds:.0f}s until {next_time} UTC (next 5m mark)")
-    time.sleep(wait_seconds)
+        nxt = now.replace(minute=m, second=0, microsecond=0)
+    sleep_s = max(0.0, (nxt - now).total_seconds())
+    logging.info(f"⏳ Waiting {sleep_s:.0f}s until {nxt:%Y-%m-%d %H:%M:%S} UTC (next 5m mark)")
+    time.sleep(sleep_s)
 
-def main_loop():
-    last_higher_level = None   # updated from just-closed RED candle high on GREEN->RED change
-    last_lower_level = None    # updated from just-closed GREEN candle low on RED->GREEN change
-    active_buy = None          # {"price": float, "expiry": datetime}
-    active_sell = None         # {"price": float, "expiry": datetime}
+# -------- Stop-loss helpers (from most recent 5m color-change) --------
+def last_red_to_green_change(ha_5m_history):
+    """
+    Find the most recent RED -> GREEN change in history and return
+    the lower low of those two candles (for BUY stop-loss).
+    History is chronological list/deque of HA tuples.
+    """
+    if len(ha_5m_history) < 2:
+        return None
+    # scan from newest backwards to find a RED then its following GREEN
+    for i in range(len(ha_5m_history) - 1, 0, -1):
+        cur = ha_5m_history[i]     # newer
+        prev = ha_5m_history[i-1]  # older
+        if prev[4] == "RED" and cur[4] == "GREEN":
+            low_prev = prev[2]
+            low_cur = cur[2]
+            return min(low_prev, low_cur)
+    return None
+
+def last_green_to_red_change(ha_5m_history):
+    """
+    Find the most recent GREEN -> RED change in history and return
+    the higher high of those two candles (for SELL stop-loss).
+    """
+    if len(ha_5m_history) < 2:
+        return None
+    for i in range(len(ha_5m_history) - 1, 0, -1):
+        cur = ha_5m_history[i]
+        prev = ha_5m_history[i-1]
+        if prev[4] == "GREEN" and cur[4] == "RED":
+            high_prev = prev[1]
+            high_cur = cur[1]
+            return max(high_prev, high_cur)
+    return None
+
+# -------- Main bot --------
+def main():
+    buy_level = None   # {"price": float, "expiry": datetime}
+    sell_level = None  # {"price": float, "expiry": datetime}
+    last_hour_processed = None
+
+    # keep a rolling history of 5m HA candles for stop-loss detection
+    ha_5m_history = deque(maxlen=FIVE_M_HISTORY)
 
     while True:
         now = datetime.utcnow()
 
-        # -------- 1H logic at exact top of the hour --------
+        # ---- HOURLY LOGIC at exact top of hour ----
+        # Run once per hour at hh:00:00
         if now.minute == 0 and now.second == 0:
-            try:
-                candles_1h = get_candles(interval="60")
-                ha_1h = convert_to_heikin_ashi(candles_1h)
-            except Exception as e:
-                logging.error(f"1H fetch/convert error: {e}")
-                # still proceed to 5m check timing
-            else:
-                last_candle = ha_1h[-1]    # (O,H,L,C,color) just closed
-                prev_candle = ha_1h[-2]    # previous 1h HA candle
-                _, last_high, last_low, _, last_color = last_candle
-                prev_color = prev_candle[4]
+            # prevent double-run within the same hour if loop wakes multiple times
+            hour_tag = now.replace(minute=0, second=0, microsecond=0)
+            if last_hour_processed != hour_tag:
+                last_hour_processed = hour_tag
+                try:
+                    raw_1h = get_candles(interval="60", limit=3)
+                    ha_1h = to_heikin_ashi(raw_1h)
+                    if not ha_1h:
+                        raise RuntimeError("No 1H HA data")
+                    last_1h = ha_1h[-1]
+                except Exception as e:
+                    logging.error(f"1H fetch/convert error: {e}")
+                else:
+                    _, h1, l1, c1, col1 = last_1h
+                    logging.info(f"1H closed: {col1} | HA-OHLC=(_, {h1:.6f}, {l1:.6f}, {c1:.6f})")
 
-                # Streak info (if you still want it for entry rules)
-                streak_color, streak_len = count_consecutive_colors(ha_1h)
-                logging.info(f"1H streak: {streak_color} x{streak_len}")
+                    # If RED -> set Buy Level to HA High (valid 1h)
+                    if col1 == "RED":
+                        buy_level = {"price": h1, "expiry": now + timedelta(hours=1)}
+                        sell_level = None  # only one level at a time
+                        logging.info(f"🎯 Buy Level set @ {buy_level['price']:.6f} (valid until {buy_level['expiry']:%Y-%m-%d %H:%M:%S} UTC)")
 
-                # ----- UPDATE LEVELS using JUST-CLOSED candle on color change -----
-                # GREEN -> RED: higher level = high of the just-closed RED candle
-                if prev_color == "GREEN" and last_color == "RED":
-                    last_higher_level = last_high
-                    logging.info(f"🔺 Updated Higher Level (just-closed RED high): {last_higher_level:.5f}")
+                    # If GREEN -> set Sell Level to HA Low (valid 1h)
+                    else:  # GREEN
+                        sell_level = {"price": l1, "expiry": now + timedelta(hours=1)}
+                        buy_level = None
+                        logging.info(f"🎯 Sell Level set @ {sell_level['price']:.6f} (valid until {sell_level['expiry']:%Y-%m-%d %H:%M:%S} UTC)")
 
-                # RED -> GREEN: lower level = low of the just-closed GREEN candle
-                if prev_color == "RED" and last_color == "GREEN":
-                    last_lower_level = last_low
-                    logging.info(f"🔻 Updated Lower Level (just-closed GREEN low): {last_lower_level:.5f}")
-
-                # ----- ENTRY RULES (examples keeping your earlier intent) -----
-                # SELL entry: after a GREEN streak and current high < last_higher_level
-                if (streak_color == "GREEN" and streak_len >= 2 and
-                    last_higher_level is not None and last_high < last_higher_level):
-                    entry_price = last_low  # low of the just-closed GREEN candle
-                    active_sell = {"price": entry_price, "expiry": now + timedelta(hours=1)}
-                    logging.info(f"📉 SELL ENTRY at {entry_price:.5f} (valid until {active_sell['expiry']:%Y-%m-%d %H:%M:%S} UTC)")
-
-                # BUY entry: after a RED streak and current low > last_lower_level
-                if (streak_color == "RED" and streak_len >= 2 and
-                    last_lower_level is not None and last_low > last_lower_level):
-                    entry_price = last_high  # high of the just-closed RED candle
-                    active_buy = {"price": entry_price, "expiry": now + timedelta(hours=1)}
-                    logging.info(f"📈 BUY ENTRY at {entry_price:.5f} (valid until {active_buy['expiry']:%Y-%m-%d %H:%M:%S} UTC)")
-
-        # -------- 5M execution checks at exact 5m marks --------
+        # ---- EVERY 5 MINUTES at exact :00/:05/:10/... ----
         try:
-            candles_5m = get_candles(interval="5", limit=2)
-            ha_5m = convert_to_heikin_ashi(candles_5m)
+            raw_5m = get_candles(interval="5", limit=3)
+            ha_5m = to_heikin_ashi(raw_5m)
+            if ha_5m:
+                # append most recent closed 5m HA candle to rolling history
+                ha_5m_history.append(ha_5m[-1])
             last_5m = ha_5m[-1]
-            _, high5, low5, _, _ = last_5m
+            _, h5, l5, c5, col5 = last_5m
         except Exception as e:
             logging.error(f"5M fetch/convert error: {e}")
-        else:
-            # Trigger SELL if 5m low <= sell entry (and still valid)
-            if active_sell is not None:
-                if now < active_sell["expiry"]:
-                    if low5 <= active_sell["price"]:
-                        logging.info(f"✅ SELL TRIGGERED at {active_sell['price']:.5f}")
-                        active_sell = None
-                else:
-                    logging.info("⌛ SELL entry expired")
-                    active_sell = None
+            # still align timing
+            wait_until_next_5m()
+            continue
 
-            # Trigger BUY if 5m high >= buy entry (and still valid)
-            if active_buy is not None:
-                if now < active_buy["expiry"]:
-                    if high5 >= active_buy["price"]:
-                        logging.info(f"✅ BUY TRIGGERED at {active_buy['price']:.5f}")
-                        active_buy = None
-                else:
-                    logging.info("⌛ BUY entry expired")
-                    active_buy = None
+        # BUY check (only if Buy Level active and not expired)
+        if buy_level is not None:
+            if datetime.utcnow() >= buy_level["expiry"]:
+                logging.info("⌛ Buy Level expired")
+                buy_level = None
+            else:
+                # 5m HA high breaches Buy Level
+                if h5 >= buy_level["price"]:
+                    entry = buy_level["price"]
+                    sl = last_red_to_green_change(list(ha_5m_history))
+                    if sl is None or sl >= entry:
+                        # fallback: if no valid SL found, skip signal to avoid nonsense RR
+                        logging.info("⚠️ No valid 5m RED→GREEN change found for SL; skipping BUY signal this time.")
+                    else:
+                        risk = entry - sl
+                        tp = entry + risk * (1.0 + RR_EXTRA)
+                        logging.info(f"✅ BUY | Entry={entry:.6f} | SL={sl:.6f} | TP={tp:.6f}  (1:1 RR + 0.07%)")
+                        # clear level after confirmed trade
+                        buy_level = None
 
-        # always align to the next exact 5-minute mark
+        # SELL check (only if Sell Level active and not expired)
+        if sell_level is not None:
+            if datetime.utcnow() >= sell_level["expiry"]:
+                logging.info("⌛ Sell Level expired")
+                sell_level = None
+            else:
+                # 5m HA low breaches Sell Level
+                if l5 <= sell_level["price"]:
+                    entry = sell_level["price"]
+                    sl = last_green_to_red_change(list(ha_5m_history))
+                    if sl is None or sl <= entry:
+                        logging.info("⚠️ No valid 5m GREEN→RED change found for SL; skipping SELL signal this time.")
+                    else:
+                        risk = sl - entry
+                        tp = entry - risk * (1.0 + RR_EXTRA)
+                        logging.info(f"✅ SELL | Entry={entry:.6f} | SL={sl:.6f} | TP={tp:.6f}  (1:1 RR + 0.07%)")
+                        # clear level after confirmed trade
+                        sell_level = None
+
+        # align to next :00/:05/:10/...
         wait_until_next_5m()
 
 if __name__ == "__main__":
-    main_loop()
-    
+    main()
