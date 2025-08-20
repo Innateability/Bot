@@ -73,22 +73,31 @@ def to_heikin_ashi(raw):
     """
     Convert raw candles (newest first) to Heikin Ashi tuples in CHRONO order:
     (ha_open, ha_high, ha_low, ha_close, color, ts_ms)
+    Uses Decimal arithmetic to avoid mixing float and Decimal.
     """
     ha = []
+    D2 = Decimal("2")
+    D4 = Decimal("4")
     for i, c in enumerate(reversed(raw)):  # chronological
         ts = int(c[0])
-        o, h, l, cl = map(float, c[1:5])
-        ha_close = (o + h + l + cl) / 4.0
+        # use Decimal for all OHLC values (avoid float)
+        o = Decimal(str(c[1]))
+        h = Decimal(str(c[2]))
+        l = Decimal(str(c[3]))
+        cl = Decimal(str(c[4]))
+
+        ha_close = (o + h + l + cl) / D4
         if i == 0:
-            ha_open = (o + cl) / 2.0
+            ha_open = (o + cl) / D2
         else:
-            p_open, _, _, p_close, _, _ = ha[-1]
-            ha_open = (p_open + p_close) / 2.0
+            p_open, _, _, p_close, _, _ = ha[-1]  # p_open, p_close are Decimal
+            ha_open = (p_open + p_close) / D2
+
         ha_high = max(h, ha_open, ha_close)
         ha_low  = min(l, ha_open, ha_close)
         color = "GREEN" if ha_close >= ha_open else "RED"
-        ha.append((Decimal(str(ha_open)), Decimal(str(ha_high)), Decimal(str(ha_low)),
-                   Decimal(str(ha_close)), color, ts))
+
+        ha.append((ha_open, ha_high, ha_low, ha_close, color, ts))
     return ha
 
 def wait_until_next_5m():
@@ -321,7 +330,7 @@ def siphon_profits_if_needed(api_key_main, api_secret_main, api_key_sub, api_sec
 
         # Refresh balances and set new milestone to what remains in main+sub
         bal_main2 = get_wallet_balance(api_key_main, api_secret_main)
-        bal_sub2  = get_wallet_balance(api_key_sub,  api_secret_sub)
+        bal_sub2  = get_wallet_balance(api_key_sub, api_secret_sub)
         new_total = bal_main2 + bal_sub2
         milestone_ref["value"] = new_total
         logging.info(f"✅ Siphon done. New milestone set to current combined balance = ${new_total:.2f}. Next trigger at ${ (new_total*2):.2f }.")
@@ -502,7 +511,7 @@ def main():
             wait_until_next_5m()
             continue
 
-        # convert to Decimal
+        # convert to Decimal (they are already Decimal from to_heikin_ashi, but keep for safety)
         h5 = Decimal(str(h5)); l5 = Decimal(str(l5)); c5 = Decimal(str(c5))
 
         # -------- BUY logic (can run even if a SELL is open) --------
