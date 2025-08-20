@@ -27,7 +27,7 @@ TIMEOUT = 15                      # HTTP timeout (seconds)
 
 # -------- Strategy Config --------
 FIVE_M_HISTORY = 500              # keep HA candles for context
-RR_EXTRA = Decimal("0.005")       # +0.5% of entry price
+RR_EXTRA = Decimal("0.0007")       # +0.5% of entry price
 LEVERAGE = Decimal("75")          # 75x leverage
 RISK_FRACTION = Decimal("0.10")   # 10% of combined balance risk
 BAL_CAP = Decimal("0.90")         # cap to 90% of that account balance (for margin)
