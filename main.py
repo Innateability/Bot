@@ -1,4 +1,3 @@
-
 # Full edited bot: 1H (levels) + 5m (triggers) + trade execution + pre-trade rebalance + profit siphon
 import os
 import hmac
@@ -349,7 +348,13 @@ def place_market_order(api_key, api_secret, side, qty):
         "timeInForce": "IOC",
     }
     data = private_request(api_key, api_secret, "POST", "/v5/order/create", body=body)
-    return data["result"]["orderId"]
+
+    # ✅ Debug logging
+    logging.info(f"Placing MARKET {side} order: qty={qty}")
+    logging.info(f"Bybit response: {data}")
+
+    return data.get("result", {}).get("orderId")
+
 
 def place_reduce_only_tp(api_key, api_secret, side, tp_price, qty):
     opp = "Sell" if side == "Buy" else "Buy"
@@ -364,7 +369,13 @@ def place_reduce_only_tp(api_key, api_secret, side, tp_price, qty):
         "timeInForce": "GTC"
     }
     data = private_request(api_key, api_secret, "POST", "/v5/order/create", body=body)
-    return data["result"]["orderId"]
+
+    # ✅ Debug logging
+    logging.info(f"Placing TP {opp} order: qty={qty}, price={tp_price}")
+    logging.info(f"Bybit response: {data}")
+
+    return data.get("result", {}).get("orderId")
+
 
 def place_reduce_only_sl(api_key, api_secret, side, sl_trigger, qty):
     opp = "Sell" if side == "Buy" else "Buy"
@@ -379,10 +390,16 @@ def place_reduce_only_sl(api_key, api_secret, side, sl_trigger, qty):
         "timeInForce": "GTC",
         "triggerBy": "LastPrice",
         "triggerPrice": str(sl_trigger),
-        "triggerDirection": 1 if opp=="Buy" else 2  # heuristic
+        "triggerDirection": 1 if opp == "Buy" else 2  # heuristic
     }
     data = private_request(api_key, api_secret, "POST", "/v5/order/create", body=body)
-    return data["result"]["orderId"]
+
+    # ✅ Debug logging
+    logging.info(f"Placing SL {opp} order: qty={qty}, triggerPrice={sl_trigger}")
+    logging.info(f"Bybit response: {data}")
+
+    return data.get("result", {}).get("orderId")
+
 
 def amend_order(api_key, api_secret, order_id, price=None, triggerPrice=None):
     body = {
