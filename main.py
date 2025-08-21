@@ -272,7 +272,7 @@ def rebalance_equal(api_key_main, api_secret_main, api_key_sub, api_secret_sub, 
         total = bal_main + bal_sub
         target_each = total / Decimal("2")
         delta_main = target_each - bal_main
-        if abs(delta_main) < Decimal("0.5"):  # ignore tiny
+        if abs(delta_main) < Decimal("0.05"):  # ignore tiny
             return
         amt = abs(delta_main)
         if delta_main > 0:
