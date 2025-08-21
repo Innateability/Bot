@@ -238,7 +238,7 @@ def universal_transfer_main_to_sub(api_key_master, api_secret_master, amount_usd
         "toMemberId": to_sub_uid
     }
     try:
-        private_request(api_key_master, api_secret_master, "POST", "/v5/asset/transfer", body=body)
+        private_request(api_key_master, api_secret_master, "POST", "/v5/asset/inter-transfer", body=body)
         logging.info(f"🔁 Transfer MAIN -> SUB {amount_usdt} USDT")
         return True
     except Exception as e:
@@ -255,7 +255,7 @@ def universal_transfer_sub_to_main(api_key_master, api_secret_master, amount_usd
         "fromMemberId": from_sub_uid
     }
     try:
-        private_request(api_key_master, api_secret_master, "POST", "/v5/asset/transfer", body=body)
+        private_request(api_key_master, api_secret_master, "POST", "/v5/asset/inter-transfer", body=body)
         logging.info(f"🔁 Transfer SUB -> MAIN {amount_usdt} USDT")
         return True
     except Exception as e:
