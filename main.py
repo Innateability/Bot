@@ -523,7 +523,17 @@ def main():
             if ha_5m:
                 ha_5m_history.append(ha_5m[-1])
             last_5m = ha_5m[-1]
-            _, h5, l5, c5, col5, ts5 = last_5m
+
+# last_5m is (ha_open, ha_high, ha_low, ha_close, color, ts)
+            _, h5, l5, ha_close, col5, ts5 = last_5m
+
+# raw_5m is returned newest-first. raw_5m[0] corresponds to the same newest candle
+# raw candle format: [ts, open, high, low, close, ...] -> close at index 4
+            raw_latest = raw_5m[0]
+            raw_close = Decimal(str(raw_latest[4]))
+
+# Use the normal candle close as c5 (entry) while still using HA high/low for signals
+            c5 = raw_close
         except Exception as e:
             logging.error(f"5M fetch/convert error: {e}")
             wait_until_next_5m()
