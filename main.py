@@ -413,6 +413,39 @@ def amend_order(api_key, api_secret, order_id, price=None, triggerPrice=None):
     private_request(api_key, api_secret, "POST", "/v5/order/amend", body=body)
 
 # =========================
+# Close all orders & positions (inserted exactly as provided)
+# =========================
+def close_all_orders_and_positions(api_key, api_secret, symbol=SYMBOL):
+    """Cancel all active orders and close all positions for given account."""
+    try:
+        # 1. Cancel all orders
+        private_request(api_key, api_secret, "POST", "/v5/order/cancel-all", 
+                        body={"category": CATEGORY, "symbol": symbol})
+        logging.info("🧹 All open orders cancelled.")
+
+        # 2. Close open positions
+        pos_data = private_request(api_key, api_secret, "GET", "/v5/position/list", 
+                                   params={"category": CATEGORY, "symbol": symbol})
+        for pos in pos_data["result"]["list"]:
+            side = pos["side"]     # "Buy" or "Sell"
+            size = Decimal(pos["size"])
+            if size > 0:
+                opp = "Sell" if side == "Buy" else "Buy"
+                private_request(api_key, api_secret, "POST", "/v5/order/create",
+                                body={
+                                    "category": CATEGORY,
+                                    "symbol": symbol,
+                                    "side": opp,
+                                    "orderType": "Market",
+                                    "qty": str(size),
+                                    "reduceOnly": True,
+                                    "timeInForce": "IOC"
+                                })
+                logging.info(f"🔒 Closed {side} position of {size} {symbol}.")
+    except Exception as e:
+        logging.warning(f"❌ Failed to close positions/orders: {e}")
+
+# =========================
 # Strategy state
 # =========================
 class ActiveLevel:
@@ -589,6 +622,12 @@ def main():
                                     logging.warning(f"Amend existing BUY SL failed: {e}")
                             else:
                                 logging.info(f"✅ BUY signal | Entry={entry_r} SL={sl_r} TP={tp_r} | qty={qty}")
+                                # NEW: ensure SUB account is flat before opening a new BUY
+                                try:
+                                    close_all_orders_and_positions(API_KEY_SUB, API_SECRET_SUB, symbol=SYMBOL)
+                                except Exception as e:
+                                    logging.warning(f"Pre-BUY close-all failed: {e}")
+
                                 # Place market BUY, then reduce-only TP/SL on SUB
                                 try:
                                     entry_id = place_market_order(API_KEY_SUB, API_SECRET_SUB, "Buy", qty)
@@ -652,6 +691,12 @@ def main():
                                     logging.warning(f"Amend existing SELL SL failed: {e}")
                             else:
                                 logging.info(f"✅ SELL signal | Entry={entry_r} SL={sl_r} TP={tp_r} | qty={qty}")
+                                # NEW: ensure MAIN account is flat before opening a new SELL
+                                try:
+                                    close_all_orders_and_positions(API_KEY_MAIN, API_SECRET_MAIN, symbol=SYMBOL)
+                                except Exception as e:
+                                    logging.warning(f"Pre-SELL close-all failed: {e}")
+
                                 try:
                                     entry_id = place_market_order(API_KEY_MAIN, API_SECRET_MAIN, "Sell", qty)
                                     tp_id = place_reduce_only_tp(API_KEY_MAIN, API_SECRET_MAIN, "Sell", tp_r, qty)
