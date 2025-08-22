@@ -1,4 +1,3 @@
-
 # Full edited bot: 1H (levels) + 5m (triggers) + trade execution + pre-trade rebalance + profit siphon
 import os
 import hmac
@@ -239,8 +238,7 @@ def universal_transfer_main_to_sub(api_key_master, api_secret_master, amount_usd
         "toMemberId": to_sub_uid
     }
     try:
-        private_request(api_key_master, api_secret_master, "POST", "/v5/asset/inter-transfer", body=body)
-        logging.info(f"🔁 Transfer MAIN -> SUB {amount_usdt} USDT")
+        private_request(api_key_master, api_secret_master, "POST", "/v5/asset/transfer/inter-transfer", body=body)
         return True
     except Exception as e:
         logging.warning(f"Transfer MAIN->SUB failed: {e}")
@@ -256,7 +254,7 @@ def universal_transfer_sub_to_main(api_key_master, api_secret_master, amount_usd
         "fromMemberId": from_sub_uid
     }
     try:
-        private_request(api_key_master, api_secret_master, "POST", "/v5/asset/inter-transfer", body=body)
+        private_request(api_key_master, api_secret_master, "POST", "/v5/asset/transfer/inter-transfer", body=body)
         logging.info(f"🔁 Transfer SUB -> MAIN {amount_usdt} USDT")
         return True
     except Exception as e:
