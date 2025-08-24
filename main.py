@@ -1,14 +1,18 @@
 # Full edited bot: 1H (levels) + 5m (triggers) + trade execution + pre-trade rebalance + profit siphon
+# + multi-symbol (TRX & BONK), per-account role, same-type replacement, ReduceOnly LIMIT TP/SL,
+# SL-cross watchdog, UUID transferIds, 2:1+0.07% TP after loss
+
 import os
 import hmac
 import hashlib
 import time
 import json
+import uuid
 import requests
 import logging
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timedelta
-from collections import deque
+from collections import deque, defaultdict
 
 # -------- Logging --------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
@@ -20,17 +24,19 @@ ORDER_URL  = BASE_URL + "/v5/order"
 ACCOUNT_URL= BASE_URL + "/v5/account"
 ASSET_URL  = BASE_URL + "/v5/asset"
 
-URL = MARKET_URL + "/kline"
-SYMBOL = os.getenv("SYMBOL", "TRXUSDT")  # change if needed
-CATEGORY = "linear"               # USDT perpetuals
 TIMEOUT = 15                      # HTTP timeout (seconds)
+CATEGORY = "linear"               # USDT perpetuals
+
+# -------- Symbols (multi) --------
+# Set exact Bybit symbols here or via env (comma separated)
+SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "TRXUSDT,BONKUSDT").split(",") if s.strip()]
 
 # -------- Strategy Config --------
-FIVE_M_HISTORY = 500              # keep HA candles for context
-RR_EXTRA = Decimal("0.0007")       # +0.5% of entry price
-LEVERAGE = Decimal("75")          # 75x leverage
-RISK_FRACTION = Decimal("0.10")   # 10% of combined balance risk
-BAL_CAP = Decimal("0.90")         # cap to 90% of that account balance (for margin)
+FIVE_M_HISTORY = 500               # keep HA candles for context
+EXTRA_TP_PCT = Decimal("0.0007")   # +0.07% of entry price
+LEVERAGE = Decimal("75")
+RISK_FRACTION = Decimal("0.10")    # 10% of combined balance risk
+BAL_CAP = Decimal("0.90")          # cap to 90% of that account balance (for margin)
 
 # -------- API keys (set your real keys or environment vars) --------
 # MAIN account (used for SELL) — also used as master for transfers
@@ -44,17 +50,17 @@ API_SECRET_SUB  = os.getenv("BYBIT_SUB_SECRET",  "PUT_SUB_SECRET_HERE")
 # For main<->sub rebalancing (equalize after trades)
 SUB_UID = os.getenv("BYBIT_SUB_UID", "PUT_SUB_UID_HERE")  # numeric string of your trading SUB
 
-# ---- Profit siphon (new) ----
-# Destination "vault" sub-account UID (where profit is sent)
+# ---- Profit siphon ----
 PROFIT_UID = os.getenv("BYBIT_PROFIT_UID", "PUT_PROFIT_UID_HERE")   # numeric string
-
-# Starting milestone in USD for doubling rule (default $10)
 SIPHON_BASE_USD = Decimal(os.getenv("BYBIT_SIPHON_BASE_USD", "10"))
 
 # =========================
 # Helpers: HA & scheduling
 # =========================
-def get_candles(symbol=SYMBOL, interval="60", limit=200):
+def market_kline_url():
+    return MARKET_URL + "/kline"
+
+def get_candles(symbol, interval="60", limit=200):
     """Fetch candles from Bybit (newest first)."""
     params = {
         "category": CATEGORY,
@@ -62,41 +68,33 @@ def get_candles(symbol=SYMBOL, interval="60", limit=200):
         "interval": interval,
         "limit": limit
     }
-    r = requests.get(URL, params=params, timeout=TIMEOUT)
+    r = requests.get(market_kline_url(), params=params, timeout=TIMEOUT)
     r.raise_for_status()
     data = r.json()
     if "result" not in data or "list" not in data["result"]:
-        raise RuntimeError(f"Bad response for interval {interval}: {data}")
+        raise RuntimeError(f"Bad response for {symbol} interval {interval}: {data}")
     return data["result"]["list"]  # newest first
 
 def to_heikin_ashi(raw):
     """
     Convert raw candles (newest first) to Heikin Ashi tuples in CHRONO order:
     (ha_open, ha_high, ha_low, ha_close, color, ts_ms)
-    Uses Decimal arithmetic to avoid mixing float and Decimal.
     """
     ha = []
     D2 = Decimal("2")
     D4 = Decimal("4")
     for i, c in enumerate(reversed(raw)):  # chronological
         ts = int(c[0])
-        # use Decimal for all OHLC values (avoid float)
-        o = Decimal(str(c[1]))
-        h = Decimal(str(c[2]))
-        l = Decimal(str(c[3]))
-        cl = Decimal(str(c[4]))
-
+        o = Decimal(str(c[1])); h = Decimal(str(c[2])); l = Decimal(str(c[3])); cl = Decimal(str(c[4]))
         ha_close = (o + h + l + cl) / D4
         if i == 0:
             ha_open = (o + cl) / D2
         else:
-            p_open, _, _, p_close, _, _ = ha[-1]  # p_open, p_close are Decimal
+            p_open, _, _, p_close, _, _ = ha[-1]
             ha_open = (p_open + p_close) / D2
-
         ha_high = max(h, ha_open, ha_close)
         ha_low  = min(l, ha_open, ha_close)
         color = "GREEN" if ha_close >= ha_open else "RED"
-
         ha.append((ha_open, ha_high, ha_low, ha_close, color, ts))
     return ha
 
@@ -163,13 +161,13 @@ def private_request(api_key, api_secret, method, path, params=None, body=None):
 # =========================
 # Instrument precision
 # =========================
-def get_instrument_info():
-    params = {"category": CATEGORY, "symbol": SYMBOL}
+def get_instrument_info(symbol):
+    params = {"category": CATEGORY, "symbol": symbol}
     r = requests.get(MARKET_URL + "/instruments-info", params=params, timeout=TIMEOUT)
     r.raise_for_status()
     data = r.json()
-    if data.get("retCode") != 0:
-        raise RuntimeError(f"instruments-info error: {data}")
+    if data.get("retCode") != 0 or not data["result"]["list"]:
+        raise RuntimeError(f"instruments-info error for {symbol}: {data}")
     info = data["result"]["list"][0]
     tick = Decimal(info["priceFilter"]["tickSize"])
     step = Decimal(info["lotSizeFilter"]["qtyStep"])
@@ -177,8 +175,7 @@ def get_instrument_info():
     return tick, step, min_qty
 
 def round_price(px: Decimal, tick: Decimal) -> Decimal:
-    # round down to tick
-    return (px // tick) * tick
+    return (px // tick) * tick  # round down to tick
 
 def round_qty(qty: Decimal, step: Decimal) -> Decimal:
     return (qty // step) * step
@@ -193,9 +190,12 @@ def get_wallet_balance(api_key, api_secret):
     if not lst: return Decimal("0")
     return Decimal(str(lst[0]["totalEquity"]))
 
+def _uuid():
+    return str(uuid.uuid4())  # ✅ robust unique transferId
+
 def universal_transfer_main_to_uid(api_key_master, api_secret_master, amount_usdt: Decimal, to_uid: str):
     body = {
-        "transferId": str(int(time.time()*1000)),
+        "transferId": _uuid(),
         "coin": "USDT",
         "amount": str(amount_usdt.quantize(Decimal('0.01'), rounding=ROUND_DOWN)),
         "fromAccountType": "UNIFIED",
@@ -212,7 +212,7 @@ def universal_transfer_main_to_uid(api_key_master, api_secret_master, amount_usd
 
 def universal_transfer_sub_to_uid(api_key_master, api_secret_master, amount_usdt: Decimal, from_sub_uid: str, to_uid: str):
     body = {
-        "transferId": str(int(time.time()*1000)),
+        "transferId": _uuid(),
         "coin": "USDT",
         "amount": str(amount_usdt.quantize(Decimal('0.01'), rounding=ROUND_DOWN)),
         "fromAccountType": "UNIFIED",
@@ -230,7 +230,7 @@ def universal_transfer_sub_to_uid(api_key_master, api_secret_master, amount_usdt
 
 def universal_transfer_main_to_sub(api_key_master, api_secret_master, amount_usdt, to_sub_uid):
     body = {
-        "transferId": str(int(time.time()*1000)),
+        "transferId": _uuid(),
         "coin": "USDT",
         "amount": str(amount_usdt),
         "fromAccountType": "UNIFIED",
@@ -246,7 +246,7 @@ def universal_transfer_main_to_sub(api_key_master, api_secret_master, amount_usd
 
 def universal_transfer_sub_to_main(api_key_master, api_secret_master, amount_usdt, from_sub_uid):
     body = {
-        "transferId": str(int(time.time()*1000)),
+        "transferId": _uuid(),
         "coin": "USDT",
         "amount": str(amount_usdt),
         "fromAccountType": "UNIFIED",
@@ -262,40 +262,34 @@ def universal_transfer_sub_to_main(api_key_master, api_secret_master, amount_usd
         return False
 
 def rebalance_equal(api_key_main, api_secret_main, api_key_sub, api_secret_sub, sub_uid):
-    """
-    Make main and sub balances equal by moving funds one way.
-    """
+    """Make main and sub balances equal by moving funds one way."""
     try:
         bal_main = get_wallet_balance(api_key_main, api_secret_main)
         bal_sub  = get_wallet_balance(api_key_sub,  api_secret_sub)
         total = bal_main + bal_sub
         target_each = total / Decimal("2")
         delta_main = target_each - bal_main
-        if abs(delta_main) < Decimal("0.05"):  # ignore tiny
+        if abs(delta_main) < Decimal("0.05"):
             return
         amt = abs(delta_main)
         if delta_main > 0:
-            # move from sub -> main
             if sub_uid and sub_uid != "PUT_SUB_UID_HERE":
                 universal_transfer_sub_to_main(api_key_main, api_secret_main, float(amt), sub_uid)
         else:
-            # move from main -> sub
             if sub_uid and sub_uid != "PUT_SUB_UID_HERE":
                 universal_transfer_main_to_sub(api_key_main, api_secret_main, float(amt), sub_uid)
     except Exception as e:
         logging.warning(f"Rebalance equal failed: {e}")
 
-# ---- Profit siphon helper (new) ----
+# ---- Profit siphon helper ----
 def siphon_profits_if_needed(api_key_main, api_secret_main, api_key_sub, api_secret_sub,
                              sub_uid: str, dest_uid: str, milestone_ref: dict):
     """
     When combined balance >= 2 * milestone, send 25% of combined to dest_uid.
-    Pull from MAIN first, then SUB for any remainder. Update milestone to remaining total.
-    `milestone_ref` is a dict holding {'value': Decimal}
+    Pull from MAIN first, then SUB. Update milestone to new combined.
     """
     if not dest_uid or dest_uid == "PUT_PROFIT_UID_HERE":
-        return  # not configured
-    # balances
+        return
     bal_main = get_wallet_balance(api_key_main, api_secret_main)
     bal_sub  = get_wallet_balance(api_key_sub,  api_secret_sub)
     total = bal_main + bal_sub
@@ -309,57 +303,46 @@ def siphon_profits_if_needed(api_key_main, api_secret_main, api_key_sub, api_sec
 
     if total >= trigger:
         send_amt = (total * Decimal("0.25")).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-        logging.info(f"💰 Siphon trigger! Combined=${total:.2f} ≥ ${trigger:.2f}. Sending 25% = ${send_amt} to UID({dest_uid})")
+        logging.info(f"💰 Siphon trigger! Combined=${total:.2f} ≥ ${trigger:.2f}. Send 25% = ${send_amt} to UID({dest_uid})")
 
         remaining = send_amt
-
-        # Send from MAIN first
         take_main = min(bal_main, remaining)
         if take_main > 0:
             ok = universal_transfer_main_to_uid(api_key_main, api_secret_main, take_main, dest_uid)
-            if ok:
-                remaining -= take_main
+            if ok: remaining -= take_main
 
-        # Then from SUB if needed
         if remaining > 0 and sub_uid and sub_uid != "PUT_SUB_UID_HERE":
             take_sub = min(bal_sub, remaining)
             if take_sub > 0:
                 universal_transfer_sub_to_uid(api_key_main, api_secret_main, take_sub, sub_uid, dest_uid)
                 remaining -= take_sub
 
-        # Refresh balances and set new milestone to what remains in main+sub
         bal_main2 = get_wallet_balance(api_key_main, api_secret_main)
-        bal_sub2  = get_wallet_balance(api_key_sub, api_secret_sub)
-        new_total = bal_main2 + bal_sub2
-        milestone_ref["value"] = new_total
-        logging.info(f"✅ Siphon done. New milestone set to current combined balance = ${new_total:.2f}. Next trigger at ${ (new_total*2):.2f }.")
+        bal_sub2  = get_wallet_balance(api_key_sub,  api_secret_sub)
+        milestone_ref["value"] = bal_main2 + bal_sub2
+        logging.info(f"✅ Siphon done. New milestone ${milestone_ref['value']:.2f} (next at ${ (milestone_ref['value']*2):.2f }).")
 
 # =========================
 # Orders
 # =========================
-def place_market_order(api_key, api_secret, side, qty):
+def place_market_order(api_key, api_secret, symbol, side, qty):
     body = {
         "category": CATEGORY,
-        "symbol": SYMBOL,
+        "symbol": symbol,
         "side": side,                   # "Buy" or "Sell"
         "orderType": "Market",
         "qty": str(qty),
         "timeInForce": "IOC",
     }
     data = private_request(api_key, api_secret, "POST", "/v5/order/create", body=body)
-
-    # ✅ Debug logging
-    logging.info(f"Placing MARKET {side} order: qty={qty}")
-    logging.info(f"Bybit response: {data}")
-
+    logging.info(f"Placing MARKET {side} {symbol} qty={qty} -> {data}")
     return data.get("result", {}).get("orderId")
 
-
-def place_reduce_only_tp(api_key, api_secret, side, tp_price, qty):
+def place_reduce_only_tp(api_key, api_secret, symbol, side, tp_price, qty):
     opp = "Sell" if side == "Buy" else "Buy"
     body = {
         "category": CATEGORY,
-        "symbol": SYMBOL,
+        "symbol": symbol,
         "side": opp,
         "orderType": "Limit",
         "price": str(tp_price),
@@ -368,63 +351,40 @@ def place_reduce_only_tp(api_key, api_secret, side, tp_price, qty):
         "timeInForce": "GTC"
     }
     data = private_request(api_key, api_secret, "POST", "/v5/order/create", body=body)
-
-    # ✅ Debug logging
-    logging.info(f"Placing TP {opp} order: qty={qty}, price={tp_price}")
-    logging.info(f"Bybit response: {data}")
-
+    logging.info(f"Placing TP LIMIT ReduceOnly {opp} {symbol} qty={qty} price={tp_price} -> {data}")
     return data.get("result", {}).get("orderId")
 
-
-def place_reduce_only_sl(api_key, api_secret, side, sl_trigger, qty):
+def place_reduce_only_sl_limit(api_key, api_secret, symbol, side, sl_price, qty):
+    """
+    SL as LIMIT ReduceOnly (no trigger). We will watchdog for price-cross and force-close if still open.
+    """
     opp = "Sell" if side == "Buy" else "Buy"
-    # Stop-Market reduceOnly with triggerPrice
     body = {
         "category": CATEGORY,
-        "symbol": SYMBOL,
+        "symbol": symbol,
         "side": opp,
-        "orderType": "Market",
+        "orderType": "Limit",
+        "price": str(sl_price),
         "qty": str(qty),
         "reduceOnly": True,
-        "timeInForce": "GTC",
-        "triggerBy": "LastPrice",
-        "triggerPrice": str(sl_trigger),
-        "triggerDirection": 1 if opp == "Buy" else 2  # heuristic
+        "timeInForce": "GTC"
     }
     data = private_request(api_key, api_secret, "POST", "/v5/order/create", body=body)
-
-    # ✅ Debug logging
-    logging.info(f"Placing SL {opp} order: qty={qty}, triggerPrice={sl_trigger}")
-    logging.info(f"Bybit response: {data}")
-
+    logging.info(f"Placing SL LIMIT ReduceOnly {opp} {symbol} qty={qty} price={sl_price} -> {data}")
     return data.get("result", {}).get("orderId")
 
-
-def amend_order(api_key, api_secret, order_id, price=None, triggerPrice=None):
-    body = {
-        "category": CATEGORY,
-        "symbol": SYMBOL,
-        "orderId": order_id
-    }
-    if price is not None:
-        body["price"] = str(price)
-    if triggerPrice is not None:
-        body["triggerPrice"] = str(triggerPrice)
-    private_request(api_key, api_secret, "POST", "/v5/order/amend", body=body)
-
-# =========================
-# Close all orders & positions (inserted exactly as provided)
-# =========================
-def close_all_orders_and_positions(api_key, api_secret, symbol=SYMBOL):
-    """Cancel all active orders and close all positions for given account."""
+def cancel_all_orders_for_symbol(api_key, api_secret, symbol):
     try:
-        # 1. Cancel all orders
-        private_request(api_key, api_secret, "POST", "/v5/order/cancel-all", 
+        private_request(api_key, api_secret, "POST", "/v5/order/cancel-all",
                         body={"category": CATEGORY, "symbol": symbol})
-        logging.info("🧹 All open orders cancelled.")
+        logging.info(f"🧹 Cancelled all orders on this account for {symbol}.")
+    except Exception as e:
+        logging.warning(f"Cancel orders failed for {symbol}: {e}")
 
-        # 2. Close open positions
-        pos_data = private_request(api_key, api_secret, "GET", "/v5/position/list", 
+def market_close_all_positions_for_symbol(api_key, api_secret, symbol):
+    """Market-close all open positions for this symbol on this account."""
+    try:
+        pos_data = private_request(api_key, api_secret, "GET", "/v5/position/list",
                                    params={"category": CATEGORY, "symbol": symbol})
         for pos in pos_data["result"]["list"]:
             side = pos["side"]     # "Buy" or "Sell"
@@ -443,7 +403,12 @@ def close_all_orders_and_positions(api_key, api_secret, symbol=SYMBOL):
                                 })
                 logging.info(f"🔒 Closed {side} position of {size} {symbol}.")
     except Exception as e:
-        logging.warning(f"❌ Failed to close positions/orders: {e}")
+        logging.warning(f"Close positions failed for {symbol}: {e}")
+
+def close_account_symbol(api_key, api_secret, symbol):
+    """Only close orders/positions on the affected account for THIS symbol."""
+    cancel_all_orders_for_symbol(api_key, api_secret, symbol)
+    market_close_all_positions_for_symbol(api_key, api_secret, symbol)
 
 # =========================
 # Strategy state
@@ -455,11 +420,12 @@ class ActiveLevel:
 
 class OpenTrade:
     """
-    Track one open trade per side. Hedging allowed (both BUY and SELL may exist).
+    Track one open trade per account per symbol (buy-on-sub, sell-on-main).
     """
-    def __init__(self, side: str, qty: Decimal, entry: Decimal, sl_price: Decimal, tp_price: Decimal,
+    def __init__(self, symbol: str, side: str, qty: Decimal, entry: Decimal, sl_price: Decimal, tp_price: Decimal,
                  entry_order_id: str, sl_order_id: str, tp_order_id: str,
                  api_key: str, api_secret: str):
+        self.symbol = symbol
         self.side = side
         self.qty = qty
         self.entry = entry
@@ -478,10 +444,6 @@ def compute_qty(entry: Decimal, sl: Decimal, trading_bal: Decimal, combined_bal:
                 lot_step: Decimal, min_qty: Decimal) -> Decimal:
     """
     Risk 10% of combined balance with 75x leverage, but cap so initial margin uses <= 90% of trading balance.
-    qty_risk = (risk$ / per-coin-risk)
-    per-coin-risk = |entry - sl|
-    margin per coin ≈ entry / leverage
-    qty_cap_by_margin = (0.9 * trading_bal * leverage) / entry
     """
     per_coin_risk = abs(entry - sl)
     if per_coin_risk <= Decimal("0"):
@@ -499,220 +461,232 @@ def compute_qty(entry: Decimal, sl: Decimal, trading_bal: Decimal, combined_bal:
 # MAIN BOT
 # =========================
 def main():
-    # precision
-    tick, lot_step, min_qty = get_instrument_info()
-    logging.info(f"Instrument: tick={tick} lotStep={lot_step} minQty={min_qty}")
+    # per-symbol precision cache
+    precision = {}
+    for sym in SYMBOLS:
+        tick, lot_step, min_qty = get_instrument_info(sym)
+        precision[sym] = {"tick": tick, "lot": lot_step, "min": min_qty}
+        logging.info(f"{sym}: tick={tick} lotStep={lot_step} minQty={min_qty}")
 
-    buy_level = None    # ActiveLevel or None
-    sell_level = None
+    # state per symbol
+    buy_level   = {sym: None for sym in SYMBOLS}    # ActiveLevel or None (arm BUY on sub)
+    sell_level  = {sym: None for sym in SYMBOLS}    # ActiveLevel or None (arm SELL on main)
     last_hour_processed = None
 
-    # open trades state (hedging allowed)
-    open_buy: OpenTrade = None
-    open_sell: OpenTrade = None
+    # open trades (per symbol, per account role)
+    open_buy  = {sym: None for sym in SYMBOLS}      # sub account only
+    open_sell = {sym: None for sym in SYMBOLS}      # main account only
 
-    # history deque (not needed for SL now, but keep if you want to inspect)
-    ha_5m_history = deque(maxlen=FIVE_M_HISTORY)
+    # HA 5m history per symbol
+    ha_5m_history = {sym: deque(maxlen=FIVE_M_HISTORY) for sym in SYMBOLS}
 
     # profit siphon milestone (persist in memory across loop)
     siphon_state = {"value": None}
 
+    # last result tracker (per account+symbol)
+    # values: "win", "loss", or None
+    last_result = {
+        "sub": {sym: None for sym in SYMBOLS},
+        "main": {sym: None for sym in SYMBOLS},
+    }
+
     while True:
         now = datetime.utcnow()
 
-        # ---- HOURLY LOGIC at exact top of hour ----
+        # ---- HOURLY LOGIC: compute levels once per closed 1H candle for each symbol ----
         if now.minute == 0 and now.second == 0:
             hour_tag = now.replace(minute=0, second=0, microsecond=0)
             if last_hour_processed != hour_tag:
                 last_hour_processed = hour_tag
-                try:
-                    raw_1h = get_candles(interval="60", limit=3)
-                    ha_1h = to_heikin_ashi(raw_1h)
-                    if not ha_1h:
-                        raise RuntimeError("No 1H HA data")
-                    last_1h = ha_1h[-1]
-                except Exception as e:
-                    logging.error(f"1H fetch/convert error: {e}")
-                else:
+                for sym in SYMBOLS:
+                    try:
+                        raw_1h = get_candles(sym, interval="60", limit=3)
+                        ha_1h = to_heikin_ashi(raw_1h)
+                        if not ha_1h:
+                            raise RuntimeError("No 1H HA data")
+                        last_1h = ha_1h[-1]
+                    except Exception as e:
+                        logging.error(f"{sym} 1H fetch/convert error: {e}")
+                        continue
+
                     _, h1, l1, c1, col1, _ = last_1h
-                    logging.info(f"1H closed: {col1} | HA-H={h1} L={l1} C={c1}")
+                    logging.info(f"{sym} 1H closed: {col1} | HA-H={h1} L={l1} C={c1}")
 
-                    # If RED -> set Buy Level to HA High (valid 1h), cancel sell level arming
                     if col1 == "RED":
-                        buy_level = ActiveLevel(price=h1, expiry=now + timedelta(hours=1))
-                        sell_level = None
-                        logging.info(f"🎯 Buy Level set @ {buy_level.price} (valid until {buy_level.expiry} UTC)")
+                        buy_level[sym]  = ActiveLevel(price=h1, expiry=now + timedelta(hours=1))
+                        sell_level[sym] = None
+                        logging.info(f"{sym} 🎯 Buy Level set @ {buy_level[sym].price} (valid 1h)")
                     else:
-                        # GREEN -> set Sell Level to HA Low (valid 1h), cancel buy level arming
-                        sell_level = ActiveLevel(price=l1, expiry=now + timedelta(hours=1))
-                        buy_level = None
-                        logging.info(f"🎯 Sell Level set @ {sell_level.price} (valid until {sell_level.expiry} UTC)")
+                        sell_level[sym] = ActiveLevel(price=l1, expiry=now + timedelta(hours=1))
+                        buy_level[sym]  = None
+                        logging.info(f"{sym} 🎯 Sell Level set @ {sell_level[sym].price} (valid 1h)")
 
-        # ---- EVERY 5 MINUTES at exact :00/:05/:10/... to check 5m candle ----
-        try:
-            raw_5m = get_candles(interval="5", limit=3)
-            ha_5m = to_heikin_ashi(raw_5m)
-            if ha_5m:
-                ha_5m_history.append(ha_5m[-1])
-            last_5m = ha_5m[-1]
+        # ---- EVERY 5 MINUTES: process each symbol ----
+        for sym in SYMBOLS:
+            tick = precision[sym]["tick"]; lot = precision[sym]["lot"]; min_qty = precision[sym]["min"]
 
-# last_5m is (ha_open, ha_high, ha_low, ha_close, color, ts)
-            _, h5, l5, ha_close, col5, ts5 = last_5m
+            try:
+                raw_5m = get_candles(sym, interval="5", limit=3)
+                ha_5m = to_heikin_ashi(raw_5m)
+                if ha_5m:
+                    ha_5m_history[sym].append(ha_5m[-1])
+                last_5m = ha_5m[-1]
+                _, h5, l5, ha_close, col5, ts5 = last_5m
+                raw_latest = raw_5m[0]
+                raw_close = Decimal(str(raw_latest[4]))
+                c5 = raw_close  # entry reference
+            except Exception as e:
+                logging.error(f"{sym} 5M fetch/convert error: {e}")
+                continue
 
-# raw_5m is returned newest-first. raw_5m[0] corresponds to the same newest candle
-# raw candle format: [ts, open, high, low, close, ...] -> close at index 4
-            raw_latest = raw_5m[0]
-            raw_close = Decimal(str(raw_latest[4]))
+            h5 = Decimal(str(h5)); l5 = Decimal(str(l5)); c5 = Decimal(str(c5))
 
-# Use the normal candle close as c5 (entry) while still using HA high/low for signals
-            c5 = raw_close
-        except Exception as e:
-            logging.error(f"5M fetch/convert error: {e}")
-            wait_until_next_5m()
-            continue
+            # ------------- Watchdog: SL already crossed but position still open? close on affected account only -------------
+            # For BUY on sub: if candle low <= SL but position still open -> force close sub's symbol
+            ob = open_buy[sym]
+            if ob is not None:
+                if l5 <= ob.sl:
+                    logging.info(f"🛡️ {sym} BUY SL crossed (low {l5} <= SL {ob.sl}) but trade still registered; force-closing SUB {sym}.")
+                    close_account_symbol(API_KEY_SUB, API_SECRET_SUB, sym)
+                    open_buy[sym] = None
+                    last_result["sub"][sym] = "loss"
 
-        # convert to Decimal (they are already Decimal from to_heikin_ashi, but keep for safety)
-        h5 = Decimal(str(h5)); l5 = Decimal(str(l5)); c5 = Decimal(str(c5))
+            # For SELL on main: if candle high >= SL but position still open -> force close main's symbol
+            osell = open_sell[sym]
+            if osell is not None:
+                if h5 >= osell.sl:
+                    logging.info(f"🛡️ {sym} SELL SL crossed (high {h5} >= SL {osell.sl}) but trade still registered; force-closing MAIN {sym}.")
+                    close_account_symbol(API_KEY_MAIN, API_SECRET_MAIN, sym)
+                    open_sell[sym] = None
+                    last_result["main"][sym] = "loss"
 
-        # -------- BUY logic (can run even if a SELL is open) --------
-        if buy_level is not None:
-            if datetime.utcnow() >= buy_level.expiry:
-                logging.info("⌛ Buy Level expired")
-                buy_level = None
-            else:
-                # trigger = 5m HA high >= Buy level
-                if h5 >= buy_level.price:
-                    # Entry = close of the signal candle; SL = low of the signal candle; TP = 1:1 + 0.5% of entry
-                    entry = c5
-                    sl    = l5
-                    if sl >= entry:
-                        logging.info("⚠️ Invalid BUY (SL >= entry); skipping")
-                    else:
-                        risk = entry - sl
-                        tp   = entry + risk + (entry * RR_EXTRA)
-
-                        # round to precision
-                        entry_r = round_price(entry, tick)
-                        sl_r    = round_price(sl,    tick)
-                        tp_r    = round_price(tp,    tick)
-
-                        # PRE-TRADE: rebalance main/sub before sizing (user requested)
-                        try:
-                            rebalance_equal(API_KEY_MAIN, API_SECRET_MAIN, API_KEY_SUB, API_SECRET_SUB, SUB_UID)
-                        except Exception as e:
-                            logging.warning(f"Pre-trade rebalance failed: {e}")
-
-                        # Balances after rebalance
-                        bal_main = get_wallet_balance(API_KEY_MAIN, API_SECRET_MAIN)
-                        bal_sub  = get_wallet_balance(API_KEY_SUB,  API_SECRET_SUB)
-                        combined = bal_main + bal_sub
-
-                        # Sizing from SUB (BUY)
-                        qty = compute_qty(entry_r, sl_r, bal_sub, combined, lot_step, min_qty)
-                        if qty <= 0:
-                            logging.info("⚠️ BUY sizing too small; skipping")
+            # -------- BUY logic (SUB account only) --------
+            if buy_level[sym] is not None:
+                if datetime.utcnow() >= buy_level[sym].expiry:
+                    logging.info(f"{sym} ⌛ Buy Level expired")
+                    buy_level[sym] = None
+                else:
+                    if h5 >= buy_level[sym].price:  # trigger
+                        entry = c5
+                        sl    = l5
+                        if sl >= entry:
+                            logging.info(f"{sym} ⚠️ Invalid BUY (SL >= entry); skipping")
                         else:
-                            # If a same-side BUY is already open: update existing SL only (don't open additional market position)
-                            if open_buy is not None:
-                                try:
-                                    amend_order(API_KEY_SUB, API_SECRET_SUB, open_buy.sl_order_id, triggerPrice=sl_r)
-                                    open_buy.sl = sl_r
-                                    logging.info(f"🔧 Amended existing BUY SL to {sl_r}")
-                                except Exception as e:
-                                    logging.warning(f"Amend existing BUY SL failed: {e}")
+                            # RR framework: default 1:1, but if last SUB trade on sym was loss -> 2:1 + 0.07%
+                            risk = entry - sl
+                            use_2to1_plus = (last_result["sub"][sym] == "loss")
+                            if use_2to1_plus:
+                                tp = entry + (risk * Decimal("2")) + (entry * EXTRA_TP_PCT)
                             else:
-                                logging.info(f"✅ BUY signal | Entry={entry_r} SL={sl_r} TP={tp_r} | qty={qty}")
-                                # NEW: ensure SUB account is flat before opening a new BUY
-                                try:
-                                    close_all_orders_and_positions(API_KEY_SUB, API_SECRET_SUB, symbol=SYMBOL)
-                                except Exception as e:
-                                    logging.warning(f"Pre-BUY close-all failed: {e}")
+                                tp = entry + risk
 
-                                # Place market BUY, then reduce-only TP/SL on SUB
+                            # round
+                            entry_r = round_price(entry, tick)
+                            sl_r    = round_price(sl,    tick)
+                            tp_r    = round_price(tp,    tick)
+
+                            # PRE-TRADE: rebalance, then size off balances
+                            try:
+                                rebalance_equal(API_KEY_MAIN, API_SECRET_MAIN, API_KEY_SUB, API_SECRET_SUB, SUB_UID)
+                            except Exception as e:
+                                logging.warning(f"{sym} Pre-trade rebalance failed: {e}")
+
+                            bal_main = get_wallet_balance(API_KEY_MAIN, API_SECRET_MAIN)
+                            bal_sub  = get_wallet_balance(API_KEY_SUB,  API_SECRET_SUB)
+                            combined = bal_main + bal_sub
+
+                            qty = compute_qty(entry_r, sl_r, bal_sub, combined, lot, min_qty)
+                            if qty <= 0:
+                                logging.info(f"{sym} ⚠️ BUY sizing too small; skipping")
+                            else:
+                                # If a same-type BUY is already open on SUB for this symbol:
+                                # close ONLY SUB's orders/positions for THIS symbol, then open fresh (no SL amend).
+                                if open_buy[sym] is not None:
+                                    logging.info(f"{sym} 🔁 New BUY signal while BUY open on SUB -> closing existing SUB {sym} orders/position first.")
+                                    close_account_symbol(API_KEY_SUB, API_SECRET_SUB, sym)
+                                    open_buy[sym] = None
+                                    # mark nothing yet (we're rolling into new trade)
+
+                                logging.info(f"{sym} ✅ BUY signal | Entry={entry_r} SL={sl_r} TP={tp_r} | qty={qty}")
+
                                 try:
-                                    entry_id = place_market_order(API_KEY_SUB, API_SECRET_SUB, "Buy", qty)
-                                    tp_id = place_reduce_only_tp(API_KEY_SUB, API_SECRET_SUB, "Buy", tp_r, qty)
-                                    sl_id = place_reduce_only_sl(API_KEY_SUB, API_SECRET_SUB, "Buy", sl_r, qty)
-                                    logging.info(f"📦 BUY opened (orderId={entry_id}); TP({tp_id}) & SL({sl_id}) placed")
-                                    open_buy = OpenTrade("Buy", qty, entry_r, sl_r, tp_r, entry_id, sl_id, tp_id,
-                                                         API_KEY_SUB, API_SECRET_SUB)
+                                    entry_id = place_market_order(API_KEY_SUB, API_SECRET_SUB, sym, "Buy", qty)
+                                    tp_id = place_reduce_only_tp(API_KEY_SUB, API_SECRET_SUB, sym, "Buy", tp_r, qty)
+                                    sl_id = place_reduce_only_sl_limit(API_KEY_SUB, API_SECRET_SUB, sym, "Buy", sl_r, qty)
+                                    logging.info(f"{sym} 📦 BUY opened (orderId={entry_id}); TP({tp_id}) & SL({sl_id}) LIMIT-ReduceOnly")
+                                    open_buy[sym] = OpenTrade(sym, "Buy", qty, entry_r, sl_r, tp_r, entry_id, sl_id, tp_id,
+                                                              API_KEY_SUB, API_SECRET_SUB)
+                                    # reset last_result marker (unknown yet)
+                                    last_result["sub"][sym] = None
                                 except Exception as e:
-                                    logging.error(f"BUY order error: {e}")
+                                    logging.error(f"{sym} BUY order error: {e}")
                                 finally:
-                                    # After trade: rebalance main/sub to equal balances
                                     try:
                                         rebalance_equal(API_KEY_MAIN, API_SECRET_MAIN, API_KEY_SUB, API_SECRET_SUB, SUB_UID)
                                     except Exception as e:
-                                        logging.warning(f"Post-trade rebalance failed: {e}")
-                            buy_level = None  # clear armed level
+                                        logging.warning(f"{sym} Post-trade rebalance failed: {e}")
 
-        # -------- SELL logic (can run even if a BUY is open) --------
-        if sell_level is not None:
-            if datetime.utcnow() >= sell_level.expiry:
-                logging.info("⌛ Sell Level expired")
-                sell_level = None
-            else:
-                # trigger = 5m HA low <= Sell level
-                if l5 <= sell_level.price:
-                    entry = c5
-                    sl    = h5
-                    if sl <= entry:
-                        logging.info("⚠️ Invalid SELL (SL <= entry); skipping")
-                    else:
-                        risk = sl - entry
-                        tp   = entry - risk - (entry * RR_EXTRA)
+                        buy_level[sym] = None  # clear armed level
 
-                        entry_r = round_price(entry, tick)
-                        sl_r    = round_price(sl,    tick)
-                        tp_r    = round_price(tp,    tick)
-
-                        # PRE-TRADE: rebalance main/sub before sizing
-                        try:
-                            rebalance_equal(API_KEY_MAIN, API_SECRET_MAIN, API_KEY_SUB, API_SECRET_SUB, SUB_UID)
-                        except Exception as e:
-                            logging.warning(f"Pre-trade rebalance failed: {e}")
-
-                        bal_main = get_wallet_balance(API_KEY_MAIN, API_SECRET_MAIN)
-                        bal_sub  = get_wallet_balance(API_KEY_SUB,  API_SECRET_SUB)
-                        combined = bal_main + bal_sub
-
-                        # Sizing from MAIN (SELL)
-                        qty = compute_qty(entry_r, sl_r, bal_main, combined, lot_step, min_qty)
-                        if qty <= 0:
-                            logging.info("⚠️ SELL sizing too small; skipping")
+            # -------- SELL logic (MAIN account only) --------
+            if sell_level[sym] is not None:
+                if datetime.utcnow() >= sell_level[sym].expiry:
+                    logging.info(f"{sym} ⌛ Sell Level expired")
+                    sell_level[sym] = None
+                else:
+                    if l5 <= sell_level[sym].price:  # trigger
+                        entry = c5
+                        sl    = h5
+                        if sl <= entry:
+                            logging.info(f"{sym} ⚠️ Invalid SELL (SL <= entry); skipping")
                         else:
-                            # If same-side SELL already open: update existing SL only (don't open additional market position)
-                            if open_sell is not None:
-                                try:
-                                    amend_order(API_KEY_MAIN, API_SECRET_MAIN, open_sell.sl_order_id, triggerPrice=sl_r)
-                                    open_sell.sl = sl_r
-                                    logging.info(f"🔧 Amended existing SELL SL to {sl_r}")
-                                except Exception as e:
-                                    logging.warning(f"Amend existing SELL SL failed: {e}")
+                            risk = sl - entry
+                            use_2to1_plus = (last_result["main"][sym] == "loss")
+                            if use_2to1_plus:
+                                tp = entry - (risk * Decimal("2")) - (entry * EXTRA_TP_PCT)
                             else:
-                                logging.info(f"✅ SELL signal | Entry={entry_r} SL={sl_r} TP={tp_r} | qty={qty}")
-                                # NEW: ensure MAIN account is flat before opening a new SELL
-                                try:
-                                    close_all_orders_and_positions(API_KEY_MAIN, API_SECRET_MAIN, symbol=SYMBOL)
-                                except Exception as e:
-                                    logging.warning(f"Pre-SELL close-all failed: {e}")
+                                tp = entry - risk
 
+                            entry_r = round_price(entry, tick)
+                            sl_r    = round_price(sl,    tick)
+                            tp_r    = round_price(tp,    tick)
+
+                            try:
+                                rebalance_equal(API_KEY_MAIN, API_SECRET_MAIN, API_KEY_SUB, API_SECRET_SUB, SUB_UID)
+                            except Exception as e:
+                                logging.warning(f"{sym} Pre-trade rebalance failed: {e}")
+
+                            bal_main = get_wallet_balance(API_KEY_MAIN, API_SECRET_MAIN)
+                            bal_sub  = get_wallet_balance(API_KEY_SUB,  API_SECRET_SUB)
+                            combined = bal_main + bal_sub
+
+                            qty = compute_qty(entry_r, sl_r, bal_main, combined, lot, min_qty)
+                            if qty <= 0:
+                                logging.info(f"{sym} ⚠️ SELL sizing too small; skipping")
+                            else:
+                                if open_sell[sym] is not None:
+                                    logging.info(f"{sym} 🔁 New SELL signal while SELL open on MAIN -> closing existing MAIN {sym} orders/position first.")
+                                    close_account_symbol(API_KEY_MAIN, API_SECRET_MAIN, sym)
+                                    open_sell[sym] = None
+
+                                logging.info(f"{sym} ✅ SELL signal | Entry={entry_r} SL={sl_r} TP={tp_r} | qty={qty}")
                                 try:
-                                    entry_id = place_market_order(API_KEY_MAIN, API_SECRET_MAIN, "Sell", qty)
-                                    tp_id = place_reduce_only_tp(API_KEY_MAIN, API_SECRET_MAIN, "Sell", tp_r, qty)
-                                    sl_id = place_reduce_only_sl(API_KEY_MAIN, API_SECRET_MAIN, "Sell", sl_r, qty)
-                                    logging.info(f"📦 SELL opened (orderId={entry_id}); TP({tp_id}) & SL({sl_id}) placed")
-                                    open_sell = OpenTrade("Sell", qty, entry_r, sl_r, tp_r, entry_id, sl_id, tp_id,
-                                                           API_KEY_MAIN, API_SECRET_MAIN)
+                                    entry_id = place_market_order(API_KEY_MAIN, API_SECRET_MAIN, sym, "Sell", qty)
+                                    tp_id = place_reduce_only_tp(API_KEY_MAIN, API_SECRET_MAIN, sym, "Sell", tp_r, qty)
+                                    sl_id = place_reduce_only_sl_limit(API_KEY_MAIN, API_SECRET_MAIN, sym, "Sell", sl_r, qty)
+                                    logging.info(f"{sym} 📦 SELL opened (orderId={entry_id}); TP({tp_id}) & SL({sl_id}) LIMIT-ReduceOnly")
+                                    open_sell[sym] = OpenTrade(sym, "Sell", qty, entry_r, sl_r, tp_r, entry_id, sl_id, tp_id,
+                                                               API_KEY_MAIN, API_SECRET_MAIN)
+                                    last_result["main"][sym] = None
                                 except Exception as e:
-                                    logging.error(f"SELL order error: {e}")
+                                    logging.error(f"{sym} SELL order error: {e}")
                                 finally:
-                                    # After trade: rebalance main/sub to equal balances
                                     try:
                                         rebalance_equal(API_KEY_MAIN, API_SECRET_MAIN, API_KEY_SUB, API_SECRET_SUB, SUB_UID)
                                     except Exception as e:
-                                        logging.warning(f"Post-trade rebalance failed: {e}")
-                            sell_level = None
+                                        logging.warning(f"{sym} Post-trade rebalance failed: {e}")
+
+                        sell_level[sym] = None
 
         # ---- Profit siphon check (runs every loop) ----
         try:
@@ -727,3 +701,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
