@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Full compiled trading bot script with fixes:
-- SL as stop-market (reduceOnly)
+- SL as stop-market (reduceOnly) via /v5/order/create with triggerPrice
 - TP as limit reduceOnly
 - Per-symbol leverage (BONK 50x, TRX 75x)
 - Transfer endpoint uses inter-transfer
@@ -184,7 +184,6 @@ def universal_transfer_main_to_sub(api_key_master, api_secret_master, amount_usd
         "toMemberId": to_sub_uid
     }
     try:
-        # use inter-transfer endpoint path
         private_request(api_key_master, api_secret_master, "POST", "/v5/asset/transfer/inter-transfer", body=body)
         logging.info(f"🔁 Transfer MAIN(FUND) -> SUB(UNIFIED:{to_sub_uid}) {body['amount']} USDT")
         return True
@@ -328,46 +327,26 @@ def place_reduce_only_tp(api_key, api_secret, symbol, side, tp_price, qty):
     logging.info(f"Placing TP LIMIT ReduceOnly {opp} {symbol} qty={qty} price={tp_price} -> {data}")
     return data.get("result", {}).get("orderId")
 
-def place_reduce_only_sl_stopmarket(api_key, api_secret, symbol, side, sl_price, qty, trigger_by="LastPrice", base_price=None):
+def place_reduce_only_sl_stopmarket(api_key, api_secret, symbol, side, sl_price, qty, trigger_by="LastPrice"):
     """
-    Place a stop-market (triggered market) reduceOnly order for SL.
-    Implementation uses Bybit conditional order endpoint (v5 conditional order create shape).
-    If your Bybit returns parameter errors, adapt 'stopPx' vs 'triggerPrice' vs 'basePrice' to match your environment.
+    Place a stop-market (triggered market) reduceOnly order for SL via v5 order/create with triggerPrice.
+    Opposite side because we are reducing (if side=="Buy" the reduce order is Sell).
     """
-    # Opposite side because we are reducing (if side=="Buy" the reduce order is Sell)
     opp = "Sell" if side == "Buy" else "Buy"
-    # This is a conservative body that many Bybit v5 variants accept. If your instance requires different field names,
-    # adjust here (stopPx, triggerPrice, basePrice, triggerBy).
     body = {
         "category": "linear",
         "symbol": symbol,
         "side": opp,
-        "orderType": "Market",            # market executed when triggered
+        "orderType": "Market",        # executed as market when triggered
         "qty": str(qty),
         "reduceOnly": True,
-        # trigger fields:
-        "triggerPrice": str(sl_price),   # the price to trigger the stop-market
-        "basePrice": str(base_price) if base_price is not None else str(sl_price),
-        "triggerBy": trigger_by,         # "LastPrice" or "MarkPrice"
-        # optional: link with a clientOrderId might be added
+        "triggerPrice": str(sl_price),
+        "triggerBy": trigger_by,
+        "timeInForce": "GTC"
     }
-    # NOTE: many Bybit v5 installs use /v5/conditional/order/create or /v5/conditional/stop-order/create.
-    # We try common path /v5/conditional/order/create first; if that fails you may need to adjust path.
-    # We'll attempt with /v5/conditional/order/create.
-    try:
-        data = private_request(api_key, api_secret, "POST", "/v5/conditional/order/create", body=body)
-        logging.info(f"Placing SL stopMarket ReduceOnly {opp} {symbol} qty={qty} trigger={sl_price} -> {data}")
-        return data.get("result", {}).get("orderId")
-    except Exception as e:
-        # if endpoint not present, try alternative path for inter-transfer style /v5/conditional/stop-order/create
-        logging.warning(f"Conditional SL endpoint first attempt failed: {e}. Trying alternate conditional path.")
-        try:
-            data = private_request(api_key, api_secret, "POST", "/v5/conditional/stop-order/create", body=body)
-            logging.info(f"Placed SL via alt path -> {data}")
-            return data.get("result", {}).get("orderId")
-        except Exception as e2:
-            logging.error(f"Both conditional SL attempts failed: {e2}")
-            raise
+    data = private_request(api_key, api_secret, "POST", "/v5/order/create", body=body)
+    logging.info(f"Placing SL StopMarket ReduceOnly {opp} {symbol} qty={qty} trigger={sl_price} -> {data}")
+    return data.get("result", {}).get("orderId")
 
 def cancel_all_orders_for_symbol(api_key, api_secret, symbol):
     try:
@@ -574,8 +553,8 @@ def main():
                             try:
                                 entry_id = try_place_market_order_with_fallback(API_KEY_SUB, API_SECRET_SUB, sym, "Buy", qty, entry_r, get_wallet_balance(API_KEY_SUB, API_SECRET_SUB), leverage, lot, min_qty)
                                 tp_id = place_reduce_only_tp(API_KEY_SUB, API_SECRET_SUB, sym, "Buy", tp_r, qty)
-                                # SL: place stop-market reduceOnly (conditional)
-                                sl_id = place_reduce_only_sl_stopmarket(API_KEY_SUB, API_SECRET_SUB, sym, "Buy", sl_r, qty, trigger_by="LastPrice", base_price=str(entry_r))
+                                # SL: place stop-market reduceOnly (via order/create with triggerPrice)
+                                sl_id = place_reduce_only_sl_stopmarket(API_KEY_SUB, API_SECRET_SUB, sym, "Buy", sl_r, qty, trigger_by="LastPrice")
                                 logging.info(f"{sym} 📦 BUY opened (orderId={entry_id}); TP({tp_id}) & SL(stopMarket:{sl_id}) ReduceOnly")
                                 open_buy[sym] = type("OT",(object,),{"symbol":sym,"side":"Buy","qty":qty,"entry":entry_r,"sl":sl_r,"tp":tp_r,"entry_order_id":entry_id,"sl_order_id":sl_id,"tp_order_id":tp_id,"api_key":API_KEY_SUB,"api_secret":API_SECRET_SUB})()
                                 last_result["sub"][sym] = None
@@ -637,7 +616,7 @@ def main():
                             try:
                                 entry_id = try_place_market_order_with_fallback(API_KEY_MAIN, API_SECRET_MAIN, sym, "Sell", qty, entry_r, get_wallet_balance(API_KEY_MAIN, API_SECRET_MAIN), leverage, lot, min_qty)
                                 tp_id = place_reduce_only_tp(API_KEY_MAIN, API_SECRET_MAIN, sym, "Sell", tp_r, qty)
-                                sl_id = place_reduce_only_sl_stopmarket(API_KEY_MAIN, API_SECRET_MAIN, sym, "Sell", sl_r, qty, trigger_by="LastPrice", base_price=str(entry_r))
+                                sl_id = place_reduce_only_sl_stopmarket(API_KEY_MAIN, API_SECRET_MAIN, sym, "Sell", sl_r, qty, trigger_by="LastPrice")
                                 logging.info(f"{sym} 📦 SELL opened (orderId={entry_id}); TP({tp_id}) & SL(stopMarket:{sl_id}) ReduceOnly")
                                 open_sell[sym] = type("OT",(object,),{"symbol":sym,"side":"Sell","qty":qty,"entry":entry_r,"sl":sl_r,"tp":tp_r,"entry_order_id":entry_id,"sl_order_id":sl_id,"tp_order_id":tp_id,"api_key":API_KEY_MAIN,"api_secret":API_SECRET_MAIN})()
                                 last_result["main"][sym] = None
