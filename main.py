@@ -1,4 +1,4 @@
-here# Full edited bot: 1H (levels) + 5m (triggers) + trade execution + pre-trade rebalance + profit siphon
+# Full edited bot: 1H (levels) + 5m (triggers) + trade execution + pre-trade rebalance + profit siphon
 # + multi-symbol (TRX & 1000BONK), per-account role, same-type replacement, ReduceOnly LIMIT TP/SL,
 # SL-cross watchdog, UUID transferIds, per-symbol leverage (BONK=50), 2:1+0.07% TP after loss
 
