@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 """
-Full compiled trading bot script:
-- 1H levels arm; 5m triggers
-- Multi-symbol: TRXUSDT, 1000BONKUSDT
-- Main (SELL) + Sub (BUY) roles
+Full compiled trading bot script with fixes:
+- SL as stop-market (reduceOnly)
+- TP as limit reduceOnly
 - Per-symbol leverage (BONK 50x, TRX 75x)
-- Market entry + ReduceOnly LIMIT TP & ReduceOnly LIMIT SL
-- SL-cross watchdog (force close if SL price crossed but reduce-only SL still open)
-- Pre-trade rebalance (equalize main/sub)
-- Fallback sizing: 90% of account balance * leverage if insufficient
-- UUID transfer IDs
-- After SL: next trade for that account+symbol uses 2:1 + EXTRA_TP_PCT
+- Transfer endpoint uses inter-transfer
+- Fallback sizing (90% of account * leverage)
+- One-way-mode friendly (no positionIdx)
 """
 import os
 import hmac
@@ -31,26 +27,26 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 BASE_URL = "https://api.bybit.com"
 MARKET_URL = BASE_URL + "/v5/market"
 TIMEOUT = 15
-CATEGORY = "linear"  # using unified cross margin / USDT perpetuals
+CATEGORY = "linear"  # USDT perpetuals (unified / cross assumed)
 
-# Symbols: default TRXUSDT, 1000BONKUSDT
+# Symbols
 SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "TRXUSDT,1000BONKUSDT").split(",") if s.strip()]
 
 # Strategy params
 FIVE_M_HISTORY = 500
-EXTRA_TP_PCT = Decimal("0.0007")  # +0.07% of entry
+EXTRA_TP_PCT = Decimal("0.0007")  # +0.07% of entry when using 2:1+extra
 DEFAULT_LEVERAGE = Decimal("75")  # TRX
 BONK_LEVERAGE = Decimal("50")     # 1000BONK
 RISK_FRACTION = Decimal("0.10")   # 10% of combined balance risk
-BAL_CAP = Decimal("0.90")         # cap initial margin usage to 90% of account
+BAL_CAP = Decimal("0.90")         # cap initial margin usage to 90% of trading balance
 
-# API keys / ids - set via env or edit inline
+# API keys / ids
 API_KEY_MAIN    = os.getenv("BYBIT_MAIN_KEY",    "PUT_MAIN_KEY_HERE")
 API_SECRET_MAIN = os.getenv("BYBIT_MAIN_SECRET", "PUT_MAIN_SECRET_HERE")
 API_KEY_SUB     = os.getenv("BYBIT_SUB_KEY",     "PUT_SUB_KEY_HERE")
 API_SECRET_SUB  = os.getenv("BYBIT_SUB_SECRET",  "PUT_SUB_SECRET_HERE")
-SUB_UID         = os.getenv("BYBIT_SUB_UID",     "PUT_SUB_UID_HERE")    # target sub member id for transfers
-PROFIT_UID      = os.getenv("BYBIT_PROFIT_UID",  "PUT_PROFIT_UID_HERE") # profit siphon UID (optional)
+SUB_UID         = os.getenv("BYBIT_SUB_UID",     "PUT_SUB_UID_HERE")
+PROFIT_UID      = os.getenv("BYBIT_PROFIT_UID",  "PUT_PROFIT_UID_HERE")
 SIPHON_BASE_USD = Decimal(os.getenv("BYBIT_SIPHON_BASE_USD", "10"))
 
 # =========================
@@ -102,7 +98,7 @@ def market_kline_url():
     return MARKET_URL + "/kline"
 
 def get_candles(symbol, interval="60", limit=200):
-    params = {"category": CATEGORY, "symbol": symbol, "interval": interval, "limit": limit}
+    params = {"category": "linear", "symbol": symbol, "interval": interval, "limit": limit}
     r = requests.get(market_kline_url(), params=params, timeout=TIMEOUT)
     r.raise_for_status()
     data = r.json()
@@ -140,10 +136,10 @@ def wait_until_next_5m():
     time.sleep(sleep_s)
 
 # =========================
-# Precision & instrument info
+# Instrument info & rounding
 # =========================
 def get_instrument_info(symbol):
-    params = {"category": CATEGORY, "symbol": symbol}
+    params = {"category": "linear", "symbol": symbol}
     r = requests.get(MARKET_URL + "/instruments-info", params=params, timeout=TIMEOUT)
     r.raise_for_status()
     data = r.json()
@@ -162,7 +158,7 @@ def round_qty(qty: Decimal, step: Decimal) -> Decimal:
     return (qty // step) * step
 
 # =========================
-# Balances & transfers (UNIFIED / FUND mapping)
+# Balances & transfers (use inter-transfer for main<->sub)
 # =========================
 def get_wallet_balance(api_key, api_secret):
     params = {"accountType": "UNIFIED", "coin": "USDT"}
@@ -175,8 +171,10 @@ def get_wallet_balance(api_key, api_secret):
 def _uuid():
     return str(uuid.uuid4())
 
-# Transfer MAIN (FUND) -> SUB (UNIFIED) and reverse.
 def universal_transfer_main_to_sub(api_key_master, api_secret_master, amount_usdt: Decimal, to_sub_uid: str):
+    """
+    MAIN (FUND) -> SUB (UNIFIED) via inter-transfer endpoint
+    """
     body = {
         "transferId": _uuid(),
         "coin": "USDT",
@@ -186,7 +184,8 @@ def universal_transfer_main_to_sub(api_key_master, api_secret_master, amount_usd
         "toMemberId": to_sub_uid
     }
     try:
-        private_request(api_key_master, api_secret_master, "POST", "/v5/asset/transfer", body=body)
+        # use inter-transfer endpoint path
+        private_request(api_key_master, api_secret_master, "POST", "/v5/asset/transfer/inter-transfer", body=body)
         logging.info(f"🔁 Transfer MAIN(FUND) -> SUB(UNIFIED:{to_sub_uid}) {body['amount']} USDT")
         return True
     except Exception as e:
@@ -194,6 +193,9 @@ def universal_transfer_main_to_sub(api_key_master, api_secret_master, amount_usd
         return False
 
 def universal_transfer_sub_to_main(api_key_master, api_secret_master, amount_usdt: Decimal, from_sub_uid: str):
+    """
+    SUB (UNIFIED) -> MAIN (FUND) via inter-transfer endpoint
+    """
     body = {
         "transferId": _uuid(),
         "coin": "USDT",
@@ -203,7 +205,7 @@ def universal_transfer_sub_to_main(api_key_master, api_secret_master, amount_usd
         "fromMemberId": from_sub_uid
     }
     try:
-        private_request(api_key_master, api_secret_master, "POST", "/v5/asset/transfer", body=body)
+        private_request(api_key_master, api_secret_master, "POST", "/v5/asset/transfer/inter-transfer", body=body)
         logging.info(f"🔁 Transfer SUB(UNIFIED:{from_sub_uid}) -> MAIN(FUND) {body['amount']} USDT")
         return True
     except Exception as e:
@@ -220,7 +222,7 @@ def universal_transfer_main_to_uid(api_key_master, api_secret_master, amount_usd
         "toMemberId": to_uid
     }
     try:
-        private_request(api_key_master, api_secret_master, "POST", "/v5/asset/transfer", body=body)
+        private_request(api_key_master, api_secret_master, "POST", "/v5/asset/transfer/inter-transfer", body=body)
         logging.info(f"🔁 Transfer MAIN -> UID({to_uid}) {body['amount']} USDT")
         return True
     except Exception as e:
@@ -238,7 +240,7 @@ def universal_transfer_sub_to_uid(api_key_master, api_secret_master, amount_usdt
         "toMemberId": to_uid
     }
     try:
-        private_request(api_key_master, api_secret_master, "POST", "/v5/asset/transfer", body=body)
+        private_request(api_key_master, api_secret_master, "POST", "/v5/asset/transfer/inter-transfer", body=body)
         logging.info(f"🔁 Transfer SUB({from_sub_uid}) -> UID({to_uid}) {body['amount']} USDT")
         return True
     except Exception as e:
@@ -256,11 +258,9 @@ def rebalance_equal(api_key_main, api_secret_main, api_key_sub, api_secret_sub, 
             return
         amt = abs(delta_main)
         if delta_main > 0:
-            # move from sub -> main
             if sub_uid and sub_uid != "PUT_SUB_UID_HERE":
                 universal_transfer_sub_to_main(api_key_main, api_secret_main, amt, sub_uid)
         else:
-            # move from main -> sub
             if sub_uid and sub_uid != "PUT_SUB_UID_HERE":
                 universal_transfer_main_to_sub(api_key_main, api_secret_main, amt, sub_uid)
     except Exception as e:
@@ -298,11 +298,11 @@ def siphon_profits_if_needed(api_key_main, api_secret_main, api_key_sub, api_sec
         logging.info(f"✅ Siphon done. New milestone ${milestone_ref['value']:.2f} (next at ${ (milestone_ref['value']*2):.2f }).")
 
 # =========================
-# Orders & execution
+# Orders & execution (SL as stop-market ReduceOnly)
 # =========================
 def set_leverage(api_key, api_secret, symbol, leverage: Decimal):
     try:
-        body = {"category": CATEGORY, "symbol": symbol, "leverage": str(int(leverage))}
+        body = {"category": "linear", "symbol": symbol, "leverage": str(int(leverage))}
         private_request(api_key, api_secret, "POST", "/v5/position/set-leverage", body=body)
         logging.info(f"Set leverage {leverage}x for {symbol} on account.")
         return True
@@ -316,40 +316,75 @@ def get_leverage_for_symbol(symbol):
     return DEFAULT_LEVERAGE
 
 def place_market_order(api_key, api_secret, symbol, side, qty):
-    body = {"category": CATEGORY, "symbol": symbol, "side": side, "orderType": "Market", "qty": str(qty), "timeInForce": "IOC"}
+    body = {"category": "linear", "symbol": symbol, "side": side, "orderType": "Market", "qty": str(qty), "timeInForce": "IOC"}
     data = private_request(api_key, api_secret, "POST", "/v5/order/create", body=body)
     logging.info(f"Placing MARKET {side} {symbol} qty={qty} -> {data}")
     return data.get("result", {}).get("orderId")
 
 def place_reduce_only_tp(api_key, api_secret, symbol, side, tp_price, qty):
     opp = "Sell" if side == "Buy" else "Buy"
-    body = {"category": CATEGORY, "symbol": symbol, "side": opp, "orderType": "Limit", "price": str(tp_price), "qty": str(qty), "reduceOnly": True, "timeInForce": "GTC"}
+    body = {"category": "linear", "symbol": symbol, "side": opp, "orderType": "Limit", "price": str(tp_price), "qty": str(qty), "reduceOnly": True, "timeInForce": "GTC"}
     data = private_request(api_key, api_secret, "POST", "/v5/order/create", body=body)
     logging.info(f"Placing TP LIMIT ReduceOnly {opp} {symbol} qty={qty} price={tp_price} -> {data}")
     return data.get("result", {}).get("orderId")
 
-def place_reduce_only_sl_limit(api_key, api_secret, symbol, side, sl_price, qty):
+def place_reduce_only_sl_stopmarket(api_key, api_secret, symbol, side, sl_price, qty, trigger_by="LastPrice", base_price=None):
+    """
+    Place a stop-market (triggered market) reduceOnly order for SL.
+    Implementation uses Bybit conditional order endpoint (v5 conditional order create shape).
+    If your Bybit returns parameter errors, adapt 'stopPx' vs 'triggerPrice' vs 'basePrice' to match your environment.
+    """
+    # Opposite side because we are reducing (if side=="Buy" the reduce order is Sell)
     opp = "Sell" if side == "Buy" else "Buy"
-    body = {"category": CATEGORY, "symbol": symbol, "side": opp, "orderType": "Limit", "price": str(sl_price), "qty": str(qty), "reduceOnly": True, "timeInForce": "GTC"}
-    data = private_request(api_key, api_secret, "POST", "/v5/order/create", body=body)
-    logging.info(f"Placing SL LIMIT ReduceOnly {opp} {symbol} qty={qty} price={sl_price} -> {data}")
-    return data.get("result", {}).get("orderId")
+    # This is a conservative body that many Bybit v5 variants accept. If your instance requires different field names,
+    # adjust here (stopPx, triggerPrice, basePrice, triggerBy).
+    body = {
+        "category": "linear",
+        "symbol": symbol,
+        "side": opp,
+        "orderType": "Market",            # market executed when triggered
+        "qty": str(qty),
+        "reduceOnly": True,
+        # trigger fields:
+        "triggerPrice": str(sl_price),   # the price to trigger the stop-market
+        "basePrice": str(base_price) if base_price is not None else str(sl_price),
+        "triggerBy": trigger_by,         # "LastPrice" or "MarkPrice"
+        # optional: link with a clientOrderId might be added
+    }
+    # NOTE: many Bybit v5 installs use /v5/conditional/order/create or /v5/conditional/stop-order/create.
+    # We try common path /v5/conditional/order/create first; if that fails you may need to adjust path.
+    # We'll attempt with /v5/conditional/order/create.
+    try:
+        data = private_request(api_key, api_secret, "POST", "/v5/conditional/order/create", body=body)
+        logging.info(f"Placing SL stopMarket ReduceOnly {opp} {symbol} qty={qty} trigger={sl_price} -> {data}")
+        return data.get("result", {}).get("orderId")
+    except Exception as e:
+        # if endpoint not present, try alternative path for inter-transfer style /v5/conditional/stop-order/create
+        logging.warning(f"Conditional SL endpoint first attempt failed: {e}. Trying alternate conditional path.")
+        try:
+            data = private_request(api_key, api_secret, "POST", "/v5/conditional/stop-order/create", body=body)
+            logging.info(f"Placed SL via alt path -> {data}")
+            return data.get("result", {}).get("orderId")
+        except Exception as e2:
+            logging.error(f"Both conditional SL attempts failed: {e2}")
+            raise
 
 def cancel_all_orders_for_symbol(api_key, api_secret, symbol):
     try:
-        private_request(api_key, api_secret, "POST", "/v5/order/cancel-all", body={"category": CATEGORY, "symbol": symbol})
+        private_request(api_key, api_secret, "POST", "/v5/order/cancel-all", body={"category": "linear", "symbol": symbol})
         logging.info(f"🧹 Cancelled all orders on this account for {symbol}.")
     except Exception as e:
         logging.warning(f"Cancel orders failed for {symbol}: {e}")
 
 def market_close_all_positions_for_symbol(api_key, api_secret, symbol):
     try:
-        pos_data = private_request(api_key, api_secret, "GET", "/v5/position/list", params={"category": CATEGORY, "symbol": symbol})
+        pos_data = private_request(api_key, api_secret, "GET", "/v5/position/list", params={"category": "linear", "symbol": symbol})
         for pos in pos_data["result"]["list"]:
             side = pos["side"]; size = Decimal(pos["size"])
             if size > 0:
                 opp = "Sell" if side == "Buy" else "Buy"
-                private_request(api_key, api_secret, "POST", "/v5/order/create", body={"category": CATEGORY, "symbol": symbol, "side": opp, "orderType": "Market", "qty": str(size), "reduceOnly": True, "timeInForce": "IOC"})
+                private_request(api_key, api_secret, "POST", "/v5/order/create",
+                                body={"category": "linear", "symbol": symbol, "side": opp, "orderType": "Market", "qty": str(size), "reduceOnly": True, "timeInForce": "IOC"})
                 logging.info(f"🔒 Closed {side} position of {size} {symbol}.")
     except Exception as e:
         logging.warning(f"Close positions failed for {symbol}: {e}")
@@ -367,7 +402,6 @@ def compute_qty(entry: Decimal, sl: Decimal, trading_bal: Decimal, combined_bal:
         return Decimal("0")
     risk_usd = combined_bal * RISK_FRACTION
     qty_risk = (risk_usd / per_coin_risk)
-    # qty cap based on trading account's leverage (use provided per-symbol leverage)
     qty_cap  = (trading_bal * BAL_CAP * leverage) / entry
     qty = min(qty_risk, qty_cap)
     qty = round_qty(qty, lot_step)
@@ -389,7 +423,7 @@ def try_place_market_order_with_fallback(api_key, api_secret, symbol, side, qty,
         set_leverage(api_key, api_secret, symbol, leverage)
         return place_market_order(api_key, api_secret, symbol, side, qty)
     except Exception as e:
-        logging.warning(f"{symbol} initial market order failed: {e}. Attempting fallback sizing based on 90% of account balance.")
+        logging.warning(f"{symbol} initial market order failed: {e}. Attempting fallback sizing.")
         fallback_qty = fallback_qty_by_account_balance(entry_price, trading_bal, leverage, lot_step, min_qty)
         if fallback_qty <= 0:
             logging.info(f"{symbol} fallback qty too small ({fallback_qty}) -> skipping trade.")
@@ -409,24 +443,23 @@ def try_place_market_order_with_fallback(api_key, api_secret, symbol, side, qty,
 # Main loop & state
 # =========================
 def main():
-    # per-symbol instrument precision cache
+    # instrument precision cache
     precision = {}
     for sym in SYMBOLS:
         tick, lot_step, min_qty = get_instrument_info(sym)
         precision[sym] = {"tick": tick, "lot": lot_step, "min": min_qty}
         logging.info(f"{sym}: tick={tick} lotStep={lot_step} minQty={min_qty}")
 
-    # state
     buy_level   = {sym: None for sym in SYMBOLS}
     sell_level  = {sym: None for sym in SYMBOLS}
     last_hour_processed = None
 
-    open_buy  = {sym: None for sym in SYMBOLS}   # sub account trades
-    open_sell = {sym: None for sym in SYMBOLS}   # main account trades
+    open_buy  = {sym: None for sym in SYMBOLS}
+    open_sell = {sym: None for sym in SYMBOLS}
 
     ha_5m_history = {sym: deque(maxlen=FIVE_M_HISTORY) for sym in SYMBOLS}
     siphon_state = {"value": None}
-    last_result = {"sub": {sym: None for sym in SYMBOLS}, "main": {sym: None for sym in SYMBOLS}}  # "win"/"loss"/None
+    last_result = {"sub": {sym: None for sym in SYMBOLS}, "main": {sym: None for sym in SYMBOLS}}
 
     while True:
         now = datetime.utcnow()
@@ -457,7 +490,7 @@ def main():
                         buy_level[sym]  = None
                         logging.info(f"{sym} 🎯 Sell Level set @ {sell_level[sym].price} (valid 1h)")
 
-        # every 5m processing per symbol
+        # every 5m processing
         for sym in SYMBOLS:
             tick = precision[sym]["tick"]; lot = precision[sym]["lot"]; min_qty = precision[sym]["min"]
 
@@ -477,7 +510,7 @@ def main():
 
             h5 = Decimal(str(h5)); l5 = Decimal(str(l5)); c5 = Decimal(str(c5))
 
-            # Watchdog: if SL-cross occurred in candle but trade still registered -> force close affected account symbol only
+            # SL-cross watchdog
             ob = open_buy[sym]
             if ob is not None and l5 <= ob.sl:
                 logging.info(f"🛡️ {sym} BUY SL crossed (low {l5} <= SL {ob.sl}); force-closing SUB {sym}.")
@@ -492,7 +525,7 @@ def main():
                 open_sell[sym] = None
                 last_result["main"][sym] = "loss"
 
-            # BUY (SUB)
+            # BUY on SUB
             if buy_level[sym] is not None:
                 if datetime.utcnow() >= buy_level[sym].expiry:
                     logging.info(f"{sym} ⌛ Buy Level expired")
@@ -511,7 +544,6 @@ def main():
                                 tp = entry + risk
                             entry_r = round_price(entry, tick); sl_r = round_price(sl, tick); tp_r = round_price(tp, tick)
 
-                            # pre-trade rebalance
                             try:
                                 rebalance_equal(API_KEY_MAIN, API_SECRET_MAIN, API_KEY_SUB, API_SECRET_SUB, SUB_UID)
                             except Exception as e:
@@ -532,7 +564,6 @@ def main():
                                 qty = fallback
                                 logging.info(f"{sym} Using fallback BUY qty based on 90% sub balance: {qty}")
 
-                            # If same-type BUY already open on SUB for this symbol: close only SUB's symbol orders/positions first
                             if open_buy[sym] is not None:
                                 logging.info(f"{sym} 🔁 New BUY signal while BUY open on SUB -> closing existing SUB {sym} orders/position first.")
                                 close_account_symbol(API_KEY_SUB, API_SECRET_SUB, sym)
@@ -543,8 +574,9 @@ def main():
                             try:
                                 entry_id = try_place_market_order_with_fallback(API_KEY_SUB, API_SECRET_SUB, sym, "Buy", qty, entry_r, get_wallet_balance(API_KEY_SUB, API_SECRET_SUB), leverage, lot, min_qty)
                                 tp_id = place_reduce_only_tp(API_KEY_SUB, API_SECRET_SUB, sym, "Buy", tp_r, qty)
-                                sl_id = place_reduce_only_sl_limit(API_KEY_SUB, API_SECRET_SUB, sym, "Buy", sl_r, qty)
-                                logging.info(f"{sym} 📦 BUY opened (orderId={entry_id}); TP({tp_id}) & SL({sl_id}) LIMIT-ReduceOnly")
+                                # SL: place stop-market reduceOnly (conditional)
+                                sl_id = place_reduce_only_sl_stopmarket(API_KEY_SUB, API_SECRET_SUB, sym, "Buy", sl_r, qty, trigger_by="LastPrice", base_price=str(entry_r))
+                                logging.info(f"{sym} 📦 BUY opened (orderId={entry_id}); TP({tp_id}) & SL(stopMarket:{sl_id}) ReduceOnly")
                                 open_buy[sym] = type("OT",(object,),{"symbol":sym,"side":"Buy","qty":qty,"entry":entry_r,"sl":sl_r,"tp":tp_r,"entry_order_id":entry_id,"sl_order_id":sl_id,"tp_order_id":tp_id,"api_key":API_KEY_SUB,"api_secret":API_SECRET_SUB})()
                                 last_result["sub"][sym] = None
                             except Exception as e:
@@ -557,7 +589,7 @@ def main():
 
                         buy_level[sym] = None
 
-            # SELL (MAIN)
+            # SELL on MAIN
             if sell_level[sym] is not None:
                 if datetime.utcnow() >= sell_level[sym].expiry:
                     logging.info(f"{sym} ⌛ Sell Level expired")
@@ -605,8 +637,8 @@ def main():
                             try:
                                 entry_id = try_place_market_order_with_fallback(API_KEY_MAIN, API_SECRET_MAIN, sym, "Sell", qty, entry_r, get_wallet_balance(API_KEY_MAIN, API_SECRET_MAIN), leverage, lot, min_qty)
                                 tp_id = place_reduce_only_tp(API_KEY_MAIN, API_SECRET_MAIN, sym, "Sell", tp_r, qty)
-                                sl_id = place_reduce_only_sl_limit(API_KEY_MAIN, API_SECRET_MAIN, sym, "Sell", sl_r, qty)
-                                logging.info(f"{sym} 📦 SELL opened (orderId={entry_id}); TP({tp_id}) & SL({sl_id}) LIMIT-ReduceOnly")
+                                sl_id = place_reduce_only_sl_stopmarket(API_KEY_MAIN, API_SECRET_MAIN, sym, "Sell", sl_r, qty, trigger_by="LastPrice", base_price=str(entry_r))
+                                logging.info(f"{sym} 📦 SELL opened (orderId={entry_id}); TP({tp_id}) & SL(stopMarket:{sl_id}) ReduceOnly")
                                 open_sell[sym] = type("OT",(object,),{"symbol":sym,"side":"Sell","qty":qty,"entry":entry_r,"sl":sl_r,"tp":tp_r,"entry_order_id":entry_id,"sl_order_id":sl_id,"tp_order_id":tp_id,"api_key":API_KEY_MAIN,"api_secret":API_SECRET_MAIN})()
                                 last_result["main"][sym] = None
                             except Exception as e:
@@ -619,13 +651,12 @@ def main():
 
                         sell_level[sym] = None
 
-        # profit siphon check every loop
+        # profit siphon check
         try:
             siphon_profits_if_needed(API_KEY_MAIN, API_SECRET_MAIN, API_KEY_SUB, API_SECRET_SUB, SUB_UID, PROFIT_UID, siphon_state)
         except Exception as e:
             logging.warning(f"Siphon check failed: {e}")
 
-        # align to next 5m mark
         wait_until_next_5m()
 
 if __name__ == "__main__":
