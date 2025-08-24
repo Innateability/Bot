@@ -1,4 +1,4 @@
-# Full edited bot: 1H (levels) + 5m (triggers) + trade execution + pre-trade rebalance + profit siphon
+BONKUSDTDTDT edited bot: 1H (levels) + 5m (triggers) + trade execution + pre-trade rebalance + profit siphon
 # + multi-symbol (TRX & BONK), per-account role, same-type replacement, ReduceOnly LIMIT TP/SL,
 # SL-cross watchdog, UUID transferIds, 2:1+0.07% TP after loss
 
@@ -29,7 +29,7 @@ CATEGORY = "linear"               # USDT perpetuals
 
 # -------- Symbols (multi) --------
 # Set exact Bybit symbols here or via env (comma separated)
-SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "TRXUSDT,BONKUSDT").split(",") if s.strip()]
+SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "TRXUSDT,1000BONKUSDT").split(",") if s.strip()]
 
 # -------- Strategy Config --------
 FIVE_M_HISTORY = 500               # keep HA candles for context
