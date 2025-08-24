@@ -1,7 +1,17 @@
-# Full edited bot: 1H (levels) + 5m (triggers) + trade execution + pre-trade rebalance + profit siphon
-# + multi-symbol (TRX & 1000BONK), per-account role, same-type replacement, ReduceOnly LIMIT TP/SL,
-# SL-cross watchdog, UUID transferIds, per-symbol leverage (BONK=50), 2:1+0.07% TP after loss
-
+#!/usr/bin/env python3
+"""
+Full compiled trading bot script:
+- 1H levels arm; 5m triggers
+- Multi-symbol: TRXUSDT, 1000BONKUSDT
+- Main (SELL) + Sub (BUY) roles
+- Per-symbol leverage (BONK 50x, TRX 75x)
+- Market entry + ReduceOnly LIMIT TP & ReduceOnly LIMIT SL
+- SL-cross watchdog (force close if SL price crossed but reduce-only SL still open)
+- Pre-trade rebalance (equalize main/sub)
+- Fallback sizing: 90% of account balance * leverage if insufficient
+- UUID transfer IDs
+- After SL: next trade for that account+symbol uses 2:1 + EXTRA_TP_PCT
+"""
 import os
 import hmac
 import hashlib
@@ -17,42 +27,77 @@ from collections import deque
 # -------- Logging --------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
-# -------- Public Market Config --------
+# -------- Config --------
 BASE_URL = "https://api.bybit.com"
 MARKET_URL = BASE_URL + "/v5/market"
-ORDER_URL  = BASE_URL + "/v5/order"
-ACCOUNT_URL= BASE_URL + "/v5/account"
-ASSET_URL  = BASE_URL + "/v5/asset"
+TIMEOUT = 15
+CATEGORY = "linear"  # using unified cross margin / USDT perpetuals
 
-TIMEOUT = 15                      # HTTP timeout (seconds)
-CATEGORY = "linear"               # USDT perpetuals
-
-# -------- Symbols (multi) --------
-# default changed to TRX and 1000BONK (per request)
+# Symbols: default TRXUSDT, 1000BONKUSDT
 SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "TRXUSDT,1000BONKUSDT").split(",") if s.strip()]
 
-# -------- Strategy Config --------
-FIVE_M_HISTORY = 500               # keep HA candles for context
-EXTRA_TP_PCT = Decimal("0.0007")   # +0.07% of entry price when using 2:1+extra
-DEFAULT_LEVERAGE = Decimal("75")   # default symbol leverage (TRX)
-BONK_LEVERAGE = Decimal("50")      # 1000BONK leverage
-RISK_FRACTION = Decimal("0.10")    # 10% of combined balance risk
-BAL_CAP = Decimal("0.90")          # cap to 90% of that account balance (for margin)
+# Strategy params
+FIVE_M_HISTORY = 500
+EXTRA_TP_PCT = Decimal("0.0007")  # +0.07% of entry
+DEFAULT_LEVERAGE = Decimal("75")  # TRX
+BONK_LEVERAGE = Decimal("50")     # 1000BONK
+RISK_FRACTION = Decimal("0.10")   # 10% of combined balance risk
+BAL_CAP = Decimal("0.90")         # cap initial margin usage to 90% of account
 
-# -------- API keys (set your real keys or environment vars) --------
+# API keys / ids - set via env or edit inline
 API_KEY_MAIN    = os.getenv("BYBIT_MAIN_KEY",    "PUT_MAIN_KEY_HERE")
 API_SECRET_MAIN = os.getenv("BYBIT_MAIN_SECRET", "PUT_MAIN_SECRET_HERE")
 API_KEY_SUB     = os.getenv("BYBIT_SUB_KEY",     "PUT_SUB_KEY_HERE")
 API_SECRET_SUB  = os.getenv("BYBIT_SUB_SECRET",  "PUT_SUB_SECRET_HERE")
-SUB_UID = os.getenv("BYBIT_SUB_UID", "PUT_SUB_UID_HERE")  # numeric string of your trading SUB
-
-# ---- Profit siphon ----
-PROFIT_UID = os.getenv("BYBIT_PROFIT_UID", "PUT_PROFIT_UID_HERE")   # numeric string
+SUB_UID         = os.getenv("BYBIT_SUB_UID",     "PUT_SUB_UID_HERE")    # target sub member id for transfers
+PROFIT_UID      = os.getenv("BYBIT_PROFIT_UID",  "PUT_PROFIT_UID_HERE") # profit siphon UID (optional)
 SIPHON_BASE_USD = Decimal(os.getenv("BYBIT_SIPHON_BASE_USD", "10"))
 
 # =========================
-# Helpers: HA & scheduling
+# Helpers
 # =========================
+def _ts_ms():
+    return str(int(time.time() * 1000))
+
+def _sign(secret: str, payload: str) -> str:
+    return hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+
+def private_request(api_key, api_secret, method, path, params=None, body=None):
+    if params is None: params = {}
+    if body is None: body = {}
+    url = BASE_URL + path
+    ts = _ts_ms()
+    recv_window = "5000"
+    if method.upper() == "GET":
+        query = "&".join([f"{k}={params[k]}" for k in sorted(params)]) if params else ""
+        payload = ts + api_key + recv_window + query
+        sign = _sign(api_secret, payload)
+        headers = {
+            "X-BAPI-API-KEY": api_key,
+            "X-BAPI-TIMESTAMP": ts,
+            "X-BAPI-RECV-WINDOW": recv_window,
+            "X-BAPI-SIGN": sign
+        }
+        r = requests.get(url, params=params, headers=headers, timeout=TIMEOUT)
+    else:
+        query = "&".join([f"{k}={params[k]}" for k in sorted(params)]) if params else ""
+        body_json = json.dumps(body) if body else ""
+        payload = ts + api_key + recv_window + query + body_json
+        sign = _sign(api_secret, payload)
+        headers = {
+            "X-BAPI-API-KEY": api_key,
+            "X-BAPI-TIMESTAMP": ts,
+            "X-BAPI-RECV-WINDOW": recv_window,
+            "X-BAPI-SIGN": sign,
+            "Content-Type": "application/json"
+        }
+        r = requests.post(url, params=params, data=body_json, headers=headers, timeout=TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("retCode") != 0:
+        raise RuntimeError(f"Bybit error {data.get('retCode')}: {data.get('retMsg')} | {data}")
+    return data
+
 def market_kline_url():
     return MARKET_URL + "/kline"
 
@@ -63,12 +108,12 @@ def get_candles(symbol, interval="60", limit=200):
     data = r.json()
     if "result" not in data or "list" not in data["result"]:
         raise RuntimeError(f"Bad response for {symbol} interval {interval}: {data}")
-    return data["result"]["list"]  # newest first
+    return data["result"]["list"]
 
 def to_heikin_ashi(raw):
     ha = []
     D2 = Decimal("2"); D4 = Decimal("4")
-    for i, c in enumerate(reversed(raw)):  # chronological
+    for i, c in enumerate(reversed(raw)):
         ts = int(c[0])
         o = Decimal(str(c[1])); h = Decimal(str(c[2])); l = Decimal(str(c[3])); cl = Decimal(str(c[4]))
         ha_close = (o + h + l + cl) / D4
@@ -95,41 +140,7 @@ def wait_until_next_5m():
     time.sleep(sleep_s)
 
 # =========================
-# Private REST auth/sign
-# =========================
-def _ts_ms():
-    return str(int(time.time() * 1000))
-
-def _sign(secret: str, payload: str) -> str:
-    return hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
-
-def private_request(api_key, api_secret, method, path, params=None, body=None):
-    if params is None: params = {}
-    if body is None: body = {}
-    url = BASE_URL + path
-    ts = _ts_ms()
-    recv_window = "5000"
-    if method.upper() == "GET":
-        query = "&".join([f"{k}={params[k]}" for k in sorted(params)]) if params else ""
-        payload = ts + api_key + recv_window + query
-        sign = _sign(api_secret, payload)
-        headers = {"X-BAPI-API-KEY": api_key, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": recv_window, "X-BAPI-SIGN": sign}
-        r = requests.get(url, params=params, headers=headers, timeout=TIMEOUT)
-    else:
-        query = "&".join([f"{k}={params[k]}" for k in sorted(params)]) if params else ""
-        body_json = json.dumps(body) if body else ""
-        payload = ts + api_key + recv_window + query + body_json
-        sign = _sign(api_secret, payload)
-        headers = {"X-BAPI-API-KEY": api_key, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": recv_window, "X-BAPI-SIGN": sign, "Content-Type": "application/json"}
-        r = requests.post(url, params=params, data=body_json, headers=headers, timeout=TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    if data.get("retCode") != 0:
-        raise RuntimeError(f"Bybit error {data.get('retCode')}: {data.get('retMsg')} | {data}")
-    return data
-
-# =========================
-# Instrument precision
+# Precision & instrument info
 # =========================
 def get_instrument_info(symbol):
     params = {"category": CATEGORY, "symbol": symbol}
@@ -151,7 +162,7 @@ def round_qty(qty: Decimal, step: Decimal) -> Decimal:
     return (qty // step) * step
 
 # =========================
-# Balances & rebalancing
+# Balances & transfers (UNIFIED / FUND mapping)
 # =========================
 def get_wallet_balance(api_key, api_secret):
     params = {"accountType": "UNIFIED", "coin": "USDT"}
@@ -164,14 +175,8 @@ def get_wallet_balance(api_key, api_secret):
 def _uuid():
     return str(uuid.uuid4())
 
-# NOTE: Bybit's various transfer APIs differ between "inter-transfer" and master-sub transfers.
-# Here we use the transfer endpoint bodies that commonly work for FUND <-> UNIFIED movement.
-# You may need to adapt to your exact account type mapping or exchange variant.
+# Transfer MAIN (FUND) -> SUB (UNIFIED) and reverse.
 def universal_transfer_main_to_sub(api_key_master, api_secret_master, amount_usdt: Decimal, to_sub_uid: str):
-    """
-    Transfer from MAIN (FUND) -> SUB (UNIFIED for that sub member).
-    Uses transferId UUID and sets fromAccountType to FUND, toAccountType UNIFIED.
-    """
     body = {
         "transferId": _uuid(),
         "coin": "USDT",
@@ -189,9 +194,6 @@ def universal_transfer_main_to_sub(api_key_master, api_secret_master, amount_usd
         return False
 
 def universal_transfer_sub_to_main(api_key_master, api_secret_master, amount_usdt: Decimal, from_sub_uid: str):
-    """
-    Transfer from SUB (UNIFIED) -> MAIN (FUND).
-    """
     body = {
         "transferId": _uuid(),
         "coin": "USDT",
@@ -208,7 +210,6 @@ def universal_transfer_sub_to_main(api_key_master, api_secret_master, amount_usd
         logging.warning(f"Transfer SUB->MAIN failed: {e}")
         return False
 
-# utility: transfer from main to arbitrary UID (profit siphon)
 def universal_transfer_main_to_uid(api_key_master, api_secret_master, amount_usdt: Decimal, to_uid: str):
     body = {
         "transferId": _uuid(),
@@ -255,15 +256,17 @@ def rebalance_equal(api_key_main, api_secret_main, api_key_sub, api_secret_sub, 
             return
         amt = abs(delta_main)
         if delta_main > 0:
+            # move from sub -> main
             if sub_uid and sub_uid != "PUT_SUB_UID_HERE":
                 universal_transfer_sub_to_main(api_key_main, api_secret_main, amt, sub_uid)
         else:
+            # move from main -> sub
             if sub_uid and sub_uid != "PUT_SUB_UID_HERE":
                 universal_transfer_main_to_sub(api_key_main, api_secret_main, amt, sub_uid)
     except Exception as e:
         logging.warning(f"Rebalance equal failed: {e}")
 
-# ---- Profit siphon helper ----
+# Profit siphon helper
 def siphon_profits_if_needed(api_key_main, api_secret_main, api_key_sub, api_secret_sub, sub_uid: str, dest_uid: str, milestone_ref: dict):
     if not dest_uid or dest_uid == "PUT_PROFIT_UID_HERE":
         return
@@ -295,19 +298,11 @@ def siphon_profits_if_needed(api_key_main, api_secret_main, api_key_sub, api_sec
         logging.info(f"✅ Siphon done. New milestone ${milestone_ref['value']:.2f} (next at ${ (milestone_ref['value']*2):.2f }).")
 
 # =========================
-# Orders & helpers
+# Orders & execution
 # =========================
 def set_leverage(api_key, api_secret, symbol, leverage: Decimal):
-    """
-    Set leverage for symbol on the account. Assumes One-way mode (no positionIdx).
-    Body may vary depending on Bybit implementation — this is a common v5 shape.
-    """
     try:
-        body = {
-            "category": CATEGORY,
-            "symbol": symbol,
-            "leverage": str(int(leverage))
-        }
+        body = {"category": CATEGORY, "symbol": symbol, "leverage": str(int(leverage))}
         private_request(api_key, api_secret, "POST", "/v5/position/set-leverage", body=body)
         logging.info(f"Set leverage {leverage}x for {symbol} on account.")
         return True
@@ -316,7 +311,6 @@ def set_leverage(api_key, api_secret, symbol, leverage: Decimal):
         return False
 
 def get_leverage_for_symbol(symbol):
-    # per your instruction: BONK -> 50x, TRX -> 75x (default)
     if symbol.upper().startswith("1000BONK"):
         return BONK_LEVERAGE
     return DEFAULT_LEVERAGE
@@ -352,8 +346,7 @@ def market_close_all_positions_for_symbol(api_key, api_secret, symbol):
     try:
         pos_data = private_request(api_key, api_secret, "GET", "/v5/position/list", params={"category": CATEGORY, "symbol": symbol})
         for pos in pos_data["result"]["list"]:
-            side = pos["side"]
-            size = Decimal(pos["size"])
+            side = pos["side"]; size = Decimal(pos["size"])
             if size > 0:
                 opp = "Sell" if side == "Buy" else "Buy"
                 private_request(api_key, api_secret, "POST", "/v5/order/create", body={"category": CATEGORY, "symbol": symbol, "side": opp, "orderType": "Market", "qty": str(size), "reduceOnly": True, "timeInForce": "IOC"})
@@ -365,14 +358,17 @@ def close_account_symbol(api_key, api_secret, symbol):
     cancel_all_orders_for_symbol(api_key, api_secret, symbol)
     market_close_all_positions_for_symbol(api_key, api_secret, symbol)
 
-def compute_qty(entry: Decimal, sl: Decimal, trading_bal: Decimal, combined_bal: Decimal, lot_step: Decimal, min_qty: Decimal) -> Decimal:
+# =========================
+# Sizing
+# =========================
+def compute_qty(entry: Decimal, sl: Decimal, trading_bal: Decimal, combined_bal: Decimal, lot_step: Decimal, min_qty: Decimal, leverage: Decimal) -> Decimal:
     per_coin_risk = abs(entry - sl)
     if per_coin_risk <= Decimal("0"):
         return Decimal("0")
     risk_usd = combined_bal * RISK_FRACTION
     qty_risk = (risk_usd / per_coin_risk)
-    # note: we use per-symbol leverage via get_leverage_for_symbol when calculating qty_cap
-    qty_cap  = (trading_bal * BAL_CAP * DEFAULT_LEVERAGE) / entry  # default cap uses default leverage as an upper bound
+    # qty cap based on trading account's leverage (use provided per-symbol leverage)
+    qty_cap  = (trading_bal * BAL_CAP * leverage) / entry
     qty = min(qty_risk, qty_cap)
     qty = round_qty(qty, lot_step)
     if qty < min_qty:
@@ -390,7 +386,6 @@ def fallback_qty_by_account_balance(entry: Decimal, trading_bal: Decimal, levera
 
 def try_place_market_order_with_fallback(api_key, api_secret, symbol, side, qty, entry_price, trading_bal, leverage, lot_step, min_qty):
     try:
-        # ensure leverage set for the symbol/account first
         set_leverage(api_key, api_secret, symbol, leverage)
         return place_market_order(api_key, api_secret, symbol, side, qty)
     except Exception as e:
@@ -411,29 +406,27 @@ def try_place_market_order_with_fallback(api_key, api_secret, symbol, side, qty,
             raise
 
 # =========================
-# MAIN BOT
+# Main loop & state
 # =========================
 def main():
-    # per-symbol precision cache
+    # per-symbol instrument precision cache
     precision = {}
     for sym in SYMBOLS:
         tick, lot_step, min_qty = get_instrument_info(sym)
         precision[sym] = {"tick": tick, "lot": lot_step, "min": min_qty}
         logging.info(f"{sym}: tick={tick} lotStep={lot_step} minQty={min_qty}")
 
-    # state per symbol
+    # state
     buy_level   = {sym: None for sym in SYMBOLS}
     sell_level  = {sym: None for sym in SYMBOLS}
     last_hour_processed = None
 
-    # open trades (per symbol)
-    open_buy  = {sym: None for sym in SYMBOLS}      # sub account only
-    open_sell = {sym: None for sym in SYMBOLS}     # main account only
+    open_buy  = {sym: None for sym in SYMBOLS}   # sub account trades
+    open_sell = {sym: None for sym in SYMBOLS}   # main account trades
 
     ha_5m_history = {sym: deque(maxlen=FIVE_M_HISTORY) for sym in SYMBOLS}
     siphon_state = {"value": None}
-
-    last_result = {"sub": {sym: None for sym in SYMBOLS}, "main": {sym: None for sym in SYMBOLS}}
+    last_result = {"sub": {sym: None for sym in SYMBOLS}, "main": {sym: None for sym in SYMBOLS}}  # "win"/"loss"/None
 
     while True:
         now = datetime.utcnow()
@@ -464,7 +457,7 @@ def main():
                         buy_level[sym]  = None
                         logging.info(f"{sym} 🎯 Sell Level set @ {sell_level[sym].price} (valid 1h)")
 
-        # every 5m per symbol
+        # every 5m processing per symbol
         for sym in SYMBOLS:
             tick = precision[sym]["tick"]; lot = precision[sym]["lot"]; min_qty = precision[sym]["min"]
 
@@ -484,7 +477,7 @@ def main():
 
             h5 = Decimal(str(h5)); l5 = Decimal(str(l5)); c5 = Decimal(str(c5))
 
-            # watchdog: SL crossed but position still open? close for affected account only
+            # Watchdog: if SL-cross occurred in candle but trade still registered -> force close affected account symbol only
             ob = open_buy[sym]
             if ob is not None and l5 <= ob.sl:
                 logging.info(f"🛡️ {sym} BUY SL crossed (low {l5} <= SL {ob.sl}); force-closing SUB {sym}.")
@@ -499,7 +492,7 @@ def main():
                 open_sell[sym] = None
                 last_result["main"][sym] = "loss"
 
-            # BUY (SUB account only)
+            # BUY (SUB)
             if buy_level[sym] is not None:
                 if datetime.utcnow() >= buy_level[sym].expiry:
                     logging.info(f"{sym} ⌛ Buy Level expired")
@@ -512,9 +505,13 @@ def main():
                         else:
                             risk = entry - sl
                             use_2to1_plus = (last_result["sub"][sym] == "loss")
-                            tp = (entry + (risk*Decimal("2")) + (entry * EXTRA_TP_PCT)) if use_2to1_plus else (entry + risk)
+                            if use_2to1_plus:
+                                tp = entry + (risk * Decimal("2")) + (entry * EXTRA_TP_PCT)
+                            else:
+                                tp = entry + risk
                             entry_r = round_price(entry, tick); sl_r = round_price(sl, tick); tp_r = round_price(tp, tick)
 
+                            # pre-trade rebalance
                             try:
                                 rebalance_equal(API_KEY_MAIN, API_SECRET_MAIN, API_KEY_SUB, API_SECRET_SUB, SUB_UID)
                             except Exception as e:
@@ -524,10 +521,10 @@ def main():
                             bal_sub  = get_wallet_balance(API_KEY_SUB, API_SECRET_SUB)
                             combined = bal_main + bal_sub
 
-                            # compute qty using combined risk but cap will be checked with fallback per-account leverage
-                            qty = compute_qty(entry_r, sl_r, bal_sub, combined, lot, min_qty)
+                            leverage = get_leverage_for_symbol(sym)
+                            qty = compute_qty(entry_r, sl_r, bal_sub, combined, lot, min_qty, leverage)
                             if qty <= 0:
-                                fallback = fallback_qty_by_account_balance(entry_r, bal_sub, get_leverage_for_symbol(sym), lot, min_qty)
+                                fallback = fallback_qty_by_account_balance(entry_r, bal_sub, leverage, lot, min_qty)
                                 if fallback <= 0:
                                     logging.info(f"{sym} ⚠️ BUY sizing too small even after fallback; skipping")
                                     buy_level[sym] = None
@@ -535,15 +532,15 @@ def main():
                                 qty = fallback
                                 logging.info(f"{sym} Using fallback BUY qty based on 90% sub balance: {qty}")
 
+                            # If same-type BUY already open on SUB for this symbol: close only SUB's symbol orders/positions first
                             if open_buy[sym] is not None:
                                 logging.info(f"{sym} 🔁 New BUY signal while BUY open on SUB -> closing existing SUB {sym} orders/position first.")
                                 close_account_symbol(API_KEY_SUB, API_SECRET_SUB, sym)
                                 open_buy[sym] = None
 
                             logging.info(f"{sym} ✅ BUY signal | Entry={entry_r} SL={sl_r} TP={tp_r} | qty={qty}")
+
                             try:
-                                # try placing, with leverage properly set for symbol on the account
-                                leverage = get_leverage_for_symbol(sym)
                                 entry_id = try_place_market_order_with_fallback(API_KEY_SUB, API_SECRET_SUB, sym, "Buy", qty, entry_r, get_wallet_balance(API_KEY_SUB, API_SECRET_SUB), leverage, lot, min_qty)
                                 tp_id = place_reduce_only_tp(API_KEY_SUB, API_SECRET_SUB, sym, "Buy", tp_r, qty)
                                 sl_id = place_reduce_only_sl_limit(API_KEY_SUB, API_SECRET_SUB, sym, "Buy", sl_r, qty)
@@ -560,7 +557,7 @@ def main():
 
                         buy_level[sym] = None
 
-            # SELL (MAIN account only)
+            # SELL (MAIN)
             if sell_level[sym] is not None:
                 if datetime.utcnow() >= sell_level[sym].expiry:
                     logging.info(f"{sym} ⌛ Sell Level expired")
@@ -573,7 +570,10 @@ def main():
                         else:
                             risk = sl - entry
                             use_2to1_plus = (last_result["main"][sym] == "loss")
-                            tp = (entry - (risk*Decimal("2")) - (entry * EXTRA_TP_PCT)) if use_2to1_plus else (entry - risk)
+                            if use_2to1_plus:
+                                tp = entry - (risk * Decimal("2")) - (entry * EXTRA_TP_PCT)
+                            else:
+                                tp = entry - risk
                             entry_r = round_price(entry, tick); sl_r = round_price(sl, tick); tp_r = round_price(tp, tick)
 
                             try:
@@ -585,9 +585,10 @@ def main():
                             bal_sub  = get_wallet_balance(API_KEY_SUB, API_SECRET_SUB)
                             combined = bal_main + bal_sub
 
-                            qty = compute_qty(entry_r, sl_r, bal_main, combined, lot, min_qty)
+                            leverage = get_leverage_for_symbol(sym)
+                            qty = compute_qty(entry_r, sl_r, bal_main, combined, lot, min_qty, leverage)
                             if qty <= 0:
-                                fallback = fallback_qty_by_account_balance(entry_r, bal_main, get_leverage_for_symbol(sym), lot, min_qty)
+                                fallback = fallback_qty_by_account_balance(entry_r, bal_main, leverage, lot, min_qty)
                                 if fallback <= 0:
                                     logging.info(f"{sym} ⚠️ SELL sizing too small even after fallback; skipping")
                                     sell_level[sym] = None
@@ -602,7 +603,6 @@ def main():
 
                             logging.info(f"{sym} ✅ SELL signal | Entry={entry_r} SL={sl_r} TP={tp_r} | qty={qty}")
                             try:
-                                leverage = get_leverage_for_symbol(sym)
                                 entry_id = try_place_market_order_with_fallback(API_KEY_MAIN, API_SECRET_MAIN, sym, "Sell", qty, entry_r, get_wallet_balance(API_KEY_MAIN, API_SECRET_MAIN), leverage, lot, min_qty)
                                 tp_id = place_reduce_only_tp(API_KEY_MAIN, API_SECRET_MAIN, sym, "Sell", tp_r, qty)
                                 sl_id = place_reduce_only_sl_limit(API_KEY_MAIN, API_SECRET_MAIN, sym, "Sell", sl_r, qty)
@@ -619,12 +619,13 @@ def main():
 
                         sell_level[sym] = None
 
-        # profit siphon
+        # profit siphon check every loop
         try:
             siphon_profits_if_needed(API_KEY_MAIN, API_SECRET_MAIN, API_KEY_SUB, API_SECRET_SUB, SUB_UID, PROFIT_UID, siphon_state)
         except Exception as e:
             logging.warning(f"Siphon check failed: {e}")
 
+        # align to next 5m mark
         wait_until_next_5m()
 
 if __name__ == "__main__":
