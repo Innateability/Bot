@@ -1,4 +1,4 @@
-BONKUSDTDTDT edited bot: 1H (levels) + 5m (triggers) + trade execution + pre-trade rebalance + profit siphon
+# Full edited bot: 1H (levels) + 5m (triggers) + trade execution + pre-trade rebalance + profit siphon
 # + multi-symbol (TRX & BONK), per-account role, same-type replacement, ReduceOnly LIMIT TP/SL,
 # SL-cross watchdog, UUID transferIds, 2:1+0.07% TP after loss
 
@@ -701,4 +701,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
