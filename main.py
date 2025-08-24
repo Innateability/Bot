@@ -1,6 +1,7 @@
-# Full edited bot: 1H (levels) + 5m (triggers) + trade execution + pre-trade rebalance + profit siphon
+here# Full edited bot: 1H (levels) + 5m (triggers) + trade execution + pre-trade rebalance + profit siphon
 # + multi-symbol (TRX & 1000BONK), per-account role, same-type replacement, ReduceOnly LIMIT TP/SL,
-# SL-cross watchdog, UUID transferIds, 2:1+0.07% TP after loss
+# SL-cross watchdog, UUID transferIds, per-symbol leverage (BONK=50), 2:1+0.07% TP after loss
+
 import os
 import hmac
 import hashlib
@@ -33,7 +34,8 @@ SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "TRXUSDT,1000BONKUSDT").split
 # -------- Strategy Config --------
 FIVE_M_HISTORY = 500               # keep HA candles for context
 EXTRA_TP_PCT = Decimal("0.0007")   # +0.07% of entry price when using 2:1+extra
-LEVERAGE = Decimal("75")
+DEFAULT_LEVERAGE = Decimal("75")   # default symbol leverage (TRX)
+BONK_LEVERAGE = Decimal("50")      # 1000BONK leverage
 RISK_FRACTION = Decimal("0.10")    # 10% of combined balance risk
 BAL_CAP = Decimal("0.90")          # cap to 90% of that account balance (for margin)
 
@@ -162,8 +164,60 @@ def get_wallet_balance(api_key, api_secret):
 def _uuid():
     return str(uuid.uuid4())
 
+# NOTE: Bybit's various transfer APIs differ between "inter-transfer" and master-sub transfers.
+# Here we use the transfer endpoint bodies that commonly work for FUND <-> UNIFIED movement.
+# You may need to adapt to your exact account type mapping or exchange variant.
+def universal_transfer_main_to_sub(api_key_master, api_secret_master, amount_usdt: Decimal, to_sub_uid: str):
+    """
+    Transfer from MAIN (FUND) -> SUB (UNIFIED for that sub member).
+    Uses transferId UUID and sets fromAccountType to FUND, toAccountType UNIFIED.
+    """
+    body = {
+        "transferId": _uuid(),
+        "coin": "USDT",
+        "amount": str(amount_usdt.quantize(Decimal('0.01'), rounding=ROUND_DOWN)),
+        "fromAccountType": "FUND",
+        "toAccountType": "UNIFIED",
+        "toMemberId": to_sub_uid
+    }
+    try:
+        private_request(api_key_master, api_secret_master, "POST", "/v5/asset/transfer", body=body)
+        logging.info(f"🔁 Transfer MAIN(FUND) -> SUB(UNIFIED:{to_sub_uid}) {body['amount']} USDT")
+        return True
+    except Exception as e:
+        logging.warning(f"Transfer MAIN->SUB failed: {e}")
+        return False
+
+def universal_transfer_sub_to_main(api_key_master, api_secret_master, amount_usdt: Decimal, from_sub_uid: str):
+    """
+    Transfer from SUB (UNIFIED) -> MAIN (FUND).
+    """
+    body = {
+        "transferId": _uuid(),
+        "coin": "USDT",
+        "amount": str(amount_usdt.quantize(Decimal('0.01'), rounding=ROUND_DOWN)),
+        "fromAccountType": "UNIFIED",
+        "toAccountType": "FUND",
+        "fromMemberId": from_sub_uid
+    }
+    try:
+        private_request(api_key_master, api_secret_master, "POST", "/v5/asset/transfer", body=body)
+        logging.info(f"🔁 Transfer SUB(UNIFIED:{from_sub_uid}) -> MAIN(FUND) {body['amount']} USDT")
+        return True
+    except Exception as e:
+        logging.warning(f"Transfer SUB->MAIN failed: {e}")
+        return False
+
+# utility: transfer from main to arbitrary UID (profit siphon)
 def universal_transfer_main_to_uid(api_key_master, api_secret_master, amount_usdt: Decimal, to_uid: str):
-    body = {"transferId": _uuid(), "coin": "USDT", "amount": str(amount_usdt.quantize(Decimal('0.01'), rounding=ROUND_DOWN)), "fromAccountType": "UNIFIED", "toAccountType": "UNIFIED", "toMemberId": to_uid}
+    body = {
+        "transferId": _uuid(),
+        "coin": "USDT",
+        "amount": str(amount_usdt.quantize(Decimal('0.01'), rounding=ROUND_DOWN)),
+        "fromAccountType": "FUND",
+        "toAccountType": "UNIFIED",
+        "toMemberId": to_uid
+    }
     try:
         private_request(api_key_master, api_secret_master, "POST", "/v5/asset/transfer", body=body)
         logging.info(f"🔁 Transfer MAIN -> UID({to_uid}) {body['amount']} USDT")
@@ -173,7 +227,15 @@ def universal_transfer_main_to_uid(api_key_master, api_secret_master, amount_usd
         return False
 
 def universal_transfer_sub_to_uid(api_key_master, api_secret_master, amount_usdt: Decimal, from_sub_uid: str, to_uid: str):
-    body = {"transferId": _uuid(), "coin": "USDT", "amount": str(amount_usdt.quantize(Decimal('0.01'), rounding=ROUND_DOWN)), "fromAccountType": "UNIFIED", "toAccountType": "UNIFIED", "fromMemberId": from_sub_uid, "toMemberId": to_uid}
+    body = {
+        "transferId": _uuid(),
+        "coin": "USDT",
+        "amount": str(amount_usdt.quantize(Decimal('0.01'), rounding=ROUND_DOWN)),
+        "fromAccountType": "UNIFIED",
+        "toAccountType": "UNIFIED",
+        "fromMemberId": from_sub_uid,
+        "toMemberId": to_uid
+    }
     try:
         private_request(api_key_master, api_secret_master, "POST", "/v5/asset/transfer", body=body)
         logging.info(f"🔁 Transfer SUB({from_sub_uid}) -> UID({to_uid}) {body['amount']} USDT")
@@ -182,29 +244,10 @@ def universal_transfer_sub_to_uid(api_key_master, api_secret_master, amount_usdt
         logging.warning(f"Transfer SUB({from_sub_uid})->UID({to_uid}) failed: {e}")
         return False
 
-def universal_transfer_main_to_sub(api_key_master, api_secret_master, amount_usdt, to_sub_uid):
-    body = {"transferId": _uuid(), "coin": "USDT", "amount": str(amount_usdt), "fromAccountType": "UNIFIED", "toAccountType": "UNIFIED", "toMemberId": to_sub_uid}
-    try:
-        private_request(api_key_master, api_secret_master, "POST", "/v5/asset/transfer/inter-transfer", body=body)
-        return True
-    except Exception as e:
-        logging.warning(f"Transfer MAIN->SUB failed: {e}")
-        return False
-
-def universal_transfer_sub_to_main(api_key_master, api_secret_master, amount_usdt, from_sub_uid):
-    body = {"transferId": _uuid(), "coin": "USDT", "amount": str(amount_usdt), "fromAccountType": "UNIFIED", "toAccountType": "UNIFIED", "fromMemberId": from_sub_uid}
-    try:
-        private_request(api_key_master, api_secret_master, "POST", "/v5/asset/transfer/inter-transfer", body=body)
-        logging.info(f"🔁 Transfer SUB -> MAIN {amount_usdt} USDT")
-        return True
-    except Exception as e:
-        logging.warning(f"Transfer SUB->MAIN failed: {e}")
-        return False
-
 def rebalance_equal(api_key_main, api_secret_main, api_key_sub, api_secret_sub, sub_uid):
     try:
         bal_main = get_wallet_balance(api_key_main, api_secret_main)
-        bal_sub  = get_wallet_balance(api_key_sub,  api_secret_sub)
+        bal_sub  = get_wallet_balance(api_key_sub, api_secret_sub)
         total = bal_main + bal_sub
         target_each = total / Decimal("2")
         delta_main = target_each - bal_main
@@ -213,10 +256,10 @@ def rebalance_equal(api_key_main, api_secret_main, api_key_sub, api_secret_sub, 
         amt = abs(delta_main)
         if delta_main > 0:
             if sub_uid and sub_uid != "PUT_SUB_UID_HERE":
-                universal_transfer_sub_to_main(api_key_main, api_secret_main, float(amt), sub_uid)
+                universal_transfer_sub_to_main(api_key_main, api_secret_main, amt, sub_uid)
         else:
             if sub_uid and sub_uid != "PUT_SUB_UID_HERE":
-                universal_transfer_main_to_sub(api_key_main, api_secret_main, float(amt), sub_uid)
+                universal_transfer_main_to_sub(api_key_main, api_secret_main, amt, sub_uid)
     except Exception as e:
         logging.warning(f"Rebalance equal failed: {e}")
 
@@ -225,7 +268,7 @@ def siphon_profits_if_needed(api_key_main, api_secret_main, api_key_sub, api_sec
     if not dest_uid or dest_uid == "PUT_PROFIT_UID_HERE":
         return
     bal_main = get_wallet_balance(api_key_main, api_secret_main)
-    bal_sub  = get_wallet_balance(api_key_sub,  api_secret_sub)
+    bal_sub  = get_wallet_balance(api_key_sub, api_secret_sub)
     total = bal_main + bal_sub
     if milestone_ref.get("value") is None:
         milestone_ref["value"] = SIPHON_BASE_USD
@@ -254,6 +297,30 @@ def siphon_profits_if_needed(api_key_main, api_secret_main, api_key_sub, api_sec
 # =========================
 # Orders & helpers
 # =========================
+def set_leverage(api_key, api_secret, symbol, leverage: Decimal):
+    """
+    Set leverage for symbol on the account. Assumes One-way mode (no positionIdx).
+    Body may vary depending on Bybit implementation — this is a common v5 shape.
+    """
+    try:
+        body = {
+            "category": CATEGORY,
+            "symbol": symbol,
+            "leverage": str(int(leverage))
+        }
+        private_request(api_key, api_secret, "POST", "/v5/position/set-leverage", body=body)
+        logging.info(f"Set leverage {leverage}x for {symbol} on account.")
+        return True
+    except Exception as e:
+        logging.warning(f"Set leverage failed for {symbol}: {e}")
+        return False
+
+def get_leverage_for_symbol(symbol):
+    # per your instruction: BONK -> 50x, TRX -> 75x (default)
+    if symbol.upper().startswith("1000BONK"):
+        return BONK_LEVERAGE
+    return DEFAULT_LEVERAGE
+
 def place_market_order(api_key, api_secret, symbol, side, qty):
     body = {"category": CATEGORY, "symbol": symbol, "side": side, "orderType": "Market", "qty": str(qty), "timeInForce": "IOC"}
     data = private_request(api_key, api_secret, "POST", "/v5/order/create", body=body)
@@ -304,42 +371,40 @@ def compute_qty(entry: Decimal, sl: Decimal, trading_bal: Decimal, combined_bal:
         return Decimal("0")
     risk_usd = combined_bal * RISK_FRACTION
     qty_risk = (risk_usd / per_coin_risk)
-    qty_cap  = (trading_bal * BAL_CAP * LEVERAGE) / entry
+    # note: we use per-symbol leverage via get_leverage_for_symbol when calculating qty_cap
+    qty_cap  = (trading_bal * BAL_CAP * DEFAULT_LEVERAGE) / entry  # default cap uses default leverage as an upper bound
     qty = min(qty_risk, qty_cap)
     qty = round_qty(qty, lot_step)
     if qty < min_qty:
         return Decimal("0")
     return qty
 
-def fallback_qty_by_account_balance(entry: Decimal, trading_bal: Decimal, lot_step: Decimal, min_qty: Decimal) -> Decimal:
-    # fallback uses 90% of trading balance * leverage
+def fallback_qty_by_account_balance(entry: Decimal, trading_bal: Decimal, leverage: Decimal, lot_step: Decimal, min_qty: Decimal) -> Decimal:
     if trading_bal <= 0 or entry <= 0:
         return Decimal("0")
-    qty_cap = (trading_bal * Decimal("0.90") * LEVERAGE) / entry
+    qty_cap = (trading_bal * Decimal("0.90") * leverage) / entry
     qty_cap = round_qty(qty_cap, lot_step)
     if qty_cap < min_qty:
         return Decimal("0")
     return qty_cap
 
-def try_place_market_order_with_fallback(api_key, api_secret, symbol, side, qty, entry_price, trading_bal, lot_step, min_qty):
-    """
-    Tries to place market order with 'qty'. If it fails due to insufficient funds, compute fallback qty
-    equal to what 90% of trading_bal can support and retry once.
-    """
+def try_place_market_order_with_fallback(api_key, api_secret, symbol, side, qty, entry_price, trading_bal, leverage, lot_step, min_qty):
     try:
+        # ensure leverage set for the symbol/account first
+        set_leverage(api_key, api_secret, symbol, leverage)
         return place_market_order(api_key, api_secret, symbol, side, qty)
     except Exception as e:
         logging.warning(f"{symbol} initial market order failed: {e}. Attempting fallback sizing based on 90% of account balance.")
-        fallback_qty = fallback_qty_by_account_balance(entry_price, trading_bal, lot_step, min_qty)
+        fallback_qty = fallback_qty_by_account_balance(entry_price, trading_bal, leverage, lot_step, min_qty)
         if fallback_qty <= 0:
             logging.info(f"{symbol} fallback qty too small ({fallback_qty}) -> skipping trade.")
             raise
         if fallback_qty >= qty:
-            # Fallback wouldn't reduce the size (rare) — just re-raise original error
             logging.info(f"{symbol} fallback qty {fallback_qty} >= original qty {qty}, re-raising.")
             raise
         try:
             logging.info(f"{symbol} retrying MARKET order with fallback qty={fallback_qty}")
+            set_leverage(api_key, api_secret, symbol, leverage)
             return place_market_order(api_key, api_secret, symbol, side, fallback_qty)
         except Exception as e2:
             logging.error(f"{symbol} fallback market order also failed: {e2}")
@@ -363,7 +428,7 @@ def main():
 
     # open trades (per symbol)
     open_buy  = {sym: None for sym in SYMBOLS}      # sub account only
-    open_sell = {sym: None for sym in SYMBOLS}      # main account only
+    open_sell = {sym: None for sym in SYMBOLS}     # main account only
 
     ha_5m_history = {sym: deque(maxlen=FIVE_M_HISTORY) for sym in SYMBOLS}
     siphon_state = {"value": None}
@@ -456,13 +521,13 @@ def main():
                                 logging.warning(f"{sym} Pre-trade rebalance failed: {e}")
 
                             bal_main = get_wallet_balance(API_KEY_MAIN, API_SECRET_MAIN)
-                            bal_sub  = get_wallet_balance(API_KEY_SUB,  API_SECRET_SUB)
+                            bal_sub  = get_wallet_balance(API_KEY_SUB, API_SECRET_SUB)
                             combined = bal_main + bal_sub
 
+                            # compute qty using combined risk but cap will be checked with fallback per-account leverage
                             qty = compute_qty(entry_r, sl_r, bal_sub, combined, lot, min_qty)
                             if qty <= 0:
-                                # try fallback by 90% of sub account balance
-                                fallback = fallback_qty_by_account_balance(entry_r, bal_sub, lot, min_qty)
+                                fallback = fallback_qty_by_account_balance(entry_r, bal_sub, get_leverage_for_symbol(sym), lot, min_qty)
                                 if fallback <= 0:
                                     logging.info(f"{sym} ⚠️ BUY sizing too small even after fallback; skipping")
                                     buy_level[sym] = None
@@ -470,7 +535,6 @@ def main():
                                 qty = fallback
                                 logging.info(f"{sym} Using fallback BUY qty based on 90% sub balance: {qty}")
 
-                            # If same-type BUY open on SUB for this symbol: close only SUB's symbol orders/positions first then open new
                             if open_buy[sym] is not None:
                                 logging.info(f"{sym} 🔁 New BUY signal while BUY open on SUB -> closing existing SUB {sym} orders/position first.")
                                 close_account_symbol(API_KEY_SUB, API_SECRET_SUB, sym)
@@ -478,8 +542,9 @@ def main():
 
                             logging.info(f"{sym} ✅ BUY signal | Entry={entry_r} SL={sl_r} TP={tp_r} | qty={qty}")
                             try:
-                                # attempt market order, if fails due to insufficient funds retry with 90% fallback qty
-                                entry_id = try_place_market_order_with_fallback(API_KEY_SUB, API_SECRET_SUB, sym, "Buy", qty, entry_r, get_wallet_balance(API_KEY_SUB, API_SECRET_SUB), lot, min_qty)
+                                # try placing, with leverage properly set for symbol on the account
+                                leverage = get_leverage_for_symbol(sym)
+                                entry_id = try_place_market_order_with_fallback(API_KEY_SUB, API_SECRET_SUB, sym, "Buy", qty, entry_r, get_wallet_balance(API_KEY_SUB, API_SECRET_SUB), leverage, lot, min_qty)
                                 tp_id = place_reduce_only_tp(API_KEY_SUB, API_SECRET_SUB, sym, "Buy", tp_r, qty)
                                 sl_id = place_reduce_only_sl_limit(API_KEY_SUB, API_SECRET_SUB, sym, "Buy", sl_r, qty)
                                 logging.info(f"{sym} 📦 BUY opened (orderId={entry_id}); TP({tp_id}) & SL({sl_id}) LIMIT-ReduceOnly")
@@ -522,7 +587,7 @@ def main():
 
                             qty = compute_qty(entry_r, sl_r, bal_main, combined, lot, min_qty)
                             if qty <= 0:
-                                fallback = fallback_qty_by_account_balance(entry_r, bal_main, lot, min_qty)
+                                fallback = fallback_qty_by_account_balance(entry_r, bal_main, get_leverage_for_symbol(sym), lot, min_qty)
                                 if fallback <= 0:
                                     logging.info(f"{sym} ⚠️ SELL sizing too small even after fallback; skipping")
                                     sell_level[sym] = None
@@ -537,7 +602,8 @@ def main():
 
                             logging.info(f"{sym} ✅ SELL signal | Entry={entry_r} SL={sl_r} TP={tp_r} | qty={qty}")
                             try:
-                                entry_id = try_place_market_order_with_fallback(API_KEY_MAIN, API_SECRET_MAIN, sym, "Sell", qty, entry_r, get_wallet_balance(API_KEY_MAIN, API_SECRET_MAIN), lot, min_qty)
+                                leverage = get_leverage_for_symbol(sym)
+                                entry_id = try_place_market_order_with_fallback(API_KEY_MAIN, API_SECRET_MAIN, sym, "Sell", qty, entry_r, get_wallet_balance(API_KEY_MAIN, API_SECRET_MAIN), leverage, lot, min_qty)
                                 tp_id = place_reduce_only_tp(API_KEY_MAIN, API_SECRET_MAIN, sym, "Sell", tp_r, qty)
                                 sl_id = place_reduce_only_sl_limit(API_KEY_MAIN, API_SECRET_MAIN, sym, "Sell", sl_r, qty)
                                 logging.info(f"{sym} 📦 SELL opened (orderId={entry_id}); TP({tp_id}) & SL({sl_id}) LIMIT-ReduceOnly")
@@ -563,3 +629,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
