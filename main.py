@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+here#!/usr/bin/env python3
 """
 Full compiled trading bot script with fixes:
 - SL as stop-market (reduceOnly) via /v5/order/create with triggerPrice
@@ -7,6 +7,9 @@ Full compiled trading bot script with fixes:
 - Transfer endpoint uses inter-transfer
 - Fallback sizing (90% of account * leverage)
 - One-way-mode friendly (no positionIdx)
+- 5m watchdog: close positions if candle H/L breaches TP or SL
+- Rebalance: always log intended transfer amount & direction
+- SL stop-market includes triggerDirection to satisfy Bybit
 """
 import os
 import hmac
@@ -184,6 +187,7 @@ def universal_transfer_main_to_sub(api_key_master, api_secret_master, amount_usd
         "toMemberId": to_sub_uid
     }
     try:
+        logging.info(f"🔁 Rebalance plan: MAIN(FUND) → SUB(UNIFIED:{to_sub_uid}) amount={body['amount']} USDT")
         private_request(api_key_master, api_secret_master, "POST", "/v5/asset/transfer/inter-transfer", body=body)
         logging.info(f"🔁 Transfer MAIN(FUND) -> SUB(UNIFIED:{to_sub_uid}) {body['amount']} USDT")
         return True
@@ -204,6 +208,7 @@ def universal_transfer_sub_to_main(api_key_master, api_secret_master, amount_usd
         "fromMemberId": from_sub_uid
     }
     try:
+        logging.info(f"🔁 Rebalance plan: SUB(UNIFIED:{from_sub_uid}) → MAIN(FUND) amount={body['amount']} USDT")
         private_request(api_key_master, api_secret_master, "POST", "/v5/asset/transfer/inter-transfer", body=body)
         logging.info(f"🔁 Transfer SUB(UNIFIED:{from_sub_uid}) -> MAIN(FUND) {body['amount']} USDT")
         return True
@@ -221,6 +226,7 @@ def universal_transfer_main_to_uid(api_key_master, api_secret_master, amount_usd
         "toMemberId": to_uid
     }
     try:
+        logging.info(f"🔁 Payout plan: MAIN(FUND) → UID({to_uid}) amount={body['amount']} USDT")
         private_request(api_key_master, api_secret_master, "POST", "/v5/asset/transfer/inter-transfer", body=body)
         logging.info(f"🔁 Transfer MAIN -> UID({to_uid}) {body['amount']} USDT")
         return True
@@ -239,6 +245,7 @@ def universal_transfer_sub_to_uid(api_key_master, api_secret_master, amount_usdt
         "toMemberId": to_uid
     }
     try:
+        logging.info(f"🔁 Payout plan: SUB(UNIFIED:{from_sub_uid}) → UID({to_uid}) amount={body['amount']} USDT")
         private_request(api_key_master, api_secret_master, "POST", "/v5/asset/transfer/inter-transfer", body=body)
         logging.info(f"🔁 Transfer SUB({from_sub_uid}) -> UID({to_uid}) {body['amount']} USDT")
         return True
@@ -255,7 +262,7 @@ def rebalance_equal(api_key_main, api_secret_main, api_key_sub, api_secret_sub, 
         delta_main = target_each - bal_main
         if abs(delta_main) < Decimal("0.05"):
             return
-        amt = abs(delta_main)
+        amt = abs(delta_main).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
         if delta_main > 0:
             if sub_uid and sub_uid != "PUT_SUB_UID_HERE":
                 universal_transfer_sub_to_main(api_key_main, api_secret_main, amt, sub_uid)
@@ -327,6 +334,14 @@ def place_reduce_only_tp(api_key, api_secret, symbol, side, tp_price, qty):
     logging.info(f"Placing TP LIMIT ReduceOnly {opp} {symbol} qty={qty} price={tp_price} -> {data}")
     return data.get("result", {}).get("orderId")
 
+def _trigger_direction_for_sl(side: str) -> int:
+    """
+    For stop-market SL:
+      - Long SL triggers on price FALLING to/below -> triggerDirection=2
+      - Short SL triggers on price RISING to/above -> triggerDirection=1
+    """
+    return 2 if side == "Buy" else 1
+
 def place_reduce_only_sl_stopmarket(api_key, api_secret, symbol, side, sl_price, qty, trigger_by="LastPrice"):
     """
     Place a stop-market (triggered market) reduceOnly order for SL via v5 order/create with triggerPrice.
@@ -342,6 +357,7 @@ def place_reduce_only_sl_stopmarket(api_key, api_secret, symbol, side, sl_price,
         "reduceOnly": True,
         "triggerPrice": str(sl_price),
         "triggerBy": trigger_by,
+        "triggerDirection": _trigger_direction_for_sl(side),
         "timeInForce": "GTC"
     }
     data = private_request(api_key, api_secret, "POST", "/v5/order/create", body=body)
@@ -489,22 +505,40 @@ def main():
 
             h5 = Decimal(str(h5)); l5 = Decimal(str(l5)); c5 = Decimal(str(c5))
 
-            # SL-cross watchdog
+            # 5m watchdog: manual close by candle H/L vs TP/SL
+            # BUY side checks
             ob = open_buy[sym]
-            if ob is not None and l5 <= ob.sl:
-                logging.info(f"🛡️ {sym} BUY SL crossed (low {l5} <= SL {ob.sl}); force-closing SUB {sym}.")
-                close_account_symbol(API_KEY_SUB, API_SECRET_SUB, sym)
-                open_buy[sym] = None
-                last_result["sub"][sym] = "loss"
+            if ob is not None:
+                # SL breach on long: candle low <= SL
+                if l5 <= ob.sl:
+                    logging.info(f"🛡️ {sym} BUY SL crossed (5m low {l5} <= SL {ob.sl}); force-closing SUB {sym}.")
+                    close_account_symbol(API_KEY_SUB, API_SECRET_SUB, sym)
+                    open_buy[sym] = None
+                    last_result["sub"][sym] = "loss"
+                # TP breach on long: candle high >= TP
+                elif h5 >= ob.tp:
+                    logging.info(f"🎯 {sym} BUY TP reached by candle (5m high {h5} >= TP {ob.tp}); force-closing SUB {sym}.")
+                    close_account_symbol(API_KEY_SUB, API_SECRET_SUB, sym)
+                    open_buy[sym] = None
+                    last_result["sub"][sym] = "win"
 
+            # SELL side checks
             osell = open_sell[sym]
-            if osell is not None and h5 >= osell.sl:
-                logging.info(f"🛡️ {sym} SELL SL crossed (high {h5} >= SL {osell.sl}); force-closing MAIN {sym}.")
-                close_account_symbol(API_KEY_MAIN, API_SECRET_MAIN, sym)
-                open_sell[sym] = None
-                last_result["main"][sym] = "loss"
+            if osell is not None:
+                # SL breach on short: candle high >= SL
+                if h5 >= osell.sl:
+                    logging.info(f"🛡️ {sym} SELL SL crossed (5m high {h5} >= SL {osell.sl}); force-closing MAIN {sym}.")
+                    close_account_symbol(API_KEY_MAIN, API_SECRET_MAIN, sym)
+                    open_sell[sym] = None
+                    last_result["main"][sym] = "loss"
+                # TP breach on short: candle low <= TP
+                elif l5 <= osell.tp:
+                    logging.info(f"🎯 {sym} SELL TP reached by candle (5m low {l5} <= TP {osell.tp}); force-closing MAIN {sym}.")
+                    close_account_symbol(API_KEY_MAIN, API_SECRET_MAIN, sym)
+                    open_sell[sym] = None
+                    last_result["main"][sym] = "win"
 
-            # BUY on SUB
+            # BUY on SUB (entry logic)
             if buy_level[sym] is not None:
                 if datetime.utcnow() >= buy_level[sym].expiry:
                     logging.info(f"{sym} ⌛ Buy Level expired")
@@ -553,7 +587,6 @@ def main():
                             try:
                                 entry_id = try_place_market_order_with_fallback(API_KEY_SUB, API_SECRET_SUB, sym, "Buy", qty, entry_r, get_wallet_balance(API_KEY_SUB, API_SECRET_SUB), leverage, lot, min_qty)
                                 tp_id = place_reduce_only_tp(API_KEY_SUB, API_SECRET_SUB, sym, "Buy", tp_r, qty)
-                                # SL: place stop-market reduceOnly (via order/create with triggerPrice)
                                 sl_id = place_reduce_only_sl_stopmarket(API_KEY_SUB, API_SECRET_SUB, sym, "Buy", sl_r, qty, trigger_by="LastPrice")
                                 logging.info(f"{sym} 📦 BUY opened (orderId={entry_id}); TP({tp_id}) & SL(stopMarket:{sl_id}) ReduceOnly")
                                 open_buy[sym] = type("OT",(object,),{"symbol":sym,"side":"Buy","qty":qty,"entry":entry_r,"sl":sl_r,"tp":tp_r,"entry_order_id":entry_id,"sl_order_id":sl_id,"tp_order_id":tp_id,"api_key":API_KEY_SUB,"api_secret":API_SECRET_SUB})()
@@ -568,7 +601,7 @@ def main():
 
                         buy_level[sym] = None
 
-            # SELL on MAIN
+            # SELL on MAIN (entry logic)
             if sell_level[sym] is not None:
                 if datetime.utcnow() >= sell_level[sym].expiry:
                     logging.info(f"{sym} ⌛ Sell Level expired")
