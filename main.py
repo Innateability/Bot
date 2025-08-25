@@ -1,4 +1,4 @@
-here#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Full compiled trading bot script with fixes:
 - SL as stop-market (reduceOnly) via /v5/order/create with triggerPrice
