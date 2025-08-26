@@ -1,4 +1,4 @@
-here#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Trading bot implementing your rules:
 - 1H Heikin-Ashi breakout levels:
