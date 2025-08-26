@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-Full compiled trading bot script with fixes:
-- SL as stop-market (reduceOnly) via /v5/order/create with triggerPrice
-- TP as limit reduceOnly
-- Per-symbol leverage (BONK 50x, TRX 75x)
-- Transfer endpoint uses inter-transfer
-- Fallback sizing (90% of account * leverage)
-- One-way-mode friendly (no positionIdx)
-- 5m watchdog: close positions if candle H/L breaches TP or SL
-- Rebalance: always log intended transfer amount & direction
-- SL stop-market includes triggerDirection to satisfy Bybit
+Trading bot updated to:
+- 1H HA breakout levels per your rules
+- 5m raw-candle trigger logic (entry on raw close crossing the breakout level)
+- SL derived from the triggering 5m candle (low for buy, high for sell)
+- TP as before (RR-based)
+- No forced closes (only logs breaches)
+- Transfer attempts log planned transfer and, if FUND insufficient, retry using UNIFIED source
+- SL stop-market includes triggerDirection for v5 order/create
 """
 import os
 import hmac
@@ -30,7 +28,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 BASE_URL = "https://api.bybit.com"
 MARKET_URL = BASE_URL + "/v5/market"
 TIMEOUT = 15
-CATEGORY = "linear"  # USDT perpetuals (unified / cross assumed)
 
 # Symbols
 SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "TRXUSDT,1000BONKUSDT").split(",") if s.strip()]
@@ -62,6 +59,10 @@ def _sign(secret: str, payload: str) -> str:
     return hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
 
 def private_request(api_key, api_secret, method, path, params=None, body=None):
+    """
+    Generic Bybit V5 signed request helper used elsewhere in the bot.
+    Raises RuntimeError when retCode != 0 (keeps earlier behavior).
+    """
     if params is None: params = {}
     if body is None: body = {}
     url = BASE_URL + path
@@ -112,6 +113,7 @@ def get_candles(symbol, interval="60", limit=200):
 def to_heikin_ashi(raw):
     ha = []
     D2 = Decimal("2"); D4 = Decimal("4")
+    # raw is expected newest-first; produce HA oldest->newest in returned list order
     for i, c in enumerate(reversed(raw)):
         ts = int(c[0])
         o = Decimal(str(c[1])); h = Decimal(str(c[2])); l = Decimal(str(c[3])); cl = Decimal(str(c[4]))
@@ -161,7 +163,10 @@ def round_qty(qty: Decimal, step: Decimal) -> Decimal:
     return (qty // step) * step
 
 # =========================
-# Balances & transfers (use inter-transfer for main<->sub)
+# Balances & transfers
+# - Attempt transfer and if FUND fails due to insufficient balance,
+#   retry using UNIFIED (because your money lives in unified).
+# - Always log the planned transfer (amount & direction)
 # =========================
 def get_wallet_balance(api_key, api_secret):
     params = {"accountType": "UNIFIED", "coin": "USDT"}
@@ -174,84 +179,68 @@ def get_wallet_balance(api_key, api_secret):
 def _uuid():
     return str(uuid.uuid4())
 
-def universal_transfer_main_to_sub(api_key_master, api_secret_master, amount_usdt: Decimal, to_sub_uid: str):
+def _attempt_inter_transfer(api_key_master, api_secret_master, body):
+    """Helper to call inter-transfer endpoint and return True/False."""
+    try:
+        private_request(api_key_master, api_secret_master, "POST", "/v5/asset/transfer/inter-transfer", body=body)
+        return True
+    except Exception as e:
+        # Re-raise the RuntimeError to the caller if needed — caller will inspect message.
+        raise
+
+def universal_transfer_with_fallback(api_key_master, api_secret_master, amount_usdt: Decimal, fromAccountType: str, toAccountType: str, fromMemberId: str = None, toMemberId: str = None):
     """
-    MAIN (FUND) -> SUB (UNIFIED) via inter-transfer endpoint
+    Generic inter-transfer that logs the intended transfer and tries first with provided fromAccountType.
+    If it fails due to insufficient balance in FUND, it'll retry using UNIFIED as source.
     """
+    amt_str = str(amount_usdt.quantize(Decimal('0.01'), rounding=ROUND_DOWN))
     body = {
         "transferId": _uuid(),
         "coin": "USDT",
-        "amount": str(amount_usdt.quantize(Decimal('0.01'), rounding=ROUND_DOWN)),
-        "fromAccountType": "FUND",
-        "toAccountType": "UNIFIED",
-        "toMemberId": to_sub_uid
+        "amount": amt_str,
+        "fromAccountType": fromAccountType,
+        "toAccountType": toAccountType
     }
+    if fromMemberId:
+        body["fromMemberId"] = fromMemberId
+    if toMemberId:
+        body["toMemberId"] = toMemberId
+    # Log the plan
+    logging.info(f"🔁 Rebalance plan: {body['fromAccountType']} -> {body['toAccountType']} "
+                 f"{'FROM UID '+fromMemberId if fromMemberId else ''}{' TO UID '+toMemberId if toMemberId else ''} amount={amt_str} USDT")
     try:
-        logging.info(f"🔁 Rebalance plan: MAIN(FUND) → SUB(UNIFIED:{to_sub_uid}) amount={body['amount']} USDT")
-        private_request(api_key_master, api_secret_master, "POST", "/v5/asset/transfer/inter-transfer", body=body)
-        logging.info(f"🔁 Transfer MAIN(FUND) -> SUB(UNIFIED:{to_sub_uid}) {body['amount']} USDT")
+        _attempt_inter_transfer(api_key_master, api_secret_master, body)
+        logging.info(f"🔁 Transfer executed: {body['fromAccountType']} -> {body['toAccountType']} amount={amt_str} USDT")
         return True
-    except Exception as e:
-        logging.warning(f"Transfer MAIN->SUB failed: {e}")
+    except RuntimeError as e:
+        msg = str(e)
+        logging.warning(f"Transfer attempt failed ({body['fromAccountType']} -> {body['toAccountType']}): {msg}")
+        # If failure is insufficient balance from FUND, retry with UNIFIED source
+        if ("insufficient balance" in msg.lower()) or ("131212" in msg):
+            if body["fromAccountType"] != "UNIFIED":
+                body_retry = body.copy()
+                body_retry["fromAccountType"] = "UNIFIED"
+                logging.info(f"🔁 Retrying transfer using UNIFIED as source: amount={amt_str} USDT")
+                try:
+                    _attempt_inter_transfer(api_key_master, api_secret_master, body_retry)
+                    logging.info(f"🔁 Transfer executed on retry: UNIFIED -> {body_retry['toAccountType']} amount={amt_str} USDT")
+                    return True
+                except Exception as e2:
+                    logging.warning(f"Retry transfer (UNIFIED) failed: {e2}")
+                    return False
         return False
+
+def universal_transfer_main_to_sub(api_key_master, api_secret_master, amount_usdt: Decimal, to_sub_uid: str):
+    return universal_transfer_with_fallback(api_key_master, api_secret_master, amount_usdt, fromAccountType="FUND", toAccountType="UNIFIED", toMemberId=to_sub_uid)
 
 def universal_transfer_sub_to_main(api_key_master, api_secret_master, amount_usdt: Decimal, from_sub_uid: str):
-    """
-    SUB (UNIFIED) -> MAIN (FUND) via inter-transfer endpoint
-    """
-    body = {
-        "transferId": _uuid(),
-        "coin": "USDT",
-        "amount": str(amount_usdt.quantize(Decimal('0.01'), rounding=ROUND_DOWN)),
-        "fromAccountType": "UNIFIED",
-        "toAccountType": "FUND",
-        "fromMemberId": from_sub_uid
-    }
-    try:
-        logging.info(f"🔁 Rebalance plan: SUB(UNIFIED:{from_sub_uid}) → MAIN(FUND) amount={body['amount']} USDT")
-        private_request(api_key_master, api_secret_master, "POST", "/v5/asset/transfer/inter-transfer", body=body)
-        logging.info(f"🔁 Transfer SUB(UNIFIED:{from_sub_uid}) -> MAIN(FUND) {body['amount']} USDT")
-        return True
-    except Exception as e:
-        logging.warning(f"Transfer SUB->MAIN failed: {e}")
-        return False
+    return universal_transfer_with_fallback(api_key_master, api_secret_master, amount_usdt, fromAccountType="UNIFIED", toAccountType="FUND", fromMemberId=from_sub_uid)
 
 def universal_transfer_main_to_uid(api_key_master, api_secret_master, amount_usdt: Decimal, to_uid: str):
-    body = {
-        "transferId": _uuid(),
-        "coin": "USDT",
-        "amount": str(amount_usdt.quantize(Decimal('0.01'), rounding=ROUND_DOWN)),
-        "fromAccountType": "FUND",
-        "toAccountType": "UNIFIED",
-        "toMemberId": to_uid
-    }
-    try:
-        logging.info(f"🔁 Payout plan: MAIN(FUND) → UID({to_uid}) amount={body['amount']} USDT")
-        private_request(api_key_master, api_secret_master, "POST", "/v5/asset/transfer/inter-transfer", body=body)
-        logging.info(f"🔁 Transfer MAIN -> UID({to_uid}) {body['amount']} USDT")
-        return True
-    except Exception as e:
-        logging.warning(f"Transfer MAIN->UID({to_uid}) failed: {e}")
-        return False
+    return universal_transfer_with_fallback(api_key_master, api_secret_master, amount_usdt, fromAccountType="FUND", toAccountType="UNIFIED", toMemberId=None, toMemberId=to_uid)
 
 def universal_transfer_sub_to_uid(api_key_master, api_secret_master, amount_usdt: Decimal, from_sub_uid: str, to_uid: str):
-    body = {
-        "transferId": _uuid(),
-        "coin": "USDT",
-        "amount": str(amount_usdt.quantize(Decimal('0.01'), rounding=ROUND_DOWN)),
-        "fromAccountType": "UNIFIED",
-        "toAccountType": "UNIFIED",
-        "fromMemberId": from_sub_uid,
-        "toMemberId": to_uid
-    }
-    try:
-        logging.info(f"🔁 Payout plan: SUB(UNIFIED:{from_sub_uid}) → UID({to_uid}) amount={body['amount']} USDT")
-        private_request(api_key_master, api_secret_master, "POST", "/v5/asset/transfer/inter-transfer", body=body)
-        logging.info(f"🔁 Transfer SUB({from_sub_uid}) -> UID({to_uid}) {body['amount']} USDT")
-        return True
-    except Exception as e:
-        logging.warning(f"Transfer SUB({from_sub_uid})->UID({to_uid}) failed: {e}")
-        return False
+    return universal_transfer_with_fallback(api_key_master, api_secret_master, amount_usdt, fromAccountType="UNIFIED", toAccountType="UNIFIED", fromMemberId=from_sub_uid, toMemberId=to_uid)
 
 def rebalance_equal(api_key_main, api_secret_main, api_key_sub, api_secret_sub, sub_uid):
     try:
@@ -265,14 +254,16 @@ def rebalance_equal(api_key_main, api_secret_main, api_key_sub, api_secret_sub, 
         amt = abs(delta_main).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
         if delta_main > 0:
             if sub_uid and sub_uid != "PUT_SUB_UID_HERE":
+                # plan: SUB -> MAIN
                 universal_transfer_sub_to_main(api_key_main, api_secret_main, amt, sub_uid)
         else:
             if sub_uid and sub_uid != "PUT_SUB_UID_HERE":
+                # plan: MAIN -> SUB
                 universal_transfer_main_to_sub(api_key_main, api_secret_main, amt, sub_uid)
     except Exception as e:
         logging.warning(f"Rebalance equal failed: {e}")
 
-# Profit siphon helper
+# Profit siphon helper (unchanged except using universal_transfer_ helpers)
 def siphon_profits_if_needed(api_key_main, api_secret_main, api_key_sub, api_secret_sub, sub_uid: str, dest_uid: str, milestone_ref: dict):
     if not dest_uid or dest_uid == "PUT_PROFIT_UID_HERE":
         return
@@ -304,7 +295,7 @@ def siphon_profits_if_needed(api_key_main, api_secret_main, api_key_sub, api_sec
         logging.info(f"✅ Siphon done. New milestone ${milestone_ref['value']:.2f} (next at ${ (milestone_ref['value']*2):.2f }).")
 
 # =========================
-# Orders & execution (SL as stop-market ReduceOnly)
+# Orders & execution
 # =========================
 def set_leverage(api_key, api_secret, symbol, leverage: Decimal):
     try:
@@ -335,24 +326,17 @@ def place_reduce_only_tp(api_key, api_secret, symbol, side, tp_price, qty):
     return data.get("result", {}).get("orderId")
 
 def _trigger_direction_for_sl(side: str) -> int:
-    """
-    For stop-market SL:
-      - Long SL triggers on price FALLING to/below -> triggerDirection=2
-      - Short SL triggers on price RISING to/above -> triggerDirection=1
-    """
+    # Long SL triggers on price falling to/below -> triggerDirection=2
+    # Short SL triggers on price rising to/above -> triggerDirection=1
     return 2 if side == "Buy" else 1
 
 def place_reduce_only_sl_stopmarket(api_key, api_secret, symbol, side, sl_price, qty, trigger_by="LastPrice"):
-    """
-    Place a stop-market (triggered market) reduceOnly order for SL via v5 order/create with triggerPrice.
-    Opposite side because we are reducing (if side=="Buy" the reduce order is Sell).
-    """
     opp = "Sell" if side == "Buy" else "Buy"
     body = {
         "category": "linear",
         "symbol": symbol,
         "side": opp,
-        "orderType": "Market",        # executed as market when triggered
+        "orderType": "Market",
         "qty": str(qty),
         "reduceOnly": True,
         "triggerPrice": str(sl_price),
@@ -435,10 +419,41 @@ def try_place_market_order_with_fallback(api_key, api_secret, symbol, side, qty,
             raise
 
 # =========================
+# Trigger/candle helpers
+# =========================
+def parse_raw_candle(c):
+    # c expected like [ts, open, high, low, close, volume]
+    ts = int(c[0])
+    o = Decimal(str(c[1])); h = Decimal(str(c[2])); l = Decimal(str(c[3])); cl = Decimal(str(c[4])); vol = Decimal(str(c[5])) if len(c) > 5 else Decimal("0")
+    return {"ts": ts, "open": o, "high": h, "low": l, "close": cl, "volume": vol}
+
+def find_triggering_5m_candle_for_side(raw_5m_list, buy_level, sell_level):
+    """
+    raw_5m_list: list of raw 5m candles (newest-first)
+    We scan oldest->newest and return triggering candle info for buy or sell if found.
+    For buy trigger: candle.high >= buy_level AND candle.close > buy_level
+      - entry = candle.close
+      - sl = candle.low
+    For sell trigger: candle.low <= sell_level AND candle.close < sell_level
+      - entry = candle.close
+      - sl = candle.high
+    Returns tuple (side, candle, entry, sl) where side is "Buy" or "Sell", or None if none.
+    """
+    # iterate oldest->newest
+    for c in reversed(raw_5m_list):
+        parsed = parse_raw_candle(c)
+        if buy_level is not None:
+            if parsed["high"] >= buy_level and parsed["close"] > buy_level:
+                return ("Buy", parsed, parsed["close"], parsed["low"])
+        if sell_level is not None:
+            if parsed["low"] <= sell_level and parsed["close"] < sell_level:
+                return ("Sell", parsed, parsed["close"], parsed["high"])
+    return None
+
+# =========================
 # Main loop & state
 # =========================
 def main():
-    # instrument precision cache
     precision = {}
     for sym in SYMBOLS:
         tick, lot_step, min_qty = get_instrument_info(sym)
@@ -459,7 +474,7 @@ def main():
     while True:
         now = datetime.utcnow()
 
-        # hourly arms
+        # hourly arms: compute breakout levels from 1H HA per your rules
         if now.minute == 0 and now.second == 0:
             hour_tag = now.replace(minute=0, second=0, microsecond=0)
             if last_hour_processed != hour_tag:
@@ -470,32 +485,36 @@ def main():
                         ha_1h = to_heikin_ashi(raw_1h)
                         if not ha_1h:
                             raise RuntimeError("No 1H HA data")
-                        last_1h = ha_1h[-1]
+                        last_1h = ha_1h[-1]  # oldest->newest in returned list
                     except Exception as e:
                         logging.error(f"{sym} 1H fetch/convert error: {e}")
                         continue
-                    _, h1, l1, c1, col1, _ = last_1h
-                    logging.info(f"{sym} 1H closed: {col1} | HA-H={h1} L={l1} C={c1}")
+                    _, h1, l1, c1, col1, ts1 = last_1h
+                    logging.info(f"{sym} 1H closed HA: {col1} | HA-H={h1} L={l1} C={c1}")
+                    # Per your rule:
+                    # - If 1H HA is RED -> buy breakout level = high of that HA candle
+                    # - If 1H HA is GREEN -> sell breakout level = low of that HA candle
                     if col1 == "RED":
-                        buy_level[sym]  = type("A",(object,),{"price":Decimal(str(h1)),"expiry":now + timedelta(hours=1)})()
+                        buy_level[sym]  = Decimal(str(h1))
                         sell_level[sym] = None
-                        logging.info(f"{sym} 🎯 Buy Level set @ {buy_level[sym].price} (valid 1h)")
+                        logging.info(f"{sym} 🎯 Buy Level set @ {buy_level[sym]} (1H HA red)")
                     else:
-                        sell_level[sym] = type("A",(object,),{"price":Decimal(str(l1)),"expiry":now + timedelta(hours=1)})()
+                        sell_level[sym] = Decimal(str(l1))
                         buy_level[sym]  = None
-                        logging.info(f"{sym} 🎯 Sell Level set @ {sell_level[sym].price} (valid 1h)")
+                        logging.info(f"{sym} 🎯 Sell Level set @ {sell_level[sym]} (1H HA green)")
 
         # every 5m processing
         for sym in SYMBOLS:
             tick = precision[sym]["tick"]; lot = precision[sym]["lot"]; min_qty = precision[sym]["min"]
-
             try:
-                raw_5m = get_candles(sym, interval="5", limit=3)
+                # request a slightly larger window so we can scan for the triggering candle
+                raw_5m = get_candles(sym, interval="5", limit=10)
                 ha_5m = to_heikin_ashi(raw_5m)
                 if ha_5m:
                     ha_5m_history[sym].append(ha_5m[-1])
                 last_5m = ha_5m[-1]
                 _, h5, l5, ha_close, col5, ts5 = last_5m
+                # raw_latest is newest-first at index 0
                 raw_latest = raw_5m[0]
                 raw_close = Decimal(str(raw_latest[4]))
                 c5 = raw_close
@@ -505,85 +524,75 @@ def main():
 
             h5 = Decimal(str(h5)); l5 = Decimal(str(l5)); c5 = Decimal(str(c5))
 
-            # 5m watchdog: manual close by candle H/L vs TP/SL
-            # BUY side checks
+            # 5m watchdog: detect TP/SL breaches by candle H/L, but DO NOT force close — only log
             ob = open_buy[sym]
             if ob is not None:
                 # SL breach on long: candle low <= SL
                 if l5 <= ob.sl:
-                    logging.info(f"🛡️ {sym} BUY SL crossed (5m low {l5} <= SL {ob.sl}); force-closing SUB {sym}.")
-                    close_account_symbol(API_KEY_SUB, API_SECRET_SUB, sym)
-                    open_buy[sym] = None
-                    last_result["sub"][sym] = "loss"
+                    logging.info(f"🛡️ {sym} BUY SL breached (5m low {l5} <= SL {ob.sl}). NOTE: not forcing close per config.")
+                    # do not force-close; only log
                 # TP breach on long: candle high >= TP
-                elif h5 >= ob.tp:
-                    logging.info(f"🎯 {sym} BUY TP reached by candle (5m high {h5} >= TP {ob.tp}); force-closing SUB {sym}.")
-                    close_account_symbol(API_KEY_SUB, API_SECRET_SUB, sym)
-                    open_buy[sym] = None
-                    last_result["sub"][sym] = "win"
+                if h5 >= ob.tp:
+                    logging.info(f"🎯 {sym} BUY TP breached (5m high {h5} >= TP {ob.tp}). NOTE: not forcing close per config.")
 
-            # SELL side checks
             osell = open_sell[sym]
             if osell is not None:
                 # SL breach on short: candle high >= SL
                 if h5 >= osell.sl:
-                    logging.info(f"🛡️ {sym} SELL SL crossed (5m high {h5} >= SL {osell.sl}); force-closing MAIN {sym}.")
-                    close_account_symbol(API_KEY_MAIN, API_SECRET_MAIN, sym)
-                    open_sell[sym] = None
-                    last_result["main"][sym] = "loss"
+                    logging.info(f"🛡️ {sym} SELL SL breached (5m high {h5} >= SL {osell.sl}). NOTE: not forcing close per config.")
                 # TP breach on short: candle low <= TP
-                elif l5 <= osell.tp:
-                    logging.info(f"🎯 {sym} SELL TP reached by candle (5m low {l5} <= TP {osell.tp}); force-closing MAIN {sym}.")
-                    close_account_symbol(API_KEY_MAIN, API_SECRET_MAIN, sym)
-                    open_sell[sym] = None
-                    last_result["main"][sym] = "win"
+                if l5 <= osell.tp:
+                    logging.info(f"🎯 {sym} SELL TP breached (5m low {l5} <= TP {osell.tp}). NOTE: not forcing close per config.")
 
-            # BUY on SUB (entry logic)
-            if buy_level[sym] is not None:
-                if datetime.utcnow() >= buy_level[sym].expiry:
-                    logging.info(f"{sym} ⌛ Buy Level expired")
-                    buy_level[sym] = None
-                else:
-                    if h5 >= buy_level[sym].price:
-                        entry = c5; sl = l5
-                        if sl >= entry:
-                            logging.info(f"{sym} ⚠️ Invalid BUY (SL >= entry); skipping")
+            # Check for triggering candle among recent raw 5m candles (oldest->newest)
+            trigger = find_triggering_5m_candle_for_side(raw_5m, buy_level[sym], sell_level[sym])
+            if trigger:
+                side, trig_candle, entry, sl_candidate = trigger
+                # If buy_level set and this is a Buy trigger, proceed
+                if side == "Buy" and buy_level[sym] is not None:
+                    sl = sl_candidate
+                    tp = None
+                    risk = entry - sl
+                    if risk <= 0:
+                        logging.info(f"{sym} ⚠️ Computed BUY SL not below entry (entry={entry} sl={sl}); skipping.")
+                    else:
+                        use_2to1_plus = (last_result["sub"][sym] == "loss")
+                        if use_2to1_plus:
+                            tp = entry + (risk * Decimal("2")) + (entry * EXTRA_TP_PCT)
                         else:
-                            risk = entry - sl
-                            use_2to1_plus = (last_result["sub"][sym] == "loss")
-                            if use_2to1_plus:
-                                tp = entry + (risk * Decimal("2")) + (entry * EXTRA_TP_PCT)
-                            else:
-                                tp = entry + risk
-                            entry_r = round_price(entry, tick); sl_r = round_price(sl, tick); tp_r = round_price(tp, tick)
+                            tp = entry + risk
+                        entry_r = round_price(entry, tick)
+                        sl_r = round_price(sl, tick)
+                        tp_r = round_price(tp, tick)
 
-                            try:
-                                rebalance_equal(API_KEY_MAIN, API_SECRET_MAIN, API_KEY_SUB, API_SECRET_SUB, SUB_UID)
-                            except Exception as e:
-                                logging.warning(f"{sym} Pre-trade rebalance failed: {e}")
+                        logging.info(f"{sym} ✅ BUY trigger found at 5m candle ts={datetime.utcfromtimestamp(trig_candle['ts']/1000):%Y-%m-%d %H:%M:%S} "
+                                     f"| raw OHL C={trig_candle['open']},{trig_candle['high']},{trig_candle['low']},{trig_candle['close']} "
+                                     f"| Entry={entry_r} SL={sl_r} TP={tp_r}")
 
-                            bal_main = get_wallet_balance(API_KEY_MAIN, API_SECRET_MAIN)
-                            bal_sub  = get_wallet_balance(API_KEY_SUB, API_SECRET_SUB)
-                            combined = bal_main + bal_sub
+                        try:
+                            rebalance_equal(API_KEY_MAIN, API_SECRET_MAIN, API_KEY_SUB, API_SECRET_SUB, SUB_UID)
+                        except Exception as e:
+                            logging.warning(f"{sym} Pre-trade rebalance failed: {e}")
 
-                            leverage = get_leverage_for_symbol(sym)
-                            qty = compute_qty(entry_r, sl_r, bal_sub, combined, lot, min_qty, leverage)
-                            if qty <= 0:
-                                fallback = fallback_qty_by_account_balance(entry_r, bal_sub, leverage, lot, min_qty)
-                                if fallback <= 0:
-                                    logging.info(f"{sym} ⚠️ BUY sizing too small even after fallback; skipping")
-                                    buy_level[sym] = None
-                                    continue
-                                qty = fallback
-                                logging.info(f"{sym} Using fallback BUY qty based on 90% sub balance: {qty}")
+                        bal_main = get_wallet_balance(API_KEY_MAIN, API_SECRET_MAIN)
+                        bal_sub  = get_wallet_balance(API_KEY_SUB, API_SECRET_SUB)
+                        combined = bal_main + bal_sub
 
-                            if open_buy[sym] is not None:
-                                logging.info(f"{sym} 🔁 New BUY signal while BUY open on SUB -> closing existing SUB {sym} orders/position first.")
-                                close_account_symbol(API_KEY_SUB, API_SECRET_SUB, sym)
-                                open_buy[sym] = None
+                        leverage = get_leverage_for_symbol(sym)
+                        qty = compute_qty(entry_r, sl_r, bal_sub, combined, lot, min_qty, leverage)
+                        if qty <= 0:
+                            fallback = fallback_qty_by_account_balance(entry_r, bal_sub, leverage, lot, min_qty)
+                            if fallback <= 0:
+                                logging.info(f"{sym} ⚠️ BUY sizing too small even after fallback; skipping")
+                                buy_level[sym] = None
+                                continue
+                            qty = fallback
+                            logging.info(f"{sym} Using fallback BUY qty based on 90% sub balance: {qty}")
 
-                            logging.info(f"{sym} ✅ BUY signal | Entry={entry_r} SL={sl_r} TP={tp_r} | qty={qty}")
-
+                        if open_buy[sym] is not None:
+                            logging.info(f"{sym} 🔁 New BUY trigger while BUY already recorded -> leaving existing open record.")
+                            # we don't force close existing per your instruction; skip replacing open record
+                        else:
                             try:
                                 entry_id = try_place_market_order_with_fallback(API_KEY_SUB, API_SECRET_SUB, sym, "Buy", qty, entry_r, get_wallet_balance(API_KEY_SUB, API_SECRET_SUB), leverage, lot, min_qty)
                                 tp_id = place_reduce_only_tp(API_KEY_SUB, API_SECRET_SUB, sym, "Buy", tp_r, qty)
@@ -593,59 +602,54 @@ def main():
                                 last_result["sub"][sym] = None
                             except Exception as e:
                                 logging.error(f"{sym} BUY order error: {e}")
-                            finally:
-                                try:
-                                    rebalance_equal(API_KEY_MAIN, API_SECRET_MAIN, API_KEY_SUB, API_SECRET_SUB, SUB_UID)
-                                except Exception as e:
-                                    logging.warning(f"{sym} Post-trade rebalance failed: {e}")
+                                # do not force close; simply log
 
                         buy_level[sym] = None
 
-            # SELL on MAIN (entry logic)
-            if sell_level[sym] is not None:
-                if datetime.utcnow() >= sell_level[sym].expiry:
-                    logging.info(f"{sym} ⌛ Sell Level expired")
-                    sell_level[sym] = None
-                else:
-                    if l5 <= sell_level[sym].price:
-                        entry = c5; sl = h5
-                        if sl <= entry:
-                            logging.info(f"{sym} ⚠️ Invalid SELL (SL <= entry); skipping")
+                # If sell trigger
+                if side == "Sell" and sell_level[sym] is not None:
+                    sl = sl_candidate
+                    tp = None
+                    risk = sl - entry
+                    if risk <= 0:
+                        logging.info(f"{sym} ⚠️ Computed SELL SL not above entry (entry={entry} sl={sl}); skipping.")
+                    else:
+                        use_2to1_plus = (last_result["main"][sym] == "loss")
+                        if use_2to1_plus:
+                            tp = entry - (risk * Decimal("2")) - (entry * EXTRA_TP_PCT)
                         else:
-                            risk = sl - entry
-                            use_2to1_plus = (last_result["main"][sym] == "loss")
-                            if use_2to1_plus:
-                                tp = entry - (risk * Decimal("2")) - (entry * EXTRA_TP_PCT)
-                            else:
-                                tp = entry - risk
-                            entry_r = round_price(entry, tick); sl_r = round_price(sl, tick); tp_r = round_price(tp, tick)
+                            tp = entry - risk
+                        entry_r = round_price(entry, tick)
+                        sl_r = round_price(sl, tick)
+                        tp_r = round_price(tp, tick)
 
-                            try:
-                                rebalance_equal(API_KEY_MAIN, API_SECRET_MAIN, API_KEY_SUB, API_SECRET_SUB, SUB_UID)
-                            except Exception as e:
-                                logging.warning(f"{sym} Pre-trade rebalance failed: {e}")
+                        logging.info(f"{sym} ✅ SELL trigger found at 5m candle ts={datetime.utcfromtimestamp(trig_candle['ts']/1000):%Y-%m-%d %H:%M:%S} "
+                                     f"| raw OHL C={trig_candle['open']},{trig_candle['high']},{trig_candle['low']},{trig_candle['close']} "
+                                     f"| Entry={entry_r} SL={sl_r} TP={tp_r}")
 
-                            bal_main = get_wallet_balance(API_KEY_MAIN, API_SECRET_MAIN)
-                            bal_sub  = get_wallet_balance(API_KEY_SUB, API_SECRET_SUB)
-                            combined = bal_main + bal_sub
+                        try:
+                            rebalance_equal(API_KEY_MAIN, API_SECRET_MAIN, API_KEY_SUB, API_SECRET_SUB, SUB_UID)
+                        except Exception as e:
+                            logging.warning(f"{sym} Pre-trade rebalance failed: {e}")
 
-                            leverage = get_leverage_for_symbol(sym)
-                            qty = compute_qty(entry_r, sl_r, bal_main, combined, lot, min_qty, leverage)
-                            if qty <= 0:
-                                fallback = fallback_qty_by_account_balance(entry_r, bal_main, leverage, lot, min_qty)
-                                if fallback <= 0:
-                                    logging.info(f"{sym} ⚠️ SELL sizing too small even after fallback; skipping")
-                                    sell_level[sym] = None
-                                    continue
-                                qty = fallback
-                                logging.info(f"{sym} Using fallback SELL qty based on 90% main balance: {qty}")
+                        bal_main = get_wallet_balance(API_KEY_MAIN, API_SECRET_MAIN)
+                        bal_sub  = get_wallet_balance(API_KEY_SUB, API_SECRET_SUB)
+                        combined = bal_main + bal_sub
 
-                            if open_sell[sym] is not None:
-                                logging.info(f"{sym} 🔁 New SELL signal while SELL open on MAIN -> closing existing MAIN {sym} orders/position first.")
-                                close_account_symbol(API_KEY_MAIN, API_SECRET_MAIN, sym)
-                                open_sell[sym] = None
+                        leverage = get_leverage_for_symbol(sym)
+                        qty = compute_qty(entry_r, sl_r, bal_main, combined, lot, min_qty, leverage)
+                        if qty <= 0:
+                            fallback = fallback_qty_by_account_balance(entry_r, bal_main, leverage, lot, min_qty)
+                            if fallback <= 0:
+                                logging.info(f"{sym} ⚠️ SELL sizing too small even after fallback; skipping")
+                                sell_level[sym] = None
+                                continue
+                            qty = fallback
+                            logging.info(f"{sym} Using fallback SELL qty based on 90% main balance: {qty}")
 
-                            logging.info(f"{sym} ✅ SELL signal | Entry={entry_r} SL={sl_r} TP={tp_r} | qty={qty}")
+                        if open_sell[sym] is not None:
+                            logging.info(f"{sym} 🔁 New SELL trigger while SELL already recorded -> leaving existing open record.")
+                        else:
                             try:
                                 entry_id = try_place_market_order_with_fallback(API_KEY_MAIN, API_SECRET_MAIN, sym, "Sell", qty, entry_r, get_wallet_balance(API_KEY_MAIN, API_SECRET_MAIN), leverage, lot, min_qty)
                                 tp_id = place_reduce_only_tp(API_KEY_MAIN, API_SECRET_MAIN, sym, "Sell", tp_r, qty)
@@ -655,11 +659,6 @@ def main():
                                 last_result["main"][sym] = None
                             except Exception as e:
                                 logging.error(f"{sym} SELL order error: {e}")
-                            finally:
-                                try:
-                                    rebalance_equal(API_KEY_MAIN, API_SECRET_MAIN, API_KEY_SUB, API_SECRET_SUB, SUB_UID)
-                                except Exception as e:
-                                    logging.warning(f"{sym} Post-trade rebalance failed: {e}")
 
                         sell_level[sym] = None
 
