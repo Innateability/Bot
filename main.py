@@ -1,15 +1,19 @@
-#!/usr/bin/env python3
+here#!/usr/bin/env python3
 """
 Trading bot implementing your rules:
+
 - 1H Heikin-Ashi breakout levels:
     * If 1H HA is RED  -> buy breakout level = HIGH of that HA candle
     * If 1H HA is GREEN -> sell breakout level = LOW of that HA candle
+
 - 5m raw-candle trigger logic:
     * Entry when a 5m candle's HIGH >= buy_level AND its RAW CLOSE > buy_level  -> Buy (entry = raw close)
     * Entry when a 5m candle's LOW <= sell_level AND its RAW CLOSE < sell_level -> Sell (entry = raw close)
+
 - SL derived from the triggering 5m candle:
     * Buy SL = LOW of that triggering candle
     * Sell SL = HIGH of that triggering candle
+
 - TP: RR-based as before (1:1 default, 2:1 when previous trade was loss -> small extra)
 - No forced closes on breaches — only logs
 - Transfers: logs planned transfer; if FUND transfer fails due to insufficient balance it retries using UNIFIED as source
@@ -66,8 +70,10 @@ def _sign(secret: str, payload: str) -> str:
 
 def private_request(api_key, api_secret, method, path, params=None, body=None):
     """Generic Bybit V5 signed request helper. Raises RuntimeError when retCode != 0."""
-    if params is None: params = {}
-    if body is None: body = {}
+    if params is None:
+        params = {}
+    if body is None:
+        body = {}
     url = BASE_URL + path
     ts = _ts_ms()
     recv_window = "5000"
@@ -169,7 +175,8 @@ def round_qty(qty: Decimal, step: Decimal) -> Decimal:
     return (qty // step) * step
 
 # =========================
-# Balances & transfers (FUND -> UNIFIED fallback to UNIFIED if FUND insufficient)
+# Balances & transfers (adjusted for UNIFIED main/sub)
+# - handles same-account-type transfers safely and retries using UNIFIED if FUND insufficient
 # =========================
 def get_wallet_balance(api_key, api_secret):
     params = {"accountType": "UNIFIED", "coin": "USDT"}
@@ -183,14 +190,23 @@ def _uuid():
     return str(uuid.uuid4())
 
 def _attempt_inter_transfer(api_key_master, api_secret_master, body):
-    """Call inter-transfer endpoint; re-raises exception on failure."""
+    """Call inter-transfer endpoint; returns result or raises."""
     return private_request(api_key_master, api_secret_master, "POST", "/v5/asset/transfer/inter-transfer", body=body)
 
 def universal_transfer_with_fallback(api_key_master, api_secret_master, amount_usdt: Decimal, fromAccountType: str, toAccountType: str, fromMemberId: str = None, toMemberId: str = None):
     """
     Generic inter-transfer that logs the intended transfer and tries first with provided fromAccountType.
     If it fails due to insufficient balance in FUND, it'll retry using UNIFIED as source.
+    Defensive checks:
+      - If fromAccountType == toAccountType AND (fromMemberId == toMemberId OR both None),
+        there's nothing to do (invalid transfer) -> log and return False.
     """
+    # Defensive: invalid same-account same-member transfer
+    if fromAccountType == toAccountType and ((fromMemberId is None and toMemberId is None) or (fromMemberId == toMemberId)):
+        logging.warning(f"Transfer skipped: fromAccountType==toAccountType and fromMemberId==toMemberId (no-op). "
+                        f"from={fromAccountType} to={toAccountType} fromMemberId={fromMemberId} toMemberId={toMemberId}")
+        return False
+
     amt_str = str(amount_usdt.quantize(Decimal('0.01'), rounding=ROUND_DOWN))
     body = {
         "transferId": _uuid(),
@@ -204,7 +220,6 @@ def universal_transfer_with_fallback(api_key_master, api_secret_master, amount_u
     if toMemberId:
         body["toMemberId"] = toMemberId
 
-    # Log the plan (explicit)
     from_desc = f"{body['fromAccountType']}{' UID:'+fromMemberId if fromMemberId else ''}"
     to_desc = f"{body['toAccountType']}{' UID:'+toMemberId if toMemberId else ''}"
     logging.info(f"🔁 Rebalance plan: {from_desc} -> {to_desc} amount={amt_str} USDT")
@@ -216,7 +231,7 @@ def universal_transfer_with_fallback(api_key_master, api_secret_master, amount_u
     except Exception as e:
         msg = str(e)
         logging.warning(f"Transfer attempt failed ({from_desc} -> {to_desc}): {msg}")
-        # If failure is insufficient balance from FUND, retry with UNIFIED source
+        # If failure indicates insufficient balance in FUND, retry using UNIFIED as source
         if ("insufficient balance" in msg.lower()) or ("131212" in msg):
             if body["fromAccountType"] != "UNIFIED":
                 body_retry = body.copy()
@@ -232,19 +247,24 @@ def universal_transfer_with_fallback(api_key_master, api_secret_master, amount_u
                     return False
         return False
 
+# EXPLICIT: main and sub are both UNIFIED account type in your setup
 def universal_transfer_main_to_sub(api_key_master, api_secret_master, amount_usdt: Decimal, to_sub_uid: str):
+    # master (no member id) UNIFIED -> sub UNIFIED (toMemberId=sub uid)
     return universal_transfer_with_fallback(api_key_master, api_secret_master, amount_usdt,
-                                            fromAccountType="FUND", toAccountType="UNIFIED", toMemberId=to_sub_uid)
+                                            fromAccountType="UNIFIED", toAccountType="UNIFIED", toMemberId=to_sub_uid)
 
 def universal_transfer_sub_to_main(api_key_master, api_secret_master, amount_usdt: Decimal, from_sub_uid: str):
+    # sub UNIFIED -> master UNIFIED
     return universal_transfer_with_fallback(api_key_master, api_secret_master, amount_usdt,
-                                            fromAccountType="UNIFIED", toAccountType="FUND", fromMemberId=from_sub_uid)
+                                            fromAccountType="UNIFIED", toAccountType="UNIFIED", fromMemberId=from_sub_uid)
 
 def universal_transfer_main_to_uid(api_key_master, api_secret_master, amount_usdt: Decimal, to_uid: str):
+    # master UNIFIED -> another UID UNIFIED
     return universal_transfer_with_fallback(api_key_master, api_secret_master, amount_usdt,
-                                            fromAccountType="FUND", toAccountType="UNIFIED", toMemberId=to_uid)
+                                            fromAccountType="UNIFIED", toAccountType="UNIFIED", toMemberId=to_uid)
 
 def universal_transfer_sub_to_uid(api_key_master, api_secret_master, amount_usdt: Decimal, from_sub_uid: str, to_uid: str):
+    # sub UNIFIED -> other UNIFIED UID
     return universal_transfer_with_fallback(api_key_master, api_secret_master, amount_usdt,
                                             fromAccountType="UNIFIED", toAccountType="UNIFIED", fromMemberId=from_sub_uid, toMemberId=to_uid)
 
@@ -312,6 +332,7 @@ def set_leverage(api_key, api_secret, symbol, leverage: Decimal):
         logging.info(f"Set leverage {leverage}x for {symbol} on account.")
         return True
     except Exception as e:
+        # log and continue — sometimes exchanges reject certain leverage settings
         logging.warning(f"Set leverage failed for {symbol}: {e}")
         return False
 
@@ -404,8 +425,12 @@ def fallback_qty_by_account_balance(entry: Decimal, trading_bal: Decimal, levera
     return qty_cap
 
 def try_place_market_order_with_fallback(api_key, api_secret, symbol, side, qty, entry_price, trading_bal, leverage, lot_step, min_qty):
+    # Try to set leverage, but proceed even if set_leverage fails (we log failure)
     try:
         set_leverage(api_key, api_secret, symbol, leverage)
+    except Exception:
+        pass
+    try:
         return place_market_order(api_key, api_secret, symbol, side, qty)
     except Exception as e:
         logging.warning(f"{symbol} initial market order failed: {e}. Attempting fallback sizing.")
@@ -418,7 +443,10 @@ def try_place_market_order_with_fallback(api_key, api_secret, symbol, side, qty,
             raise
         try:
             logging.info(f"{symbol} retrying MARKET order with fallback qty={fallback_qty}")
-            set_leverage(api_key, api_secret, symbol, leverage)
+            try:
+                set_leverage(api_key, api_secret, symbol, leverage)
+            except Exception:
+                pass
             return place_market_order(api_key, api_secret, symbol, side, fallback_qty)
         except Exception as e2:
             logging.error(f"{symbol} fallback market order also failed: {e2}")
@@ -659,4 +687,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+   
