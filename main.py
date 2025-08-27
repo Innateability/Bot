@@ -165,4 +165,4 @@ if __name__ == '__main__':
     print("Fetching last 1000 1h candles for TRXUSDT...")
     raw = fetch_candles(limit=1000)
     ha = heikin_ashi_from_raw(raw)
-    simulate_trades(raw, ha, start_balance=10.0)￼Enter
+    simulate_trades(raw, ha, start_balance=10.0)
