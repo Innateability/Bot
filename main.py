@@ -1,168 +1,292 @@
+#!/usr/bin/env python3
 """
-Bybit Heikin-Ashi backtest script (corrected logic)
+Bybit live trading bot for TRXUSDT (USDT Perpetual)
 
-- Fetches last 1000 1-hour raw candles for TRXUSDT from Bybit
-- Converts them to Heikin-Ashi candles
-- Trade rules:
-    * If HA is green and HA_low == HA_open → Long entry
-    * If HA is red and HA_high == HA_open → Short entry
-    * Entry = same raw candle open
-    * SL = HA_open of the trigger HA candle
-    * TP = 1:1 RR + 0.07% of entry
-    * Within the same raw candle, if both TP and SL fall inside, assume SL first
-    * If neither TP nor SL hit inside the candle, exit at that candle close
-- Balance simulation:
-    * TP → balance *= 1.10
-    * SL → balance *= 0.90
-    * If closed at end without TP/SL → balance *= (1 + pct_diff/100)
-- Prints final win rate and balance from $10 start
+Strategy:
+- Runs on 1-hour timeframe using raw candles for entry, Heikin Ashi for signals
+- Signal (evaluate on each CLOSED 1H candle):
+    * Long when HA is green (ha_close > ha_open) AND ha_low ~ ha_open (within tolerance)
+    * Short when HA is red (ha_close < ha_open) AND ha_high ~ ha_open (within tolerance)
+- Entry: NEXT 1H candle raw OPEN (market order at candle open, using raw open for calculations)
+- SL: HA open of the signal candle
+- TP: 1:1 RR + 0.07% of entry price
+- Max holding time: one candle; if neither TP nor SL hit by candle close, force market exit
+
+Risk & Account rules:
+- Leverage: 75x
+- Position sizing: risk 10% of account equity per trade
+- Fallback: if required margin is insufficient, cap size to 90% of what balance can afford
+- Profit siphon: starting checkpoint = $4.00. Whenever equity >= 2x checkpoint,
+  transfer 25% of current equity from Unified to Funding account (USDT),
+  then set checkpoint *= 2
+
+Notes:
+- Uses Bybit v5 REST API. One-way mode assumed.
+- Tested with Python 3.10+. Requires: requests, pandas, numpy
+- Carefully review, paper trade first.
+
+DISCLAIMER: This code is for educational purposes. Use at your own risk.
 """
+
+import os
+import time
+import hmac
+import hashlib
+import json
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_DOWN
+from typing import Dict, Any, Tuple, Optional
 
 import requests
-import math
+import pandas as pd
+import numpy as np
 
-BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
 
-# --------------------- Utilities ---------------------
-def fetch_candles(limit: int = 1000):
-    params = {
-        "symbol": "TRXUSDT",
-        "category": "linear",
-        "interval": "60",
-        "limit": limit
+# ========================= CONFIG =========================
+API_KEY = os.getenv("BYBIT_API_KEY", "YOUR_API_KEY")
+API_SECRET = os.getenv("BYBIT_API_SECRET", "YOUR_API_SECRET")
+BASE_URL = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com")  # live
+
+SYMBOL = "TRXUSDT"
+CATEGORY = "linear"  # USDT perpetual
+LEVERAGE = 75
+RISK_PCT = Decimal("0.10")       # 10%
+EXTRA_TP_PCT = Decimal("0.0007") # 0.07%
+TOL_PCT = Decimal("0.0002")      # 0.02% tolerance for open≈low/open≈high
+MIN_QTY = Decimal("1")
+QTY_STEP = Decimal("1")
+PRICE_TICK = Decimal("0.00001")
+CHECK_INTERVAL_SEC = 5
+
+# Siphon on doubling
+START_CHECKPOINT = Decimal(os.getenv("START_CHECKPOINT", "4"))  # $4.00
+TRANSFER_ON_DOUBLING = True
+TRANSFER_COIN = "USDT"
+FROM_ACCT = "UNIFIED"
+TO_ACCT = "FUND"
+# ==========================================================
+
+
+# ----------------- Signing & Requests -----------------
+def _ts_ms() -> str:
+    return str(int(time.time() * 1000))
+
+def _sign(payload: str) -> str:
+    return hmac.new(API_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+
+def _headers() -> Dict[str, str]:
+    return {
+        "Content-Type": "application/json",
+        "X-BAPI-API-KEY": API_KEY,
+        "X-BAPI-TIMESTAMP": _ts_ms(),
+        "X-BAPI-RECV-WINDOW": "5000",
     }
-    r = requests.get(BYBIT_KLINE_URL, params=params, timeout=20)
+
+def _auth_body(body: Dict[str, Any]) -> Tuple[Dict[str, str], str]:
+    body_str = json.dumps(body, separators=(",", ":"))
+    sign = _sign(_headers()["X-BAPI-TIMESTAMP"] + API_KEY + _headers()["X-BAPI-RECV-WINDOW"] + body_str)
+    hdrs = _headers().copy()
+    hdrs["X-BAPI-SIGN"] = sign
+    return hdrs, body_str
+
+def _get(path: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
+    url = BASE_URL + path
+    if params is None:
+        params = {}
+    ts = _ts_ms()
+    recv = "5000"
+    qs = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
+    sign_str = ts + API_KEY + recv + qs
+    sign = _sign(sign_str)
+    headers = {
+        "X-BAPI-API-KEY": API_KEY,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": recv,
+        "X-BAPI-SIGN": sign,
+    }
+    r = requests.get(url, params=params, headers=headers, timeout=30)
     r.raise_for_status()
-    data = r.json()
-    candles = data["result"]["list"]
-    candles.sort(key=lambda c: int(c[0]))
-    return candles
+    return r.json()
+
+def _post(path: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    url = BASE_URL + path
+    headers, body_str = _auth_body(body)
+    r = requests.post(url, data=body_str, headers=headers, timeout=30)
+    r.raise_for_status()
+    return r.json()
 
 
-def heikin_ashi_from_raw(raw_candles):
-    ha = []
-    prev_ha_open = None
-    prev_ha_close = None
-    for idx, c in enumerate(raw_candles):
-        ts = int(c[0])
-        o = float(c[1])
-        h = float(c[2])
-        l = float(c[3])
-        cl = float(c[4])
-        ha_close = (o + h + l + cl) / 4.0
-        if idx == 0:
-            ha_open = (o + cl) / 2.0
-        else:
-            ha_open = (prev_ha_open + prev_ha_close) / 2.0
-        ha_high = max(h, ha_open, ha_close)
-        ha_low = min(l, ha_open, ha_close)
-        ha.append({
-            "ts": ts,
-            "o": o,
-            "h": h,
-            "l": l,
-            "c": cl,
-            "ha_o": ha_open,
-            "ha_h": ha_high,
-            "ha_l": ha_low,
-            "ha_c": ha_close,
-        })
-        prev_ha_open = ha_open
-        prev_ha_close = ha_close
-    return ha
+# ----------------- Exchange Helpers -----------------
+def set_leverage(symbol: str, buy: int, sell: int) -> None:
+    body = {"category": CATEGORY, "symbol": symbol, "buyLeverage": str(buy), "sellLeverage": str(sell)}
+    _post("/v5/position/set-leverage", body)
 
+def get_wallet_equity(coin: str = "USDT") -> Tuple[Decimal, Decimal]:
+    j = _get("/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": coin})
+    try:
+        balances = j["result"]["list"][0]["coin"]
+        for c in balances:
+            if c["coin"] == coin:
+                equity = Decimal(c["equity"])
+                avail = Decimal(c.get("availableToWithdraw") or c.get("availableBalance") or c["equity"])
+                return equity, avail
+    except Exception:
+        pass
+    return Decimal("0"), Decimal("0")
 
-def is_close(a, b, rel_tol=1e-9, abs_tol=1e-12):
-    return math.isclose(a, b, rel_tol=rel_tol, abs_tol=abs_tol)
+def transfer_between_accounts(coin: str, amount: Decimal, from_acct: str, to_acct: str) -> Optional[str]:
+    body = {
+        "transferId": str(int(time.time()*1000)),
+        "coin": coin,
+        "amount": str(amount),
+        "fromAccountType": from_acct,
+        "toAccountType": to_acct,
+    }
+    try:
+        j = _post("/v5/asset/transfer", body)
+        return j.get("result", {}).get("transferId")
+    except Exception as e:
+        print(f"Transfer error: {e}")
+        return None
 
+def fetch_klines(symbol: str, interval: str = "60", limit: int = 200) -> pd.DataFrame:
+    j = _get("/v5/market/kline", {"category": CATEGORY, "symbol": symbol, "interval": interval, "limit": limit})
+    rows = j["result"]["list"]
+    rows.sort(key=lambda x: int(x[0]))
+    data = [[int(r[0]), Decimal(r[1]), Decimal(r[2]), Decimal(r[3]), Decimal(r[4]), Decimal(r[5]), Decimal(r[6] if len(r) > 6 else 0)] for r in rows]
+    df = pd.DataFrame(data, columns=["start","open","high","low","close","volume","turnover"])
+    df["dt"] = pd.to_datetime(df["start"], unit="ms", utc=True)
+    return df
 
-def resolve_intrabar_result(direction, entry, sl, tp, high, low):
-    if direction == 'long':
-        tp_hit = high >= tp
-        sl_hit = low <= sl
-        if tp_hit and not sl_hit:
-            return 'TP'
-        if sl_hit and not tp_hit:
-            return 'SL'
-        if tp_hit and sl_hit:
-            return 'SL'  # conservative
-        return 'NONE'
+def to_heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
+    o,h,l,c = df["open"].astype(float).values, df["high"].astype(float).values, df["low"].astype(float).values, df["close"].astype(float).values
+    ha_close = (o+h+l+c)/4.0
+    ha_open = np.zeros_like(ha_close)
+    ha_open[0] = (o[0]+c[0])/2.0
+    for i in range(1,len(ha_open)):
+        ha_open[i] = (ha_open[i-1]+ha_close[i-1])/2.0
+    ha_high = np.maximum.reduce([h,ha_open,ha_close])
+    ha_low = np.minimum.reduce([l,ha_open,ha_close])
+    out = df.copy()
+    out["ha_open"], out["ha_close"], out["ha_high"], out["ha_low"] = ha_open, ha_close, ha_high, ha_low
+    return out
+
+def is_green(row) -> bool: return Decimal(str(row.ha_close)) > Decimal(str(row.ha_open))
+def is_red(row) -> bool: return Decimal(str(row.ha_close)) < Decimal(str(row.ha_open))
+
+def approx_equal(a: Decimal, b: Decimal, tol_pct: Decimal) -> bool:
+    return (a == b) or (abs(a-b) <= (tol_pct*((a+b)/Decimal("2"))))
+
+def detect_signal(ha_df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    if len(ha_df) < 2: return None
+    row = ha_df.iloc[-1]
+    ha_open = Decimal(str(row.ha_open)).quantize(PRICE_TICK)
+    ha_low  = Decimal(str(row.ha_low)).quantize(PRICE_TICK)
+    ha_high = Decimal(str(row.ha_high)).quantize(PRICE_TICK)
+    if is_green(row) and approx_equal(ha_low,ha_open,TOL_PCT):
+        return {"side":"Buy","ha_open":ha_open,"signal_ts":int(row.start)}
+    if is_red(row) and approx_equal(ha_high,ha_open,TOL_PCT):
+        return {"side":"Sell","ha_open":ha_open,"signal_ts":int(row.start)}
+    return None
+
+def round_down_qty(qty: Decimal) -> Decimal:
+    steps = (qty/QTY_STEP).to_integral_value(rounding=ROUND_DOWN)
+    q = steps*QTY_STEP
+    return q if q>=MIN_QTY else Decimal("0")
+
+def get_last_open_price(df: pd.DataFrame) -> Decimal:
+    return Decimal(str(df.iloc[-1].open)).quantize(PRICE_TICK)
+
+def place_market_order(symbol: str, side: str, qty: Decimal, reduce_only: bool=False) -> Dict[str, Any]:
+    body = {"category":CATEGORY,"symbol":symbol,"side":side,"orderType":"Market","qty":str(qty),"reduceOnly":reduce_only,"timeInForce":"IOC"}
+    return _post("/v5/order/create", body)
+
+def place_reduce_only_tp_sl(symbol: str, side: str, qty: Decimal, entry: Decimal, sl: Decimal, extra_tp_pct: Decimal):
+    if side=="Buy":
+        risk=(entry-sl); tp=(entry+risk+(entry*extra_tp_pct)).quantize(PRICE_TICK)
     else:
-        tp_hit = low <= tp
-        sl_hit = high >= sl
-        if tp_hit and not sl_hit:
-            return 'TP'
-        if sl_hit and not tp_hit:
-            return 'SL'
-        if tp_hit and sl_hit:
-            return 'SL'
-        return 'NONE'
+        risk=(sl-entry); tp=(entry-risk-(entry*extra_tp_pct)).quantize(PRICE_TICK)
+    if risk<=0: return None,None
+    tp_body={"category":CATEGORY,"symbol":symbol,"side":"Sell" if side=="Buy" else "Buy","orderType":"Limit","qty":str(qty),"price":str(tp),"reduceOnly":True,"timeInForce":"GTC"}
+    tp_res=_post("/v5/order/create",tp_body); tp_id=tp_res.get("result",{}).get("orderId")
+    sl_body={"category":CATEGORY,"symbol":symbol,"side":"Sell" if side=="Buy" else "Buy","orderType":"Market","qty":str(qty),"reduceOnly":True,"timeInForce":"GTC","triggerPrice":str(sl),"triggerDirection":2 if side=="Buy" else 1,"tpslMode":"Full"}
+    sl_res=_post("/v5/order/create",sl_body); sl_id=sl_res.get("result",{}).get("orderId")
+    return tp_id,sl_id
+
+def cancel_all_reduce_only(symbol: str): _post("/v5/order/cancel-all", {"category":CATEGORY,"symbol":symbol})
+def close_position_market(symbol: str):
+    j=_get("/v5/position/list",{"category":CATEGORY,"symbol":symbol}); pos=j.get("result",{}).get("list",[])
+    if not pos: return
+    p=pos[0]; size=Decimal(p.get("size","0"))
+    if size<=0: return
+    side=p.get("side"); close_side="Sell" if side=="Buy" else "Buy"
+    place_market_order(symbol, close_side, size, reduce_only=True)
+
+def compute_qty(entry: Decimal, sl: Decimal, equity: Decimal, avail: Decimal) -> Decimal:
+    risk=abs(entry-sl)
+    if risk<=0: return Decimal("0")
+    risk_amt=equity*RISK_PCT
+    qty_by_risk=(risk_amt/risk)
+    qty_max=(avail*Decimal(LEVERAGE))/entry
+    qty=qty_max*Decimal("0.90") if qty_by_risk>qty_max else qty_by_risk
+    return round_down_qty(qty)
+
+def next_hour_start(ts_ms: int) -> int:
+    dt=datetime.fromtimestamp(ts_ms/1000, tz=timezone.utc)
+    nh=(dt+timedelta(hours=1)).replace(minute=0,second=0,microsecond=0)
+    return int(nh.timestamp()*1000)
+
+def sleep_until(ts_ms: int):
+    while True:
+        now=int(time.time()*1000)
+        if now>=ts_ms: return
+        time.sleep(min(0.5,(ts_ms-now)/1000))
 
 
-def simulate_trades(raw_candles, ha_candles, start_balance=10.0):
-    balance = float(start_balance)
-    total_trades = 0
-    tp_count = 0
-    sl_count = 0
-    none_count = 0
+# ----------------- Main Loop -----------------
+def main_loop():
+    print("Starting bot...")
+    try: set_leverage(SYMBOL,LEVERAGE,LEVERAGE)
+    except Exception as e: print("Leverage set error:",e)
 
-    for i in range(len(ha_candles)):
-        trigger = ha_candles[i]
-        raw = raw_candles[i]
+    checkpoint=START_CHECKPOINT
+    pending_signal=None
 
-        o = float(raw[1])
-        h = float(raw[2])
-        l = float(raw[3])
-        c = float(raw[4])
+    while True:
+        try:
+            df=fetch_klines(SYMBOL,"60",300)
+            ha=to_heikin_ashi(df)
+            sig=detect_signal(ha)
+            if sig:
+                pending_signal={**sig,"enter_at":next_hour_start(sig["signal_ts"])}
+                print(f"Signal {sig['side']} at {sig['ha_open']} → enter next hour")
 
-        ha_o = trigger['ha_o']
-        ha_h = trigger['ha_h']
-        ha_l = trigger['ha_l']
-        ha_c = trigger['ha_c']
+            if pending_signal and int(time.time()*1000)>=pending_signal["enter_at"]:
+                df2=fetch_klines(SYMBOL,"60",2)
+                entry=get_last_open_price(df2); side=pending_signal["side"]; sl=pending_signal["ha_open"]
+                if (side=="Buy" and entry<=sl) or (side=="Sell" and entry>=sl):
+                    print("Skip: non-positive risk"); pending_signal=None; continue
+                equity,avail=get_wallet_equity("USDT")
+                qty=compute_qty(entry,sl,equity,avail)
+                if qty<=0: print("Qty too small"); pending_signal=None; continue
+                print(f"Entering {side} qty={qty} at ~{entry} SL={sl}")
+                place_market_order(SYMBOL,side,qty)
+                tp_id,sl_id=place_reduce_only_tp_sl(SYMBOL,side,qty,entry,sl,EXTRA_TP_PCT)
+                exit_at=next_hour_start(pending_signal["enter_at"]); sleep_until(exit_at-1500)
+                jpos=_get("/v5/position/list",{"category":CATEGORY,"symbol":SYMBOL}); pos_list=jpos.get("result",{}).get("list",[])
+                still_open=pos_list and Decimal(pos_list[0].get("size","0"))>0
+                if still_open: print("Force exit..."); cancel_all_reduce_only(SYMBOL); close_position_market(SYMBOL)
+                if TRANSFER_ON_DOUBLING:
+                    eq_now,_=get_wallet_equity("USDT")
+                    if eq_now>=checkpoint*2:
+                        amt=(eq_now*Decimal("0.25")).quantize(Decimal("0.01"))
+                        if amt>0: txid=transfer_between_accounts(TRANSFER_COIN,amt,FROM_ACCT,TO_ACCT); print(f"Siphon {amt} {TRANSFER_COIN} txid={txid}")
+                        checkpoint*=2
+                pending_signal=None
+            time.sleep(CHECK_INTERVAL_SEC)
+        except Exception as e:
+            print("Loop error:",e); time.sleep(2)
 
-        if ha_c > ha_o and is_close(ha_l, ha_o):
-            direction = 'long'
-        elif ha_c < ha_o and is_close(ha_h, ha_o):
-            direction = 'short'
-        else:
-            continue
-
-        total_trades += 1
-        entry = o
-        sl = ha_o
-        risk = abs(entry - sl)
-
-        if direction == 'long':
-            tp = entry + risk + (entry * 0.0007)
-        else:
-            tp = entry - risk - (entry * 0.0007)
-
-        outcome = resolve_intrabar_result(direction, entry, sl, tp, h, l)
-
-        if outcome == 'TP':
-            tp_count += 1
-            balance *= 1.10
-        elif outcome == 'SL':
-            sl_count += 1
-            balance *= 0.90
-        else:
-            none_count += 1
-            pct = (c - entry) / entry * 100.0 if direction == 'long' else (entry - c) / entry * 100.0
-            balance *= (1.0 + pct / 100.0)
-
-    win_rate = (tp_count / total_trades * 100.0) if total_trades else 0.0
-
-    print("--- RESULTS ---")
-    print(f"Total trades: {total_trades}")
-    print(f"Wins (TP): {tp_count}")
-    print(f"Losses (SL): {sl_count}")
-    print(f"No TP/SL (closed EoH): {none_count}")
-    print(f"Win rate: {win_rate:.2f}%")
-    print(f"Final balance from $10: ${balance:.6f}")
-
-
-if __name__ == '__main__':
-    print("Fetching last 1000 1h candles for TRXUSDT...")
-    raw = fetch_candles(limit=1000)
-    ha = heikin_ashi_from_raw(raw)
-    simulate_trades(raw, ha, start_balance=10.0)
+if __name__=="__main__":
+    main_loop()
+   
