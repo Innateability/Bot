@@ -38,8 +38,6 @@ from decimal import Decimal, ROUND_DOWN
 from typing import Dict, Any, Tuple, Optional
 
 import requests
-import pandas as pd
-import numpy as np
 
 
 # ========================= CONFIG =========================
