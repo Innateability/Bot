@@ -15,13 +15,13 @@ Features:
 
 import os, time, math, json, logging
 from datetime import datetime
-from pybit import HTTP
+from pybit.unified_trading import HTTP
 
 
 # ----------------- CONFIG -----------------
 SYMBOL = "TRXUSDT"
 TIMEFRAME = "60"
-INITIAL_HA_OPEN = 0.33813       # You can change this
+INITIAL_HA_OPEN = 0.33824       # You can change this
 TICK_SIZE = 0.00001
 LEVERAGE = 75
 RISK_PERCENT = 0.10
@@ -50,9 +50,8 @@ def save_state(state):
     with open(STATE_FILE, 'w') as f:
         json.dump(state, f, indent=2)
 
-# ----------------- BYBIT CLIENT -----------------
-session = HTTP(endpoint=BASE_URL, api_key=API_KEY, api_secret=API_SECRET)
-
+ 
+session = HTTP(testnet=False, api_key=API_KEY, api_secret=API_SECRET)
 # ----------------- HA COMPUTE -----------------
 def compute_ha(raw_candles, persisted_open=None):
     ha_list = []
