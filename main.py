@@ -20,7 +20,7 @@ from pybit import HTTP
 # ----------------- CONFIG -----------------
 SYMBOL = "TRXUSDT"
 TIMEFRAME = "60"
-INITIAL_HA_OPEN = 0.3       # You can change this
+INITIAL_HA_OPEN = 0.33813       # You can change this
 TICK_SIZE = 0.00001
 LEVERAGE = 75
 RISK_PERCENT = 0.10
