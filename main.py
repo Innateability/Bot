@@ -15,7 +15,7 @@ Features:
 
 import os, time, math, json, logging
 from datetime import datetime
-from pybit.unified_trading import HTTP
+from pybit import HTTP
 
 
 # ----------------- CONFIG -----------------
