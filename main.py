@@ -141,7 +141,7 @@ def get_wallet_info(coin: str = "USDT") -> Dict[str, Decimal]:
         for c in lst[0].get("coin", []):
             if c.get("coin") == coin:
                 equity = Decimal(str(c.get("equity", "0")))
-                available = Decimal(str(c.get("availableToWithdraw") or c.get("availableBalance") or c.get("equity") or "0")))
+                available = Decimal((str(c.get("availableToWithdraw") or c.get("availableBalance") or c.get("equity") or "0")))
                 return {"equity": equity, "available": available}
     except Exception as e:
         print("get_wallet_info error:", e)
