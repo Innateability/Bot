@@ -15,7 +15,8 @@ Features:
 
 import os, time, math, json, logging
 from datetime import datetime
-from pybit import HTTP
+from pybit.unified_trading import HTTP
+
 
 # ----------------- CONFIG -----------------
 SYMBOL = "TRXUSDT"
