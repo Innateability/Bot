@@ -150,7 +150,7 @@ def run_bot():
     persisted_ha_open = state.get('last_ha_open', None)
     baseline_balance = state.get('baseline_balance', None)
 
-    candles = session.query_kline(symbol=SYMBOL, interval=TIMEFRAME, limit=200)['result']
+    candles = session.get_kline(symbol=SYMBOL, interval=TIMEFRAME, limit=200)['result']
     raw_candles = [{'ts':c['open_time'],'open':float(c['open']),'high':float(c['high']),
                     'low':float(c['low']),'close':float(c['close'])} for c in candles]
 
