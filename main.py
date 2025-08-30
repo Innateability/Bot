@@ -1,11 +1,12 @@
 """
 Live Heikin-Ashi Bot for Bybit USDT Perpetual (One-Way Mode)
 Features:
-- Initialize HA open = 0.3 on first deploy
+- Initialize HA open = 0.3 on first deploy (modifiable)
 - Update HA open each hour: HA_open = (prev_HA_open + prev_HA_close)/2
 - Detect buy/sell signals from HA candles
 - Market orders with TP/SL attached
 - Risk 10% of balance, fallback 90%
+- Incremental position sizing if new qty > open qty
 - 75x leverage, one-way mode
 - USDT Perpetual
 - Hourly execution using system clock
@@ -14,13 +15,12 @@ Features:
 
 import os, time, math, json, logging
 from datetime import datetime
-import requests
 from pybit import HTTP
 
 # ----------------- CONFIG -----------------
 SYMBOL = "TRXUSDT"
 TIMEFRAME = "60"
-INITIAL_HA_OPEN = 0.33813
+INITIAL_HA_OPEN = 0.3       # You can change this
 TICK_SIZE = 0.00001
 LEVERAGE = 75
 RISK_PERCENT = 0.10
@@ -116,12 +116,26 @@ def place_order(signal, qty, entry, sl, tp):
     logger.info(f"Placed order: {side} qty={qty} entry={entry} TP={tp} SL={sl}")
     return res
 
-def modify_open_position(sl, tp):
+def modify_open_position(new_sl, new_tp, new_qty):
     pos = session.get_position(symbol=SYMBOL)['result'][0]
-    order_id = pos['position_idx']
-    res = session.set_trading_stop(symbol=SYMBOL, take_profit=tp, stop_loss=sl)
-    logger.info(f"Modified open position TP/SL: SL={sl} TP={tp}")
-    return res
+    current_qty = float(pos['size'])
+    side = pos['side']
+
+    # Always update TP/SL
+    session.set_trading_stop(symbol=SYMBOL, take_profit=new_tp, stop_loss=new_sl)
+    logger.info(f"Modified open position TP/SL: SL={new_sl} TP={new_tp}")
+
+    # Increase quantity if needed
+    if new_qty > current_qty:
+        additional_qty = new_qty - current_qty
+        balance = get_balance()
+        max_affordable_qty = (balance * FALLBACK_PERCENT * LEVERAGE) / pos['entry_price']
+        qty_to_open = min(additional_qty, max_affordable_qty)
+        if qty_to_open > 0:
+            # Open extra contracts with same side
+            place_order("Buy" if side=="Buy" else "Sell", qty_to_open, pos['entry_price'], new_sl, new_tp)
+            logger.info(f"Increased position by {qty_to_open} contracts with updated TP/SL")
+    return True
 
 def siphon_balance(balance):
     amount = round(balance*SIP_PERCENT)
@@ -168,7 +182,7 @@ def run_bot():
     # Check open position
     pos_info = session.get_position(symbol=SYMBOL)['result'][0]
     if float(pos_info['size'])>0:
-        modify_open_position(signal['sl'], signal['tp'])
+        modify_open_position(signal['sl'], signal['tp'], qty)
     else:
         place_order(signal['signal'], qty, signal['entry'], signal['sl'], signal['tp'])
 
@@ -190,4 +204,3 @@ if __name__=="__main__":
     while True:
         run_bot()
         wait_for_next_hour()
-        
