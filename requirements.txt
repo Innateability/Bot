@@ -1,5 +1,4 @@
 fastapi
 uvicorn
 requests
-pybit==2.0.1
-
+pybit==3.0.0
