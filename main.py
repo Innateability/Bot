@@ -12,7 +12,7 @@ from datetime import datetime
 SYMBOL = "TRXUSDT"
 INTERVAL = "60"       # 1h
 LIMIT = 200           # number of candles to fetch
-INITIAL_HA_OPEN = 0.3 # set manually at deployment
+INITIAL_HA_OPEN = 0.35329 # set manually at deployment
 TICK_SIZE = 0.00001
 LEVERAGE = 75
 RISK_PERCENT = 0.10
@@ -33,6 +33,9 @@ def floor_to_step(x, step):
 def round_price(p, tick=TICK_SIZE):
     ticks = round(p / tick)
     return round(ticks * tick, 8)
+
+def ts_to_str(ts):
+    return datetime.utcfromtimestamp(ts/1000).strftime("%Y-%m-%d %H:%M:%S")
 
 # -------- DATA FETCH --------
 def fetch_bybit_klines(symbol, interval, limit=200):
@@ -105,7 +108,7 @@ def compute_qty(entry, sl, balance):
 # -------- BACKTEST --------
 def backtest(balance=100):
     raw = fetch_bybit_klines(SYMBOL, INTERVAL, LIMIT)
-    logger.info("Fetched %d candles. First candle UTC time = %s", len(raw), datetime.utcfromtimestamp(raw[0]['ts']/1000))
+    logger.info("Fetched %d candles. First candle UTC time = %s", len(raw), ts_to_str(raw[0]['ts']))
     logger.info("⚠️ Use this time to cross-check HA open in TradingView!")
 
     trades = []
@@ -134,47 +137,51 @@ def backtest(balance=100):
         final_qty = max(qty, MIN_NEW_ORDER_QTY)
 
         current_trade = pos[sig]
+        timestamp_str = ts_to_str(last["ts"])
 
         if not current_trade:
-            # No open trade for this side -> open new
+            # Open new trade
             pos[sig] = {"side": sig, "entry": entry, "sl": sl, "tp": tp, "qty": final_qty, "open_time": last["ts"]}
             trades.append(pos[sig])
-            logger.info("New %s trade at %.6f | SL=%.6f | TP=%.6f | qty=%.2f", sig, entry, sl, tp, final_qty)
+            logger.info("[%s] New %s trade | Entry=%.6f | SL=%.6f | TP=%.6f | qty=%.2f | Balance=%.2f", 
+                        timestamp_str, sig, entry, sl, tp, final_qty, balance)
         else:
-            # Trade exists -> check for SL/TP update
-            modified = False
-            if current_trade["sl"] != sl:
-                logger.info("%s trade SL updated: %.6f -> %.6f", sig, current_trade["sl"], sl)
+            # Update SL/TP if changed
+            if current_trade["sl"] != sl or current_trade["tp"] != tp:
                 current_trade["sl"] = sl
-                modified = True
-            if current_trade["tp"] != tp:
-                logger.info("%s trade TP updated: %.6f -> %.6f", sig, current_trade["tp"], tp)
                 current_trade["tp"] = tp
-                modified = True
-            if modified:
-                logger.info("%s trade now Entry=%.6f | SL=%.6f | TP=%.6f | qty=%.2f", sig, current_trade["entry"], current_trade["sl"], current_trade["tp"], current_trade["qty"])
+                logger.info("[%s] %s trade TP and SL changed to %.6f | %.6f | Entry=%.6f | qty=%.2f | Balance=%.2f",
+                            timestamp_str, sig, tp, sl, current_trade["entry"], current_trade["qty"], balance)
 
-        # Mini-sim: check if trade hits TP or SL
+        # Mini-sim: check TP/SL hit and update balance
         for side, t in pos.items():
             if not t:
                 continue
             last_low, last_high = last["raw_low"], last["raw_high"]
+            pnl = 0
+            hit = None
+
             if t["side"] == "Buy" and last_low <= t["sl"]:
-                logger.info("Buy trade SL hit at %.6f | Entry=%.6f | TP=%.6f", t["sl"], t["entry"], t["tp"])
-                pos[side] = None
+                pnl = -abs(t["entry"] - t["sl"]) * t["qty"]
+                hit = "SL"
             elif t["side"] == "Sell" and last_high >= t["sl"]:
-                logger.info("Sell trade SL hit at %.6f | Entry=%.6f | TP=%.6f", t["sl"], t["entry"], t["tp"])
-                pos[side] = None
+                pnl = -abs(t["entry"] - t["sl"]) * t["qty"]
+                hit = "SL"
             elif t["side"] == "Buy" and last_high >= t["tp"]:
-                logger.info("Buy trade TP hit at %.6f | Entry=%.6f | SL=%.6f", t["tp"], t["entry"], t["sl"])
-                pos[side] = None
+                pnl = abs(t["tp"] - t["entry"]) * t["qty"]
+                hit = "TP"
             elif t["side"] == "Sell" and last_low <= t["tp"]:
-                logger.info("Sell trade TP hit at %.6f | Entry=%.6f | SL=%.6f", t["tp"], t["entry"], t["sl"])
+                pnl = abs(t["entry"] - t["tp"]) * t["qty"]
+                hit = "TP"
+
+            if hit:
+                balance += pnl
+                logger.info("[%s] %s trade %s hit | Entry=%.6f | SL=%.6f | TP=%.6f | qty=%.2f | Balance=%.2f",
+                            timestamp_str, t["side"], hit, t["entry"], t["sl"], t["tp"], t["qty"], balance)
                 pos[side] = None
 
-    logger.info("Backtest finished. Total trades opened = %d", len(trades))
+    logger.info("Backtest finished. Total trades opened = %d | Final Balance=%.2f", len(trades), balance)
     return trades
 
 if __name__ == "__main__":
     backtest(balance=100)
-    
