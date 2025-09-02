@@ -7,6 +7,9 @@ Fixes:
 - Align to top-of-hour on startup (so initial persisted/INITIAL_HA_OPEN is used for the first closed candle)
 - Detect & drop in-progress candle so OHLC/HA are computed only on closed candles
 - Detailed logging (raw + HA OHLC, balance, absolute qty, order events)
+
+Added:
+- Enforce minimum quantity of 16 contracts for NEW trades only (env override: MIN_NEW_ORDER_QTY)
 """
 
 import os
@@ -30,6 +33,7 @@ FALLBACK_PERCENT = float(os.environ.get("FALLBACK_PERCENT", "0.90"))
 START_SIP_BALANCE = float(os.environ.get("START_SIP_BALANCE", "4.0"))
 SIP_PERCENT = float(os.environ.get("SIP_PERCENT", "0.25"))
 STATE_FILE = os.environ.get("STATE_FILE", "ha_state.json")
+MIN_NEW_ORDER_QTY = float(os.environ.get("MIN_NEW_ORDER_QTY", "16"))  # ✅ minimum contracts for NEW trades
 
 API_KEY = os.environ.get("BYBIT_API_KEY")
 API_SECRET = os.environ.get("BYBIT_API_SECRET")
@@ -475,8 +479,19 @@ def run_once():
         modified = modify_tp_sl_and_maybe_increase(SYMBOL, sl, tp, qty)
         logger.info("Modify/increase result: %s", modified)
     else:
-        logger.info("No open position — placing new market order with attached TP/SL")
-        placed = place_market_with_tp_sl(sig["signal"], SYMBOL, qty, sl, tp)
+        # ✅ Enforce minimum 16 contracts for NEW trades only
+        final_qty = qty
+        if final_qty < MIN_NEW_ORDER_QTY:
+            logger.info("Computed qty %.8f < minimum %.0f; using minimum for new order.", final_qty, MIN_NEW_ORDER_QTY)
+            final_qty = MIN_NEW_ORDER_QTY
+        # respect exchange lot step
+        final_qty = floor_to_step(final_qty, QTY_STEP)
+        if final_qty <= 0:
+            logger.warning("Final qty after min/step adjustment <= 0; aborting new order")
+            return
+
+        logger.info("No open position — placing new market order with attached TP/SL (final_qty=%.8f)", final_qty)
+        placed = place_market_with_tp_sl(sig["signal"], SYMBOL, final_qty, sl, tp)
         logger.info("Place order result: %s", placed)
 
     # siphon logic
@@ -508,4 +523,3 @@ if __name__ == "__main__":
         except Exception:
             logger.exception("Error during run_once()")
         wait_until_next_hour()
-        
