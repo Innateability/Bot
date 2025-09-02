@@ -160,16 +160,16 @@ def backtest(balance=100):
                 continue
             last_low, last_high = last["raw_low"], last["raw_high"]
             if t["side"] == "Buy" and last_low <= t["sl"]:
-                logger.info("Buy trade SL hit at %.6f | Entry=%.6f | TP=%.6f", t["sl'], t["entry'], t["tp'])
+                logger.info("Buy trade SL hit at %.6f | Entry=%.6f | TP=%.6f", t["sl"], t["entry"], t["tp"])
                 pos[side] = None
             elif t["side"] == "Sell" and last_high >= t["sl"]:
-                logger.info("Sell trade SL hit at %.6f | Entry=%.6f | TP=%.6f", t["sl'], t["entry'], t["tp'])
+                logger.info("Sell trade SL hit at %.6f | Entry=%.6f | TP=%.6f", t["sl"], t["entry"], t["tp"])
                 pos[side] = None
             elif t["side"] == "Buy" and last_high >= t["tp"]:
-                logger.info("Buy trade TP hit at %.6f | Entry=%.6f | SL=%.6f", t["tp'], t["entry'], t["sl'])
+                logger.info("Buy trade TP hit at %.6f | Entry=%.6f | SL=%.6f", t["tp"], t["entry"], t["sl"])
                 pos[side] = None
             elif t["side"] == "Sell" and last_low <= t["tp"]:
-                logger.info("Sell trade TP hit at %.6f | Entry=%.6f | SL=%.6f", t["tp'], t["entry'], t["sl'])
+                logger.info("Sell trade TP hit at %.6f | Entry=%.6f | SL=%.6f", t["tp"], t["entry"], t["sl"])
                 pos[side] = None
 
     logger.info("Backtest finished. Total trades opened = %d", len(trades))
