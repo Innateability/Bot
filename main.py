@@ -13,7 +13,7 @@ from datetime import datetime
 SYMBOL = "TRXUSDT"
 INTERVAL = "60"       # 1h
 LIMIT = 200           # number of candles to fetch
-INITIAL_HA_OPEN = 0.34370 # starting HA open to match TradingView
+INITIAL_HA_OPEN = 0.34416 # starting HA open to match TradingView
 TICK_SIZE = 0.00001
 LEVERAGE = 75
 RISK_PERCENT = 0.10
@@ -106,57 +106,60 @@ def backtest(balance=100):
     logger.info("Fetched %d candles. First candle UTC time = %s", len(raw), ts_to_str(raw[0]['ts']))
     logger.info("⚠️ Use this time to cross-check HA open in TradingView!")
 
-    trades = []
-    prev_ha_open = INITIAL_HA_OPEN
-    prev_ha_close = None
-    pos = {"Buy": None, "Sell": None}
+    trades = []  
+    prev_ha_open = INITIAL_HA_OPEN  
+    prev_ha_close = None  
+    pos = {"Buy": None, "Sell": None}  
 
-    for candle in raw:
-        ha_candle, prev_ha_open, prev_ha_close = compute_ha_candle_forward(candle, prev_ha_open, prev_ha_close)
-        timestamp_str = ts_to_str(ha_candle["ts"])
+    for candle in raw:  
+        ha_candle, prev_ha_open, prev_ha_close = compute_ha_candle_forward(candle, prev_ha_open, prev_ha_close)  
+        timestamp_str = ts_to_str(ha_candle["ts"])  
 
-        sig = evaluate_signal(ha_candle)
-        if not sig:
-            continue
+        # Log every candle
+        logger.info("[%s] Candle | RAW O/H/L/C = %.6f / %.6f / %.6f / %.6f | HA O/H/L/C = %.6f / %.6f / %.6f / %.6f",
+                    timestamp_str,
+                    ha_candle["raw_open"], ha_candle["raw_high"], ha_candle["raw_low"], ha_candle["raw_close"],
+                    ha_candle["ha_open"], ha_candle["ha_high"], ha_candle["ha_low"], ha_candle["ha_close"])
 
-        entry = ha_candle["raw_close"]
-        sl = ha_candle["ha_open"]
-        risk = abs(entry - sl)
-        if risk <= 0:
-            continue
-        tp = entry + risk + 0.001*entry if sig=="Buy" else entry - (risk + 0.001*entry)
-        sl, tp = round_price(sl), round_price(tp)
-        qty = max(compute_qty(entry, sl, balance), MIN_NEW_ORDER_QTY)
+        sig = evaluate_signal(ha_candle)  
+        if not sig:  
+            continue  
 
-        current_trade = pos[sig]
+        entry = ha_candle["raw_close"]  
+        sl = ha_candle["ha_open"]  
+        risk = abs(entry - sl)  
+        if risk <= 0:  
+            continue  
+        tp = entry + risk + 0.001*entry if sig=="Buy" else entry - (risk + 0.001*entry)  
+        sl, tp = round_price(sl), round_price(tp)  
+        qty = max(compute_qty(entry, sl, balance), MIN_NEW_ORDER_QTY)  
 
-        if not current_trade:
+        current_trade = pos[sig]  
+
+        if not current_trade:  
             # Open new trade
-            pos[sig] = {"side": sig, "entry": entry, "sl": sl, "tp": tp, "qty": qty, "open_time": candle["ts"]}
-            trades.append(pos[sig])
-            logger.info("[%s] New %s trade | Entry=%.6f | SL=%.6f | TP=%.6f | qty=%.2f | Balance=%.2f",
+            pos[sig] = {"side": sig, "entry": entry, "sl": sl, "tp": tp, "qty": qty, "open_time": candle["ts"]}  
+            trades.append(pos[sig])  
+            logger.info("[%s] New %s trade | Entry=%.6f | SL=%.6f | TP=%.6f | qty=%.2f | Balance=%.2f",  
                         timestamp_str, sig, entry, sl, tp, qty, balance)
-            logger.info("    RAW O/H/L/C = %.6f / %.6f / %.6f / %.6f | HA O/H/L/C = %.6f / %.6f / %.6f / %.6f",
-                        ha_candle["raw_open"], ha_candle["raw_high"], ha_candle["raw_low"], ha_candle["raw_close"],
-                        ha_candle["ha_open"], ha_candle["ha_high"], ha_candle["ha_low"], ha_candle["ha_close"])
 
-            # Immediately check SL/TP in same candle
+            # Immediately check if SL/TP hit in same candle
             last_low, last_high = ha_candle["raw_low"], ha_candle["raw_high"]
             pnl = 0
             hit = None
 
             if sig == "Buy":
-                if last_low <= sl:   # SL first
+                if last_low <= sl:
                     pnl = -abs(entry - sl) * qty
                     hit = "SL"
-                elif last_high >= tp:  # TP second
+                elif last_high >= tp:
                     pnl = abs(tp - entry) * qty
                     hit = "TP"
             elif sig == "Sell":
-                if last_high >= sl:   # SL first
+                if last_high >= sl:
                     pnl = -abs(entry - sl) * qty
                     hit = "SL"
-                elif last_low <= tp:  # TP second
+                elif last_low <= tp:
                     pnl = abs(entry - tp) * qty
                     hit = "TP"
 
@@ -164,53 +167,44 @@ def backtest(balance=100):
                 balance += pnl
                 logger.info("[%s] %s trade %s hit immediately | Entry=%.6f | SL=%.6f | TP=%.6f | qty=%.2f | Balance=%.2f",
                             timestamp_str, sig, hit, entry, sl, tp, qty, balance)
-                logger.info("    RAW O/H/L/C = %.6f / %.6f / %.6f / %.6f | HA O/H/L/C = %.6f / %.6f / %.6f / %.6f",
-                            ha_candle["raw_open"], ha_candle["raw_high"], ha_candle["raw_low"], ha_candle["raw_close"],
-                            ha_candle["ha_open"], ha_candle["ha_high"], ha_candle["ha_low"], ha_candle["ha_close"])
                 pos[sig] = None
 
-        else:
+        else:  
             # Update TP/SL if changed
-            if current_trade["sl"] != sl or current_trade["tp"] != tp:
-                current_trade["sl"] = sl
-                current_trade["tp"] = tp
-                logger.info("[%s] %s trade TP and SL changed to %.6f | %.6f | Entry=%.6f | qty=%.2f | Balance=%.2f",
+            if current_trade["sl"] != sl or current_trade["tp"] != tp:  
+                current_trade["sl"] = sl  
+                current_trade["tp"] = tp  
+                logger.info("[%s] %s trade TP and SL changed to %.6f | %.6f | Entry=%.6f | qty=%.2f | Balance=%.2f",  
                             timestamp_str, sig, tp, sl, current_trade["entry"], current_trade["qty"], balance)
-                logger.info("    RAW O/H/L/C = %.6f / %.6f / %.6f / %.6f | HA O/H/L/C = %.6f / %.6f / %.6f / %.6f",
-                            ha_candle["raw_open"], ha_candle["raw_high"], ha_candle["raw_low"], ha_candle["raw_close"],
-                            ha_candle["ha_open"], ha_candle["ha_high"], ha_candle["ha_low"], ha_candle["ha_close"])
 
         # Mini-sim: check TP/SL hit and update balance
-        for side, t in pos.items():
-            if not t:
-                continue
-            last_low, last_high = ha_candle["raw_low"], ha_candle["raw_high"]
-            pnl = 0
-            hit = None
+        for side, t in pos.items():  
+            if not t:  
+                continue  
+            last_low, last_high = ha_candle["raw_low"], ha_candle["raw_high"]  
+            pnl = 0  
+            hit = None  
 
-            if t["side"] == "Buy" and last_low <= t["sl"]:
-                pnl = -abs(t["entry"] - t["sl"]) * t["qty"]
-                hit = "SL"
-            elif t["side"] == "Sell" and last_high >= t["sl"]:
-                pnl = -abs(t["entry"] - t["sl"]) * t["qty"]
-                hit = "SL"
-            elif t["side"] == "Buy" and last_high >= t["tp"]:
-                pnl = abs(t["tp"] - t["entry"]) * t["qty"]
-                hit = "TP"
-            elif t["side"] == "Sell" and last_low <= t["tp"]:
-                pnl = abs(t["entry"] - t["tp"]) * t["qty"]
-                hit = "TP"
+            if t["side"] == "Buy" and last_low <= t["sl"]:  
+                pnl = -abs(t["entry"] - t["sl"]) * t["qty"]  
+                hit = "SL"  
+            elif t["side"] == "Sell" and last_high >= t["sl"]:  
+                pnl = -abs(t["entry"] - t["sl"]) * t["qty"]  
+                hit = "SL"  
+            elif t["side"] == "Buy" and last_high >= t["tp"]:  
+                pnl = abs(t["tp"] - t["entry"]) * t["qty"]  
+                hit = "TP"  
+            elif t["side"] == "Sell" and last_low <= t["tp"]:  
+                pnl = abs(t["entry"] - t["tp"]) * t["qty"]  
+                hit = "TP"  
 
-            if hit:
-                balance += pnl
-                logger.info("[%s] %s trade %s hit | Entry=%.6f | SL=%.6f | TP=%.6f | qty=%.2f | Balance=%.2f",
+            if hit:  
+                balance += pnl  
+                logger.info("[%s] %s trade %s hit | Entry=%.6f | SL=%.6f | TP=%.6f | qty=%.2f | Balance=%.2f",  
                             timestamp_str, t["side"], hit, t["entry"], t["sl"], t["tp"], t["qty"], balance)
-                logger.info("    RAW O/H/L/C = %.6f / %.6f / %.6f / %.6f | HA O/H/L/C = %.6f / %.6f / %.6f / %.6f",
-                            ha_candle["raw_open"], ha_candle["raw_high"], ha_candle["raw_low"], ha_candle["raw_close"],
-                            ha_candle["ha_open"], ha_candle["ha_high"], ha_candle["ha_low"], ha_candle["ha_close"])
-                pos[side] = None
+                pos[side] = None  
 
-    logger.info("Backtest finished. Total trades opened = %d | Final Balance=%.2f", len(trades), balance)
+    logger.info("Backtest finished. Total trades opened = %d | Final Balance=%.2f", len(trades), balance)  
     return trades
 
 if __name__ == "__main__":
