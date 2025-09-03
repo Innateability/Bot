@@ -9,10 +9,11 @@ import logging
 from datetime import datetime
 
 # -------- CONFIG --------
+
 SYMBOL = "TRXUSDT"
 INTERVAL = "60"       # 1h
 LIMIT = 200           # number of candles to fetch
-INITIAL_HA_OPEN = 0.35306 # starting HA open to match TradingView
+INITIAL_HA_OPEN = 0.3 # starting HA open to match TradingView
 TICK_SIZE = 0.00001
 LEVERAGE = 75
 RISK_PERCENT = 0.10
@@ -21,10 +22,12 @@ QTY_STEP = 1
 MIN_NEW_ORDER_QTY = 16
 
 # -------- LOGGING --------
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 logger = logging.getLogger("backtest")
 
 # -------- HELPERS --------
+
 def floor_to_step(x, step):
     if step <= 0:
         return x
@@ -38,6 +41,7 @@ def ts_to_str(ts):
     return datetime.utcfromtimestamp(ts/1000).strftime("%Y-%m-%d %H:%M:%S")
 
 # -------- DATA FETCH --------
+
 def fetch_bybit_klines(symbol, interval, limit=200):
     url = "https://api.bybit.com/v5/market/kline"
     params = {"category": "linear", "symbol": symbol, "interval": interval, "limit": limit}
@@ -58,6 +62,7 @@ def fetch_bybit_klines(symbol, interval, limit=200):
     return candles
 
 # -------- FORWARD HEIKIN-ASHI --------
+
 def compute_ha_candle_forward(candle, prev_ha_open, prev_ha_close):
     ro, rh, rl, rc = candle["open"], candle["high"], candle["low"], candle["close"]
     ha_close = (ro + rh + rl + rc) / 4.0
@@ -71,6 +76,7 @@ def compute_ha_candle_forward(candle, prev_ha_open, prev_ha_close):
     }, ha_open, ha_close
 
 # -------- SIGNAL --------
+
 def evaluate_signal(last):
     green = last["ha_close"] > last["ha_open"]
     red = last["ha_close"] < last["ha_open"]
@@ -81,6 +87,7 @@ def evaluate_signal(last):
     return None
 
 # -------- QTY --------
+
 def compute_qty(entry, sl, balance):
     risk_usd = balance * RISK_PERCENT
     per_contract_risk = abs(entry - sl)
@@ -93,6 +100,7 @@ def compute_qty(entry, sl, balance):
     return floor_to_step(qty, QTY_STEP)
 
 # -------- BACKTEST --------
+
 def backtest(balance=100):
     raw = fetch_bybit_klines(SYMBOL, INTERVAL, LIMIT)
     logger.info("Fetched %d candles. First candle UTC time = %s", len(raw), ts_to_str(raw[0]['ts']))
@@ -128,6 +136,9 @@ def backtest(balance=100):
             trades.append(pos[sig])
             logger.info("[%s] New %s trade | Entry=%.6f | SL=%.6f | TP=%.6f | qty=%.2f | Balance=%.2f",
                         timestamp_str, sig, entry, sl, tp, qty, balance)
+            logger.info("    RAW O/H/L/C = %.6f / %.6f / %.6f / %.6f | HA O/H/L/C = %.6f / %.6f / %.6f / %.6f",
+                        ha_candle["raw_open"], ha_candle["raw_high"], ha_candle["raw_low"], ha_candle["raw_close"],
+                        ha_candle["ha_open"], ha_candle["ha_high"], ha_candle["ha_low"], ha_candle["ha_close"])
         else:
             # Update TP/SL if changed
             if current_trade["sl"] != sl or current_trade["tp"] != tp:
@@ -135,6 +146,9 @@ def backtest(balance=100):
                 current_trade["tp"] = tp
                 logger.info("[%s] %s trade TP and SL changed to %.6f | %.6f | Entry=%.6f | qty=%.2f | Balance=%.2f",
                             timestamp_str, sig, tp, sl, current_trade["entry"], current_trade["qty"], balance)
+                logger.info("    RAW O/H/L/C = %.6f / %.6f / %.6f / %.6f | HA O/H/L/C = %.6f / %.6f / %.6f / %.6f",
+                            ha_candle["raw_open"], ha_candle["raw_high"], ha_candle["raw_low"], ha_candle["raw_close"],
+                            ha_candle["ha_open"], ha_candle["ha_high"], ha_candle["ha_low"], ha_candle["ha_close"])
 
         # Mini-sim: check TP/SL hit and update balance
         for side, t in pos.items():
@@ -161,6 +175,9 @@ def backtest(balance=100):
                 balance += pnl
                 logger.info("[%s] %s trade %s hit | Entry=%.6f | SL=%.6f | TP=%.6f | qty=%.2f | Balance=%.2f",
                             timestamp_str, t["side"], hit, t["entry"], t["sl"], t["tp"], t["qty"], balance)
+                logger.info("    RAW O/H/L/C = %.6f / %.6f / %.6f / %.6f | HA O/H/L/C = %.6f / %.6f / %.6f / %.6f",
+                            ha_candle["raw_open"], ha_candle["raw_high"], ha_candle["raw_low"], ha_candle["raw_close"],
+                            ha_candle["ha_open"], ha_candle["ha_high"], ha_candle["ha_low"], ha_candle["ha_close"])
                 pos[side] = None
 
     logger.info("Backtest finished. Total trades opened = %d | Final Balance=%.2f", len(trades), balance)
