@@ -139,6 +139,36 @@ def backtest(balance=100):
             logger.info("    RAW O/H/L/C = %.6f / %.6f / %.6f / %.6f | HA O/H/L/C = %.6f / %.6f / %.6f / %.6f",
                         ha_candle["raw_open"], ha_candle["raw_high"], ha_candle["raw_low"], ha_candle["raw_close"],
                         ha_candle["ha_open"], ha_candle["ha_high"], ha_candle["ha_low"], ha_candle["ha_close"])
+
+            # Immediately check SL/TP in same candle
+            last_low, last_high = ha_candle["raw_low"], ha_candle["raw_high"]
+            pnl = 0
+            hit = None
+
+            if sig == "Buy":
+                if last_low <= sl:   # SL first
+                    pnl = -abs(entry - sl) * qty
+                    hit = "SL"
+                elif last_high >= tp:  # TP second
+                    pnl = abs(tp - entry) * qty
+                    hit = "TP"
+            elif sig == "Sell":
+                if last_high >= sl:   # SL first
+                    pnl = -abs(entry - sl) * qty
+                    hit = "SL"
+                elif last_low <= tp:  # TP second
+                    pnl = abs(entry - tp) * qty
+                    hit = "TP"
+
+            if hit:
+                balance += pnl
+                logger.info("[%s] %s trade %s hit immediately | Entry=%.6f | SL=%.6f | TP=%.6f | qty=%.2f | Balance=%.2f",
+                            timestamp_str, sig, hit, entry, sl, tp, qty, balance)
+                logger.info("    RAW O/H/L/C = %.6f / %.6f / %.6f / %.6f | HA O/H/L/C = %.6f / %.6f / %.6f / %.6f",
+                            ha_candle["raw_open"], ha_candle["raw_high"], ha_candle["raw_low"], ha_candle["raw_close"],
+                            ha_candle["ha_open"], ha_candle["ha_high"], ha_candle["ha_low"], ha_candle["ha_close"])
+                pos[sig] = None
+
         else:
             # Update TP/SL if changed
             if current_trade["sl"] != sl or current_trade["tp"] != tp:
