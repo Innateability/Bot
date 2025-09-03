@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Backtester for Heikin-Ashi Strategy (Bybit USDT Perp)
+Forward Heikin-Ashi Backtester for Bybit USDT Perp
 """
 
 import requests
@@ -12,7 +12,7 @@ from datetime import datetime
 SYMBOL = "TRXUSDT"
 INTERVAL = "60"       # 1h
 LIMIT = 200           # number of candles to fetch
-INITIAL_HA_OPEN = 0.35329 # set manually at deployment
+INITIAL_HA_OPEN = 0.35306 # starting HA open to match TradingView
 TICK_SIZE = 0.00001
 LEVERAGE = 75
 RISK_PERCENT = 0.10
@@ -57,31 +57,18 @@ def fetch_bybit_klines(symbol, interval, limit=200):
     candles.sort(key=lambda x: x["ts"])
     return candles
 
-# -------- HEIKIN-ASHI --------
-def compute_heikin_ashi(raw_candles, persisted_open=None):
-    ha = []
-    prev_ha_open = None
-    prev_ha_close = None
-    n = len(raw_candles)
-    for i, c in enumerate(raw_candles):
-        ro, rh, rl, rc = c["open"], c["high"], c["low"], c["close"]
-        ha_close = (ro + rh + rl + rc) / 4.0
-        if i == n - 1:
-            ha_open = float(persisted_open) if persisted_open is not None else INITIAL_HA_OPEN
-        else:
-            if prev_ha_open is None:
-                ha_open = (ro + rc) / 2.0
-            else:
-                ha_open = (prev_ha_open + prev_ha_close) / 2.0
-        ha_high = max(rh, ha_open, ha_close)
-        ha_low = min(rl, ha_open, ha_close)
-        ha.append({
-            "ts": c["ts"],
-            "raw_open": ro, "raw_high": rh, "raw_low": rl, "raw_close": rc,
-            "ha_open": ha_open, "ha_high": ha_high, "ha_low": ha_low, "ha_close": ha_close
-        })
-        prev_ha_open, prev_ha_close = ha_open, ha_close
-    return ha
+# -------- FORWARD HEIKIN-ASHI --------
+def compute_ha_candle_forward(candle, prev_ha_open, prev_ha_close):
+    ro, rh, rl, rc = candle["open"], candle["high"], candle["low"], candle["close"]
+    ha_close = (ro + rh + rl + rc) / 4.0
+    ha_open = prev_ha_open if prev_ha_close is None else (prev_ha_open + prev_ha_close) / 2.0
+    ha_high = max(rh, ha_open, ha_close)
+    ha_low = min(rl, ha_open, ha_close)
+    return {
+        "ts": candle["ts"],
+        "raw_open": ro, "raw_high": rh, "raw_low": rl, "raw_close": rc,
+        "ha_open": ha_open, "ha_high": ha_high, "ha_low": ha_low, "ha_close": ha_close
+    }, ha_open, ha_close
 
 # -------- SIGNAL --------
 def evaluate_signal(last):
@@ -112,41 +99,37 @@ def backtest(balance=100):
     logger.info("⚠️ Use this time to cross-check HA open in TradingView!")
 
     trades = []
-    state_ha_open = INITIAL_HA_OPEN
-    pos = {"Buy": None, "Sell": None}  # track one trade per side
+    prev_ha_open = INITIAL_HA_OPEN
+    prev_ha_close = None
+    pos = {"Buy": None, "Sell": None}
 
-    for i in range(1, len(raw)):
-        ha_list = compute_heikin_ashi(raw[:i+1], persisted_open=state_ha_open)
-        last = ha_list[-1]
-        next_ha_open = (last["ha_open"] + last["ha_close"]) / 2.0
-        state_ha_open = next_ha_open
+    for candle in raw:
+        ha_candle, prev_ha_open, prev_ha_close = compute_ha_candle_forward(candle, prev_ha_open, prev_ha_close)
+        timestamp_str = ts_to_str(ha_candle["ts"])
 
-        sig = evaluate_signal(last)
+        sig = evaluate_signal(ha_candle)
         if not sig:
             continue
 
-        entry = last["raw_close"]
-        sl = next_ha_open
+        entry = ha_candle["raw_close"]
+        sl = ha_candle["ha_open"]
         risk = abs(entry - sl)
         if risk <= 0:
             continue
         tp = entry + risk + 0.001*entry if sig=="Buy" else entry - (risk + 0.001*entry)
         sl, tp = round_price(sl), round_price(tp)
-
-        qty = compute_qty(entry, sl, balance)
-        final_qty = max(qty, MIN_NEW_ORDER_QTY)
+        qty = max(compute_qty(entry, sl, balance), MIN_NEW_ORDER_QTY)
 
         current_trade = pos[sig]
-        timestamp_str = ts_to_str(last["ts"])
 
         if not current_trade:
             # Open new trade
-            pos[sig] = {"side": sig, "entry": entry, "sl": sl, "tp": tp, "qty": final_qty, "open_time": last["ts"]}
+            pos[sig] = {"side": sig, "entry": entry, "sl": sl, "tp": tp, "qty": qty, "open_time": candle["ts"]}
             trades.append(pos[sig])
-            logger.info("[%s] New %s trade | Entry=%.6f | SL=%.6f | TP=%.6f | qty=%.2f | Balance=%.2f", 
-                        timestamp_str, sig, entry, sl, tp, final_qty, balance)
+            logger.info("[%s] New %s trade | Entry=%.6f | SL=%.6f | TP=%.6f | qty=%.2f | Balance=%.2f",
+                        timestamp_str, sig, entry, sl, tp, qty, balance)
         else:
-            # Update SL/TP if changed
+            # Update TP/SL if changed
             if current_trade["sl"] != sl or current_trade["tp"] != tp:
                 current_trade["sl"] = sl
                 current_trade["tp"] = tp
@@ -157,7 +140,7 @@ def backtest(balance=100):
         for side, t in pos.items():
             if not t:
                 continue
-            last_low, last_high = last["raw_low"], last["raw_high"]
+            last_low, last_high = ha_candle["raw_low"], ha_candle["raw_high"]
             pnl = 0
             hit = None
 
@@ -184,4 +167,4 @@ def backtest(balance=100):
     return trades
 
 if __name__ == "__main__":
-    backtest(balance=100)
+    backtest(balance=100)￼Enter
