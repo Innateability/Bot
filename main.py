@@ -167,4 +167,4 @@ def backtest(balance=100):
     return trades
 
 if __name__ == "__main__":
-    backtest(balance=100)￼Enter
+    backtest(balance=100)
