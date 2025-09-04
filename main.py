@@ -20,7 +20,7 @@ from typing import List, Optional
 SYMBOL = "TRXUSDT"
 INTERVAL = "60"         # 1h
 LIMIT = 200             # number of candles
-INITIAL_HA_OPEN = 0.3   # 🔴 put your HA open starting value here
+INITIAL_HA_OPEN = 0.34894   # 🔴 put your HA open starting value here
 TICK_SIZE = 0.00001
 QTY_STEP = 1
 LEVERAGE = 75
