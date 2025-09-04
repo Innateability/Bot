@@ -31,7 +31,7 @@ from pybit.unified_trading import HTTP
 # ---------------- CONFIG --------------
 SYMBOL = os.environ.get("SYMBOL", "TRXUSDT")
 TIMEFRAME = os.environ.get("TIMEFRAME", "60")  # minutes (string or int)
-INITIAL_HA_OPEN = float(os.environ.get("INITIAL_HA_OPEN", "0.33889"))
+INITIAL_HA_OPEN = float(os.environ.get("INITIAL_HA_OPEN", "0.33833"))
 TICK_SIZE = float(os.environ.get("TICK_SIZE", "0.00001"))
 QTY_STEP = float(os.environ.get("QTY_STEP", "1"))
 LEVERAGE = int(os.environ.get("LEVERAGE", "75"))
