@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 SYMBOL = "TRXUSDT"
 INTERVAL = "60"       # 1h
 LIMIT = 200
-INITIAL_HA_OPEN = 0.34957 # ⚠️ set manually from TradingView
+INITIAL_HA_OPEN = 0.34996 # ⚠️ set manually from TradingView
 ACCOUNT_BALANCE = 100
 TICK_SIZE = 0.00001
 LEVERAGE = 75
@@ -67,6 +67,24 @@ def compute_qty(entry, sl, balance):
         qty = (balance * FALLBACK_PERCENT * LEVERAGE) / entry
     return floor_to_step(qty, QTY_STEP)
 
+# -------- TRADE SIM --------
+class Trade:
+    def __init__(self, side, entry, sl, tp, qty):
+        self.side, self.entry, self.sl, self.tp, self.qty = side, entry, sl, tp, qty
+
+    def update(self, new_sl, new_tp):
+        old_sl, old_tp = self.sl, self.tp
+        improved = False
+        if self.side == "Buy":
+            if new_sl > self.sl: self.sl, improved = new_sl, True
+            if new_tp > self.tp: self.tp, improved = new_tp, True
+        else:
+            if new_sl < self.sl: self.sl, improved = new_sl, True
+            if new_tp < self.tp: self.tp, improved = new_tp, True
+        if improved:
+            logger.info("🔄 Update %s trade | Old SL=%.6f TP=%.6f -> New SL=%.6f TP=%.6f",
+                        self.side, old_sl, old_tp, self.sl, self.tp)
+
 # -------- MAIN BACKTEST --------
 def backtest(balance=ACCOUNT_BALANCE):
     raw = fetch_bybit_klines(SYMBOL, INTERVAL, LIMIT)
@@ -83,13 +101,41 @@ def backtest(balance=ACCOUNT_BALANCE):
         first["raw_open"], first["raw_high"], first["raw_low"], first["raw_close"],
         first["ha_high"], first["ha_low"], first["ha_close"])
 
-    for c in ha_candles:
+    trade = None
+
+    for i, c in enumerate(ha_candles):
+        ts = datetime.fromtimestamp(c["ts"]/1000, tz=timezone.utc)
         logger.info("Candle UTC %s | Raw O=%.5f H=%.5f L=%.5f C=%.5f | HA O=%.5f H=%.5f L=%.5f C=%.5f",
-            datetime.fromtimestamp(c["ts"]/1000, tz=timezone.utc),
-            c["raw_open"], c["raw_high"], c["raw_low"], c["raw_close"],
+            ts, c["raw_open"], c["raw_high"], c["raw_low"], c["raw_close"],
             c["ha_open"], c["ha_high"], c["ha_low"], c["ha_close"])
 
-    # (You can expand here with trade simulation like before)
+        if i == 0: continue  # skip first for signals (need prev candle for SL)
+
+        signal = evaluate_signal(c)
+
+        if trade is None and signal:
+            entry = c["ha_close"]
+            if signal == "Buy":
+                sl = ha_candles[i-1]["ha_low"]
+                tp = entry + (entry - sl) * 1.001
+            else:
+                sl = ha_candles[i-1]["ha_high"]
+                tp = entry - (sl - entry) * 1.001
+            qty = compute_qty(entry, sl, balance)
+            if qty >= MIN_NEW_ORDER_QTY:
+                trade = Trade(signal, entry, sl, tp, qty)
+                logger.info("📈 New %s trade | Entry=%.6f | SL=%.6f | TP=%.6f | qty=%.2f",
+                            signal, entry, sl, tp, qty)
+
+        elif trade:
+            if trade.side == "Buy":
+                new_sl = max(trade.sl, ha_candles[i-1]["ha_low"])
+                new_tp = max(trade.tp, c["ha_close"] + (c["ha_close"] - new_sl) * 1.001)
+            else:
+                new_sl = min(trade.sl, ha_candles[i-1]["ha_high"])
+                new_tp = min(trade.tp, c["ha_close"] - (new_sl - c["ha_close"]) * 1.001)
+            trade.update(new_sl, new_tp)
+
     logger.info("✅ Backtest finished")
 
 if __name__ == "__main__":
