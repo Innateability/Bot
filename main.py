@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 SYMBOL = "TRXUSDT"
 INTERVAL = "60"       # 1h
 LIMIT = 200
-INITIAL_HA_OPEN = 0.34957 # ⚠️ set manually from TradingView
+INITIAL_HA_OPEN = 0.34957  # ⚠️ set manually from TradingView
 ACCOUNT_BALANCE = 100
 TICK_SIZE = 0.00001
 LEVERAGE = 75
@@ -81,28 +81,39 @@ def backtest(balance=ACCOUNT_BALANCE):
 
     for c in ha_candles:
         ts = datetime.fromtimestamp(c["ts"]/1000, tz=timezone.utc)
+
+        # log every candle
+        logger.info("Candle UTC %s | Raw O=%.5f H=%.5f L=%.5f C=%.5f | "
+                    "HA O=%.5f H=%.5f L=%.5f C=%.5f",
+            ts, c["raw_open"], c["raw_high"], c["raw_low"], c["raw_close"],
+            c["ha_open"], c["ha_high"], c["ha_low"], c["ha_close"])
+
         signal = evaluate_signal(c)
 
         # --- If trade is open, check SL/TP ---
         if trade:
             if trade["type"] == "Buy":
                 if c["raw_low"] <= trade["sl"]:
-                    logger.info("❌ SL hit for Buy | Entry=%.5f SL=%.5f", trade["entry"], trade["sl"])
-                    trades.append({**trade, "exit": trade["sl"], "result": "loss"})
+                    logger.info("❌ SL hit for Buy at %s | Entry=%.5f SL=%.5f",
+                                ts, trade["entry"], trade["sl"])
+                    trades.append({**trade, "exit": trade["sl"], "exit_time": ts, "result": "loss"})
                     trade = None
                 elif c["raw_high"] >= trade["tp"]:
-                    logger.info("✅ TP hit for Buy | Entry=%.5f TP=%.5f", trade["entry"], trade["tp"])
-                    trades.append({**trade, "exit": trade["tp"], "result": "win"})
+                    logger.info("✅ TP hit for Buy at %s | Entry=%.5f TP=%.5f",
+                                ts, trade["entry"], trade["tp"])
+                    trades.append({**trade, "exit": trade["tp"], "exit_time": ts, "result": "win"})
                     trade = None
 
             elif trade["type"] == "Sell":
                 if c["raw_high"] >= trade["sl"]:
-                    logger.info("❌ SL hit for Sell | Entry=%.5f SL=%.5f", trade["entry"], trade["sl"])
-                    trades.append({**trade, "exit": trade["sl"], "result": "loss"})
+                    logger.info("❌ SL hit for Sell at %s | Entry=%.5f SL=%.5f",
+                                ts, trade["entry"], trade["sl"])
+                    trades.append({**trade, "exit": trade["sl"], "exit_time": ts, "result": "loss"})
                     trade = None
                 elif c["raw_low"] <= trade["tp"]:
-                    logger.info("✅ TP hit for Sell | Entry=%.5f TP=%.5f", trade["entry"], trade["tp"])
-                    trades.append({**trade, "exit": trade["tp"], "result": "win"})
+                    logger.info("✅ TP hit for Sell at %s | Entry=%.5f TP=%.5f",
+                                ts, trade["entry"], trade["tp"])
+                    trades.append({**trade, "exit": trade["tp"], "exit_time": ts, "result": "win"})
                     trade = None
 
         # --- Open new trade if signal ---
@@ -116,9 +127,10 @@ def backtest(balance=ACCOUNT_BALANCE):
                 tp = entry - (sl - entry) * RR
             qty = compute_qty(entry, sl, balance)
             if qty >= MIN_NEW_ORDER_QTY:
-                trade = {"type": signal, "entry": entry, "sl": sl, "tp": tp, "qty": qty, "time": ts}
-                logger.info("📈 New %s trade | Entry=%.5f SL=%.5f TP=%.5f | qty=%.2f",
-                            signal, entry, sl, tp, qty)
+                trade = {"type": signal, "entry": entry, "sl": sl, "tp": tp,
+                         "qty": qty, "time": ts}
+                logger.info("📈 New %s trade at %s | Entry=%.5f SL=%.5f TP=%.5f | qty=%.2f",
+                            signal, ts, entry, sl, tp, qty)
 
     # --- Summary ---
     wins = sum(1 for t in trades if t["result"] == "win")
@@ -127,3 +139,4 @@ def backtest(balance=ACCOUNT_BALANCE):
 
 if __name__ == "__main__":
     backtest()
+    
