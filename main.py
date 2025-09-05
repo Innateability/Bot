@@ -8,7 +8,7 @@ PAIR = "TRXUSDT"
 INTERVAL = "1h"
 INITIAL_HA_OPEN = 0.34957  # <-- Set this manually from TradingView
 RISK_PER_TRADE = 0.1
-ACCOUNT_BALANCE = 1000  # example
+ACCOUNT_BALANCE = 100  # example
 
 # -----------------------
 # Logging setup
@@ -114,5 +114,5 @@ if __name__ == "__main__":
                 datetime.fromtimestamp(raw_candles[0]["ts"]/1000, timezone.utc))
 
     ha_candles = ha_convert(raw_candles, INITIAL_HA_OPEN)
-    process_candles(ha_candles)test(balance=100)
+    process_candles(ha_candles)
     
