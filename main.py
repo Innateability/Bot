@@ -1,175 +1,118 @@
-#!/usr/bin/env python3
-"""
-Backtester for Heikin-Ashi Strategy (Bybit USDT Perp)
-"""
-
-import requests
-import math
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
-# -------- CONFIG --------
-SYMBOL = "TRXUSDT"
-INTERVAL = "60"       # 1h
-LIMIT = 200           # number of candles to fetch
-INITIAL_HA_OPEN = 0.34957 # <-- set manually from TradingView
-TICK_SIZE = 0.00001
-LEVERAGE = 75
-RISK_PERCENT = 0.10
-FALLBACK_PERCENT = 0.90
-QTY_STEP = 1
-MIN_NEW_ORDER_QTY = 16
+# -----------------------
+# Config
+# -----------------------
+PAIR = "TRXUSDT"
+INTERVAL = "1h"
+INITIAL_HA_OPEN = 0.34957  # <-- Set this manually from TradingView
+RISK_PER_TRADE = 0.1
+ACCOUNT_BALANCE = 1000  # example
 
-# -------- LOGGING --------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-logger = logging.getLogger("backtest")
+# -----------------------
+# Logging setup
+# -----------------------
+logging.basicConfig(
+    format="%(asctime)s | %(message)s",
+    level=logging.INFO,
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger()
 
-# -------- HELPERS --------
-def floor_to_step(x, step):
-    if step <= 0:
-        return x
-    return math.floor(x / step) * step
+# -----------------------
+# Heikin Ashi conversion
+# -----------------------
+def ha_convert(candles, initial_ha_open):
+    ha_candles = []
+    ha_open = initial_ha_open
 
-def round_price(p, tick=TICK_SIZE):
-    ticks = round(p / tick)
-    return round(ticks * tick, 8)
-
-# -------- DATA FETCH --------
-def fetch_bybit_klines(symbol, interval, limit=200):
-    url = "https://api.bybit.com/v5/market/kline"
-    params = {"category": "linear", "symbol": symbol, "interval": interval, "limit": limit}
-    r = requests.get(url, params=params)
-    r.raise_for_status()
-    data = r.json()
-    rows = data["result"]["list"]
-    candles = []
-    for r in rows:
-        candles.append({
-            "ts": int(r[0]),
-            "open": float(r[1]),
-            "high": float(r[2]),
-            "low": float(r[3]),
-            "close": float(r[4])
-        })
-    candles.sort(key=lambda x: x["ts"])
-    return candles
-
-# -------- HEIKIN-ASHI --------
-def compute_heikin_ashi(raw_candles, persisted_open=None):
-    ha = []
-    prev_ha_open = None
-    prev_ha_close = None
-    n = len(raw_candles)
-    for i, c in enumerate(raw_candles):
-        ro, rh, rl, rc = c["open"], c["high"], c["low"], c["close"]
-        ha_close = (ro + rh + rl + rc) / 4.0
-        if i == n - 1:
-            ha_open = float(persisted_open) if persisted_open is not None else INITIAL_HA_OPEN
+    for i, c in enumerate(candles):
+        ha_close = (c["raw_open"] + c["raw_high"] + c["raw_low"] + c["raw_close"]) / 4
+        if i == 0:
+            ha_open = initial_ha_open
         else:
-            if prev_ha_open is None:
-                ha_open = (ro + rc) / 2.0
-            else:
-                ha_open = (prev_ha_open + prev_ha_close) / 2.0
-        ha_high = max(rh, ha_open, ha_close)
-        ha_low = min(rl, ha_open, ha_close)
-        ha.append({
-            "ts": c["ts"],
-            "raw_open": ro, "raw_high": rh, "raw_low": rl, "raw_close": rc,
-            "ha_open": ha_open, "ha_high": ha_high, "ha_low": ha_low, "ha_close": ha_close
-        })
-        prev_ha_open, prev_ha_close = ha_open, ha_close
-    return ha
+            ha_open = (ha_open + ha_candles[-1]["ha_close"]) / 2
+        ha_high = max(c["raw_high"], ha_open, ha_close)
+        ha_low = min(c["raw_low"], ha_open, ha_close)
 
-# -------- SIGNAL --------
-def evaluate_signal(last):
-    green = last["ha_close"] > last["ha_open"]
-    red = last["ha_close"] < last["ha_open"]
-    if green and abs(last["ha_low"] - last["ha_open"]) <= TICK_SIZE:
-        return "Buy"
-    if red and abs(last["ha_high"] - last["ha_open"]) <= TICK_SIZE:
-        return "Sell"
+        ha_candle = {
+            "ts": c["ts"],
+            "raw_open": c["raw_open"],
+            "raw_high": c["raw_high"],
+            "raw_low": c["raw_low"],
+            "raw_close": c["raw_close"],
+            "ha_open": ha_open,
+            "ha_high": ha_high,
+            "ha_low": ha_low,
+            "ha_close": ha_close
+        }
+        ha_candles.append(ha_candle)
+
+    return ha_candles
+
+# -----------------------
+# Signal detection (dummy example)
+# -----------------------
+def detect_signal(candle):
+    # Example rule: buy if HA close > HA open, sell if HA close < HA open
+    if candle["ha_close"] > candle["ha_open"]:
+        return {
+            "action": "new",
+            "side": "Buy",
+            "entry": candle["raw_close"],
+            "sl": candle["ha_low"],
+            "tp": candle["raw_close"] + (candle["raw_close"] - candle["ha_low"]),
+            "qty": (ACCOUNT_BALANCE * RISK_PER_TRADE) / candle["raw_close"]
+        }
+    elif candle["ha_close"] < candle["ha_open"]:
+        return {
+            "action": "new",
+            "side": "Sell",
+            "entry": candle["raw_close"],
+            "sl": candle["ha_high"],
+            "tp": candle["raw_close"] - (candle["ha_high"] - candle["raw_close"]),
+            "qty": (ACCOUNT_BALANCE * RISK_PER_TRADE) / candle["raw_close"]
+        }
     return None
 
-# -------- QTY --------
-def compute_qty(entry, sl, balance):
-    risk_usd = balance * RISK_PERCENT
-    per_contract_risk = abs(entry - sl)
-    if per_contract_risk <= 0:
-        return 0.0
-    qty = risk_usd / per_contract_risk
-    est_margin = (qty * entry) / LEVERAGE
-    if est_margin > balance:
-        qty = (balance * FALLBACK_PERCENT * LEVERAGE) / entry
-    return floor_to_step(qty, QTY_STEP)
+# -----------------------
+# Candle processing
+# -----------------------
+def process_candles(candles):
+    candles.sort(key=lambda x: x["ts"])  # ensure chronological
 
-# -------- BACKTEST --------
-def backtest(balance=100):
-    raw = fetch_bybit_klines(SYMBOL, INTERVAL, LIMIT)
-    logger.info("Fetched %d candles. First candle UTC = %s", len(raw), datetime.utcfromtimestamp(raw[0]['ts']/1000))
-    logger.info("⚠️ Use this time to set INITIAL_HA_OPEN from TradingView.")
+    for c in candles:
+        # 1. Log candle
+        logger.info(
+            "Candle UTC %s | Raw O=%.5f H=%.5f L=%.5f C=%.5f | HA O=%.5f H=%.5f L=%.5f C=%.5f",
+            datetime.fromtimestamp(c["ts"]/1000, timezone.utc),
+            c["raw_open"], c["raw_high"], c["raw_low"], c["raw_close"],
+            c["ha_open"], c["ha_high"], c["ha_low"], c["ha_close"]
+        )
 
-    trades = []
-    state_ha_open = INITIAL_HA_OPEN
-    pos = None
+        # 2. Trade logic after candle
+        signal = detect_signal(c)
+        if signal:
+            if signal["action"] == "new":
+                logger.info("📈 New %s trade | Entry=%.6f | SL=%.6f | TP=%.6f | qty=%.2f",
+                            signal["side"], signal["entry"],
+                            signal["sl"], signal["tp"], signal["qty"])
 
-    for i in range(1, len(raw)):
-        ha_list = compute_heikin_ashi(raw[:i+1], persisted_open=state_ha_open)
-        last = ha_list[-1]
-        prev = ha_list[-2]
-
-        # update persisted ha_open for next round
-        next_ha_open = (last["ha_open"] + last["ha_close"]) / 2.0
-        state_ha_open = next_ha_open
-
-        logger.info("Candle UTC %s | Raw O=%.5f H=%.5f L=%.5f C=%.5f | HA O=%.5f H=%.5f L=%.5f C=%.5f",
-                    datetime.utcfromtimestamp(last["ts"]/1000), last["raw_open"], last["raw_high"], last["raw_low"], last["raw_close"],
-                    last["ha_open"], last["ha_high"], last["ha_low"], last["ha_close"])
-
-        sig = evaluate_signal(last)
-        if not sig:
-            continue
-
-        entry = last["raw_close"]
-        sl = prev["ha_open"]  # SL from previous candle
-        risk = abs(entry - sl)
-        if risk <= 0:
-            continue
-
-        # TP = 1:1 RR + 0.1% of entry
-        if sig == "Buy":
-            tp = entry + risk + (0.001 * entry)
-        else:
-            tp = entry - (risk + (0.001 * entry))
-        sl, tp = round_price(sl), round_price(tp)
-
-        qty = compute_qty(entry, sl, balance)
-
-        if not pos:
-            # --- new trade ---
-            final_qty = max(qty, MIN_NEW_ORDER_QTY)
-            pos = {"side": sig, "entry": entry, "sl": sl, "tp": tp, "qty": final_qty, "open_time": last["ts"]}
-            trades.append(pos)
-            logger.info("📈 New %s trade | Entry=%.6f | SL=%.6f | TP=%.6f | qty=%.2f",
-                        sig, entry, sl, tp, final_qty)
-        else:
-            # --- trade already open, maybe update TP/SL ---
-            old_sl, old_tp = pos["sl"], pos["tp"]
-
-            if sig == "Buy":
-                better_sl = max(sl, old_sl)   # higher SL = less loss
-                better_tp = max(tp, old_tp)   # higher TP = more profit
-            else:
-                better_sl = min(sl, old_sl)   # lower SL = less loss
-                better_tp = min(tp, old_tp)   # lower TP = more profit
-
-            if better_sl != old_sl or better_tp != old_tp:
-                logger.info("🔄 Update %s trade | Old SL=%.6f TP=%.6f -> New SL=%.6f TP=%.6f",
-                            sig, old_sl, old_tp, better_sl, better_tp)
-                pos["sl"], pos["tp"] = better_sl, better_tp
-
-    logger.info("✅ Backtest finished. Total trades opened = %d", len(trades))
-    return trades
-
+# -----------------------
+# Example run
+# -----------------------
 if __name__ == "__main__":
-    backtest(balance=100)
+    # Example raw candles (replace with Bybit fetch later)
+    raw_candles = [
+        {"ts": 1693142400000, "raw_open": 0.35055, "raw_high": 0.35058, "raw_low": 0.34911, "raw_close": 0.34997},
+        {"ts": 1693146000000, "raw_open": 0.34997, "raw_high": 0.35020, "raw_low": 0.34880, "raw_close": 0.34950},
+        {"ts": 1693149600000, "raw_open": 0.34950, "raw_high": 0.35000, "raw_low": 0.34850, "raw_close": 0.34890},
+    ]
+
+    logger.info("⚠️ Use this first candle UTC to set INITIAL_HA_OPEN from TradingView: %s",
+                datetime.fromtimestamp(raw_candles[0]["ts"]/1000, timezone.utc))
+
+    ha_candles = ha_convert(raw_candles, INITIAL_HA_OPEN)
+    process_candles(ha_candles)test(balance=100)
     
