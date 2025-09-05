@@ -25,7 +25,7 @@ except Exception:
 # ---------------- CONFIG ----------------
 SYMBOL = os.environ.get("SYMBOL", "TRXUSDT")
 TIMEFRAME = os.environ.get("TIMEFRAME", "60")   # minutes string as bybit expects e.g. "60"
-INITIAL_HA_OPEN = float(os.environ.get("INITIAL_HA_OPEN", "0.3358"))
+INITIAL_HA_OPEN = float(os.environ.get("INITIAL_HA_OPEN", "0.3365"))
 TICK_SIZE = float(os.environ.get("TICK_SIZE", "0.00001"))
 QTY_STEP = float(os.environ.get("QTY_STEP", "1"))
 LEVERAGE = int(os.environ.get("LEVERAGE", "75"))
