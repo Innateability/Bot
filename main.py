@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
 Live Heikin-Ashi Bot for Bybit USDT Perpetual (One-Way Mode)
-- LIVE mode (set env LIVE=1 and BYBIT_API_KEY/BYBIT_API_SECRET) will attempt to place orders on testnet/mainnet (TESTNET env).
-- Default INITIAL_HA_OPEN can be overridden with env INITIAL_HA_OPEN.
-- Persists state to STATE_FILE containing last_ha_open, baseline_balance, open_position.
-- NOTE: siphoning/transfer logic intentionally omitted per request.
+
+- Edit INITIAL_HA_OPEN here or set environment variable INITIAL_HA_OPEN.
+- Set LIVE=1 and BYBIT_API_KEY/BYBIT_API_SECRET to place orders (testnet/mainnet via BYBIT_TESTNET).
+- Persists state to STATE_FILE (last_ha_open, baseline_balance, open_position).
+- Updates TP/SL hourly if it reduces risk or increases reward (even without a new signal).
+- No siphoning/transfer logic.
 """
 
 import os
@@ -16,7 +18,7 @@ from datetime import datetime, timezone
 
 import requests
 
-# optional pybit; required only for LIVE=1
+# optional: required only for LIVE=1
 try:
     from pybit.unified_trading import HTTP as BybitHTTP
 except Exception:
@@ -24,8 +26,8 @@ except Exception:
 
 # ---------------- CONFIG ----------------
 SYMBOL = os.environ.get("SYMBOL", "TRXUSDT")
-TIMEFRAME = os.environ.get("TIMEFRAME", "60")   # minutes string as bybit expects e.g. "60"
-INITIAL_HA_OPEN = float(os.environ.get("INITIAL_HA_OPEN", "0.3365"))
+TIMEFRAME = os.environ.get("TIMEFRAME", "60")   # minutes string (e.g. "60")
+INITIAL_HA_OPEN = float(os.environ.get("INITIAL_HA_OPEN", "0.33663"))  # change here or via env
 TICK_SIZE = float(os.environ.get("TICK_SIZE", "0.00001"))
 QTY_STEP = float(os.environ.get("QTY_STEP", "1"))
 LEVERAGE = int(os.environ.get("LEVERAGE", "75"))
@@ -39,8 +41,7 @@ API_KEY = os.environ.get("BYBIT_API_KEY", "")
 API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
 TESTNET = os.environ.get("BYBIT_TESTNET", "true").lower() in ("1", "true", "yes")
 
-# default simulated balance if not persisted / in simulation mode
-START_BALANCE = float(os.environ.get("START_BALANCE", "10.0"))
+START_BALANCE = float(os.environ.get("START_BALANCE", "10.0"))  # fallback simulation balance
 
 # ---------------- LOG ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
@@ -50,7 +51,7 @@ logger = logging.getLogger("ha_live_bot")
 session = None
 if LIVE:
     if BybitHTTP is None:
-        raise RuntimeError("pybit required for LIVE mode. Install pybit or set LIVE=0.")
+        raise RuntimeError("pybit is required for LIVE mode. Install pybit or set LIVE=0.")
     session = BybitHTTP(testnet=TESTNET, api_key=API_KEY, api_secret=API_SECRET)
 
 # ---------------- STATE ----------------
@@ -107,6 +108,11 @@ def fetch_candles_bybit(symbol: str, interval: str = TIMEFRAME, limit: int = 200
 
 # ---------------- HEIKIN-ASHI ----------------
 def compute_heikin_ashi(raw_candles, persisted_open=None):
+    """
+    raw_candles: list oldest->newest
+    persisted_open: used as HA-open for the LAST (most-recent closed) candle
+    Returns list of HA candles (oldest->newest)
+    """
     ha = []
     prev_ha_open = None
     prev_ha_close = None
@@ -114,7 +120,6 @@ def compute_heikin_ashi(raw_candles, persisted_open=None):
     for i, c in enumerate(raw_candles):
         ro, rh, rl, rc = c["open"], c["high"], c["low"], c["close"]
         ha_close = (ro + rh + rl + rc) / 4.0
-        # apply persisted_open only to the LAST candle (most recent closed)
         if i == n - 1 and persisted_open is not None:
             ha_open = float(persisted_open)
         else:
@@ -144,7 +149,7 @@ def evaluate_signal_from_ha(ha_candle):
 
 # ---------------- BALANCE PARSING (LIVE) ----------------
 def get_balance_usdt():
-    """Try to robustly parse wallet balance for USDT using unified API shapes."""
+    """Robustly parse unified wallet balance shapes for USDT."""
     if not LIVE:
         raise RuntimeError("get_balance_usdt called in non-LIVE mode")
     try:
@@ -152,10 +157,8 @@ def get_balance_usdt():
     except Exception as e:
         logger.exception("get_wallet_balance error: %s", e)
         raise
-
     res = out.get("result", {}) or out
-
-    # Case: result -> list -> items with 'coin' possibly a list
+    # Case A: list form
     if isinstance(res, dict) and "list" in res and isinstance(res["list"], list):
         for item in res["list"]:
             coins = item.get("coin")
@@ -167,26 +170,25 @@ def get_balance_usdt():
                                 try:
                                     return float(c[key])
                                 except Exception:
-                                    continue
+                                    pass
                         for k, v in c.items():
                             try:
                                 return float(v)
                             except Exception:
-                                continue
+                                pass
             if isinstance(item.get("coin"), str) and item.get("coin") == "USDT":
                 for key in ("availableToWithdraw", "availableBalance", "walletBalance", "usdValue", "equity"):
                     if key in item and item[key] not in (None, "", " "):
                         try:
                             return float(item[key])
                         except Exception:
-                            continue
+                            pass
                 for k, v in item.items():
                     try:
                         return float(v)
                     except Exception:
-                        continue
-
-    # Case: result -> {'USDT': {...}}
+                        pass
+    # Case B: dict keyed by coin
     try:
         if isinstance(res, dict) and "USDT" in res:
             u = res["USDT"]
@@ -206,10 +208,9 @@ def get_balance_usdt():
                 try:
                     return float(v)
                 except Exception:
-                    continue
+                    pass
     except Exception:
         pass
-
     logger.error("Unable to parse wallet balance response: %s", out)
     raise RuntimeError("Unable to parse wallet balance response")
 
@@ -230,7 +231,7 @@ def ensure_one_way(symbol):
     if not LIVE:
         return
     try:
-        session.switch_position_mode(category="linear", symbol=symbol, mode=0)
+        session.switch_position_mode(category="linear", symbol=symbol, mode=0)  # 0 = one-way
         logger.info("Ensured one-way mode for %s", symbol)
     except Exception as e:
         logger.debug("switch_position_mode failed: %s", e)
@@ -332,7 +333,7 @@ def run_once():
     first = ha_list[0]
     logger.info("Fetched %d closed candles. First candle UTC = %s",
                 len(ha_list), datetime.fromtimestamp(first["ts"]/1000, tz=timezone.utc).isoformat())
-    logger.info("⚠️ Use the first candle above to set INITIAL_HA_OPEN in TradingView.")
+    logger.info("⚠️ Use this first candle to set INITIAL_HA_OPEN in TradingView.")
     logger.info("FIRST Candle RAW O=%.8f H=%.8f L=%.8f C=%.8f | HA H=%.8f L=%.8f C=%.8f",
                 first["raw_open"], first["raw_high"], first["raw_low"], first["raw_close"],
                 first["ha_high"], first["ha_low"], first["ha_close"])
@@ -346,7 +347,7 @@ def run_once():
                 last["raw_open"], last["raw_high"], last["raw_low"], last["raw_close"],
                 last["ha_open"], last["ha_high"], last["ha_low"], last["ha_close"])
 
-    # compute and persist next HA open
+    # compute and persist next HA open (for next run)
     next_ha_open = (last["ha_open"] + last["ha_close"]) / 2.0
     state["last_ha_open"] = float(next_ha_open)
     save_state(state)
@@ -354,49 +355,34 @@ def run_once():
 
     # determine signal
     sig = evaluate_signal_from_ha(last)
+    # If no signal, we still do update-TP/SL checks below (per your request)
     if not sig:
-        logger.info("No signal on last closed candle.")
-        # still check whether an existing position was closed by last candle
-        if open_pos:
-            outcome = check_candle_hit_levels(open_pos, last)
-            if outcome == "tp":
-                logger.info("Existing position TP hit -> closing and crediting baseline.")
-                baseline_balance += abs(open_pos["entry"] - open_pos["sl"])
-                state["open_position"] = None
-                state["baseline_balance"] = baseline_balance
-                save_state(state)
-            elif outcome == "sl":
-                logger.info("Existing position SL hit -> closing and debiting baseline.")
-                baseline_balance -= abs(open_pos["entry"] - open_pos["sl"])
-                state["open_position"] = None
-                state["baseline_balance"] = baseline_balance
-                save_state(state)
-        return
+        logger.info("No new signal on last closed candle.")
+    else:
+        logger.info("Signal detected: %s", sig)
 
-    logger.info("Signal detected: %s", sig)
     entry = float(last["raw_close"])
 
     # choose SL base from previous candle's HA (if available) else from last
     if prev:
-        sl_base = prev["ha_low"] if sig == "Buy" else prev["ha_high"]
+        sl_base = prev["ha_low"] if (sig == "Buy") else prev["ha_high"]
     else:
-        sl_base = last["ha_low"] if sig == "Buy" else last["ha_high"]
+        sl_base = last["ha_low"] if (sig == "Buy") else last["ha_high"]
 
     # add one tick offset
     if sig == "Buy":
         sl = round_price(sl_base - TICK_SIZE)
         risk = entry - sl
         tp = round_price(entry + (risk + 0.001 * entry))
-    else:
+    elif sig == "Sell":
         sl = round_price(sl_base + TICK_SIZE)
         risk = sl - entry
         tp = round_price(entry - (risk + 0.001 * entry))
-
-    sl = round_price(sl)
-    tp = round_price(tp)
-
-    logger.info("Calculated levels -> Entry=%.8f | SL=%.8f | TP=%.8f | risk=%.8f",
-                entry, sl, tp, abs(risk))
+    else:
+        # no signal — still compute candidate update levels for existing position using prev HA
+        # If no open_pos, nothing to do; candidate levels are computed in the modification section below
+        sl = None
+        tp = None
 
     # get current balance (LIVE) or use persisted baseline
     if LIVE:
@@ -411,102 +397,131 @@ def run_once():
         bal = float(baseline_balance)
         logger.info("Simulation balance (baseline) = %.8f", bal)
 
-    qty = compute_qty(entry, sl, bal)
-    logger.info("Computed qty (before min enforcement) = %.8f", qty)
+    # compute qty only when opening new trades (or show candidate qty)
+    if sl is not None:
+        qty = compute_qty(entry, sl, bal)
+        logger.info("Computed qty (before min enforcement) = %.8f", qty)
+    else:
+        qty = None
 
     # enforce MIN for NEW trades only
     final_qty = qty
-    if final_qty < MIN_NEW_ORDER_QTY:
-        logger.info("Computed qty %.8f < min %.0f -> using min for NEW trade", final_qty, MIN_NEW_ORDER_QTY)
-        final_qty = MIN_NEW_ORDER_QTY
-    final_qty = floor_to_step(final_qty, QTY_STEP)
-    if final_qty <= 0:
-        logger.warning("Final qty <= 0 after step -> abort")
-        return
+    if final_qty is not None:
+        if final_qty < MIN_NEW_ORDER_QTY:
+            logger.info("Computed qty %.8f < min %.0f -> using min for NEW trade", final_qty, MIN_NEW_ORDER_QTY)
+            final_qty = MIN_NEW_ORDER_QTY
+        final_qty = floor_to_step(final_qty, QTY_STEP)
+        if final_qty <= 0:
+            logger.warning("Final qty <= 0 after step -> abort trade open")
+            final_qty = None
 
-    # handle existing open position
+    # HANDLE EXISTING OPEN POSITION
     if open_pos:
         logger.info("Existing open position: side=%s entry=%.8f sl=%.8f tp=%.8f qty=%.8f",
                     open_pos["side"], open_pos["entry"], open_pos["sl"], open_pos["tp"], open_pos["qty"])
-        # check if last candle hit TP/SL
+
+        # Check if last candle hit TP/SL
         outcome = check_candle_hit_levels(open_pos, last)
         if outcome == "tp":
-            logger.info("Existing pos TP hit -> closing. Crediting baseline.")
+            logger.info("Existing position TP hit -> closing and crediting baseline.")
             baseline_balance += abs(open_pos["entry"] - open_pos["sl"])
             state["open_position"] = None
             state["baseline_balance"] = baseline_balance
             save_state(state)
             return
         if outcome == "sl":
-            logger.info("Existing pos SL hit -> closing. Debiting baseline.")
+            logger.info("Existing position SL hit -> closing and debiting baseline.")
             baseline_balance -= abs(open_pos["entry"] - open_pos["sl"])
             state["open_position"] = None
             state["baseline_balance"] = baseline_balance
             save_state(state)
             return
 
-        # if same side, consider update only if beneficial
-        if open_pos["side"] == sig:
-            old_sl = open_pos["sl"]
-            old_tp = open_pos["tp"]
-            old_risk = abs(open_pos["entry"] - old_sl)
-            new_risk = abs(open_pos["entry"] - sl)
-            old_reward = abs(old_tp - open_pos["entry"])
-            new_reward = abs(tp - open_pos["entry"])
-
-            logger.info("Considering modification for existing %s trade | Old SL=%.8f TP=%.8f -> Candidate SL=%.8f TP=%.8f",
-                        open_pos["side"], old_sl, old_tp, sl, tp)
-            if (new_risk < old_risk) or (new_reward > old_reward):
-                logger.info("🔄 Updating existing trade (beneficial). Old SL=%.8f TP=%.8f -> New SL=%.8f TP=%.8f",
-                            old_sl, old_tp, sl, tp)
-                if LIVE:
-                    try:
-                        set_trading_stop(SYMBOL, tp, sl)
-                        logger.info("API set_trading_stop called to update TP/SL")
-                    except Exception as e:
-                        logger.exception("API set_trading_stop failed: %s", e)
-                open_pos["sl"] = round_price(sl)
-                open_pos["tp"] = round_price(tp)
-                state["open_position"] = open_pos
-                save_state(state)
+        # Candidate update: compute new SL/TP using previous candle HA levels (with one tick offset)
+        # Use prev HA for updates; fallback to last HA if prev missing
+        if prev:
+            if open_pos["side"] == "Buy":
+                candidate_sl = round_price(prev["ha_low"] - TICK_SIZE)
+                candidate_rr = open_pos["entry"] - candidate_sl
+                candidate_tp = round_price(open_pos["entry"] + (candidate_rr + 0.001 * open_pos["entry"]))
             else:
-                logger.info("No beneficial update to SL/TP; skipping.")
+                candidate_sl = round_price(prev["ha_high"] + TICK_SIZE)
+                candidate_rr = candidate_sl - open_pos["entry"]
+                candidate_tp = round_price(open_pos["entry"] - (candidate_rr + 0.001 * open_pos["entry"]))
         else:
-            logger.info("Opposite-side signal but existing open position remains open per rules.")
+            # fallback: use last candle HA
+            if open_pos["side"] == "Buy":
+                candidate_sl = round_price(last["ha_low"] - TICK_SIZE)
+                candidate_rr = open_pos["entry"] - candidate_sl
+                candidate_tp = round_price(open_pos["entry"] + (candidate_rr + 0.001 * open_pos["entry"]))
+            else:
+                candidate_sl = round_price(last["ha_high"] + TICK_SIZE)
+                candidate_rr = candidate_sl - open_pos["entry"]
+                candidate_tp = round_price(open_pos["entry"] - (candidate_rr + 0.001 * open_pos["entry"]))
+
+        old_sl = open_pos["sl"]
+        old_tp = open_pos["tp"]
+        old_risk = abs(open_pos["entry"] - old_sl)
+        new_risk = abs(open_pos["entry"] - candidate_sl)
+        old_reward = abs(old_tp - open_pos["entry"])
+        new_reward = abs(candidate_tp - open_pos["entry"])
+
+        logger.info("Candidate update for open %s trade | Old SL=%.8f TP=%.8f -> Candidate SL=%.8f TP=%.8f",
+                    open_pos["side"], old_sl, old_tp, candidate_sl, candidate_tp)
+
+        # Update if reduces risk or increases reward
+        if (new_risk < old_risk) or (new_reward > old_reward):
+            logger.info("🔄 Updating existing trade (beneficial). Old SL=%.8f TP=%.8f -> New SL=%.8f TP=%.8f",
+                        old_sl, old_tp, candidate_sl, candidate_tp)
+            if LIVE:
+                try:
+                    set_trading_stop(SYMBOL, candidate_tp, candidate_sl)
+                    logger.info("API set_trading_stop called to update TP/SL")
+                except Exception as e:
+                    logger.exception("API set_trading_stop failed: %s", e)
+            open_pos["sl"] = round_price(candidate_sl)
+            open_pos["tp"] = round_price(candidate_tp)
+            state["open_position"] = open_pos
+            save_state(state)
+        else:
+            logger.info("No beneficial update to SL/TP; skipping.")
         return
 
-    # open new trade
-    logger.info("Opening NEW %s trade -> Entry=%.8f SL=%.8f TP=%.8f qty=%.8f", sig, entry, sl, tp, final_qty)
+    # NO open position -> open new trade if signal detected and final_qty computed
+    if sig and final_qty:
+        logger.info("Opening NEW %s trade -> Entry=%.8f SL=%.8f TP=%.8f qty=%.8f", sig, entry, sl, tp, final_qty)
+        if LIVE:
+            ensure_one_way(SYMBOL)
+            set_symbol_leverage(SYMBOL, LEVERAGE)
+            try:
+                resp = place_live_market_order(sig, SYMBOL, final_qty)
+                logger.info("Placed live market order: %s", resp)
+            except Exception as e:
+                logger.exception("Live market order failed: %s", e)
+                return
 
-    if LIVE:
-        ensure_one_way(SYMBOL)
-        set_symbol_leverage(SYMBOL, LEVERAGE)
-        try:
-            resp = place_live_market_order(sig, SYMBOL, final_qty)
-            logger.info("Placed live market order resp: %s", resp)
-        except Exception as e:
-            logger.exception("Live market order failed: %s", e)
-            return
-        try:
-            resp2 = set_trading_stop(SYMBOL, tp, sl)
-            logger.info("Attached TP/SL via API: %s", resp2)
-        except Exception as e:
-            logger.exception("set_trading_stop failed: %s", e)
-    else:
-        logger.info("SIMULATED order placed (LIVE=0)")
+            # attach TP/SL using API
+            try:
+                resp2 = set_trading_stop(SYMBOL, tp, sl)
+                logger.info("Attached TP/SL via API: %s", resp2)
+            except Exception as e:
+                logger.exception("set_trading_stop failed: %s", e)
+        else:
+            logger.info("SIMULATED order placed (LIVE=0)")
 
-    open_rec = {
-        "side": sig,
-        "entry": entry,
-        "sl": round_price(sl),
-        "tp": round_price(tp),
-        "qty": final_qty,
-        "open_time": last["ts"]
-    }
-    state["open_position"] = open_rec
-    state["baseline_balance"] = baseline_balance
-    save_state(state)
-    logger.info("Recorded open position in state (simulated/live).")
+        # Persist open position (note: for real live, you'd want to fetch actual filled qty/entry from API)
+        open_rec = {
+            "side": sig,
+            "entry": entry,
+            "sl": round_price(sl),
+            "tp": round_price(tp),
+            "qty": final_qty,
+            "open_time": last["ts"]
+        }
+        state["open_position"] = open_rec
+        state["baseline_balance"] = baseline_balance
+        save_state(state)
+        logger.info("Recorded open position in state (simulated persistence).")
 
 # ---------------- SCHEDULER ----------------
 def wait_until_next_hour():
@@ -515,15 +530,20 @@ def wait_until_next_hour():
     to_wait = 3600 - seconds
     if to_wait <= 0:
         to_wait = 1
-    logger.info("Sleeping %d seconds until next top-of-hour (UTC). Now=%s", to_wait,
-                now.strftime("%Y-%m-%d %H:%M:%S"))
+    logger.info("Sleeping %d seconds until next top-of-hour (UTC). Now=%s",
+                to_wait, now.strftime("%Y-%m-%d %H:%M:%S"))
     time.sleep(to_wait)
 
 # ---------------- ENTRY POINT ----------------
 if __name__ == "__main__":
-    logger.info("Starting HA live bot. LIVE=%s TESTNET=%s SYMBOL=%s", LIVE, TESTNET, SYMBOL)
-    logger.info("INITIAL_HA_OPEN default = %.8f (overridden by persisted last_ha_open if present)", INITIAL_HA_OPEN)
+    logger.info("Starting live HA bot. LIVE=%s TESTNET=%s SYMBOL=%s",
+                LIVE, TESTNET, SYMBOL)
+    logger.info("INITIAL_HA_OPEN default = %.8f "
+                "(will be overwritten by persisted last_ha_open if present)",
+                INITIAL_HA_OPEN)
     logger.info("Minimum new-order qty = %.0f", MIN_NEW_ORDER_QTY)
+    # Initial alignment: wait until top-of-hour so initial persisted / INITIAL_HA_OPEN
+    # used for first closed candle
     logger.info("Initial alignment: sleeping until next top-of-hour before first run")
     wait_until_next_hour()
     while True:
