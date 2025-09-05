@@ -32,7 +32,7 @@ except Exception:
 # ---------------- CONFIG ----------------
 SYMBOL = os.environ.get("SYMBOL", "TRXUSDT")
 TIMEFRAME = os.environ.get("TIMEFRAME", "60")   # minutes (string because API expects "60")
-INITIAL_HA_OPEN = float(os.environ.get("INITIAL_HA_OPEN", "0.34957"))  # default per your request
+INITIAL_HA_OPEN = float(os.environ.get("INITIAL_HA_OPEN", "0.33533"))  # default per your request
 TICK_SIZE = float(os.environ.get("TICK_SIZE", "0.00001"))
 QTY_STEP = float(os.environ.get("QTY_STEP", "1"))
 LEVERAGE = int(os.environ.get("LEVERAGE", "75"))
