@@ -12,7 +12,7 @@ from datetime import datetime
 SYMBOL = "TRXUSDT"
 INTERVAL = "60"       # 1h
 LIMIT = 200           # number of candles to fetch
-INITIAL_HA_OPEN = 0.3 # <-- set manually from TradingView
+INITIAL_HA_OPEN = 0.34957 # <-- set manually from TradingView
 TICK_SIZE = 0.00001
 LEVERAGE = 75
 RISK_PERCENT = 0.10
