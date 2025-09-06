@@ -59,7 +59,7 @@ LEVERAGE = int(os.getenv("LEVERAGE", "75"))
 MIN_QTY = int(os.getenv("MIN_QTY", "16"))
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.10"))       # 10% risk
 FALLBACK_USAGE = float(os.getenv("FALLBACK_USAGE", "0.90"))  # 90% fallback
-PIP_SIZE = float(os.getenv("PIP_SIZE", "0.00001"))
+PIP_SIZE = float(os.getenv("PIP_SIZE", "0.0001"))
 RR = float(os.getenv("RR", "1.0"))
 EXTRA_TP_PERCENT = float(os.getenv("EXTRA_TP_PERCENT", "0.001"))  # 0.1% extra
 
