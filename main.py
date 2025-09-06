@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 bybit_ha_bot_verbose_fixed.py
@@ -44,7 +45,7 @@ START_BALANCE = Decimal(os.getenv("START_BALANCE", "2"))  # user requested start
 SIPHON_RATIO = Decimal(os.getenv("SIPHON_RATIO", "0.25"))
 FUND_ACCOUNT_TYPE = os.getenv("FUND_ACCOUNT_TYPE", "FUND")
 
-INITIAL_HA_OPEN = Decimal(os.getenv("INITIAL_HA_OPEN", "0.33097"))
+INITIAL_HA_OPEN = Decimal(os.getenv("INITIAL_HA_OPEN", "0.33143"))
 
 # Persistence files
 LOG_FILE = Path("bybit_ha_bot.log")
