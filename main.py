@@ -1,29 +1,17 @@
 #!/usr/bin/env python3
 """
-bybit_ha_bot_verbose.py
+bybit_ha_bot_verbose_fixed.py
 
-Verbose, full-featured Bybit hourly Heikin-Ashi trading bot (ONE-WAY mode).
-Implements:
-- Initial HA open hard-coded to 0.33143 on first run (persisted).
-- Siphon baseline starting at $2. Before each trade, if unified_balance >= 2 * baseline,
-  siphon 25% of unified balance to FUND account and set baseline = remaining.
-- Entry = raw close of most recent fully closed 1H candle.
-- Heikin Ashi computed using persisted HA open to remain consistent with TradingView.
-- Buy if HA_close > HA_open and HA_open ≈ HA_low.
-- Sell if HA_close < HA_open and HA_open ≈ HA_high.
-- SL from HA (buy: HA_low - pip ; sell: HA_high + pip) with pip = 0.0001.
-- TP = 1:1 risk reward + 0.1% of entry.
-- Attach TP & SL to market order at creation if supported, otherwise place market then attach with trading-stop.
-- Update TP or SL if new signal improves one without worsening the other.
-- One-way mode: close opposite position (reduce-only) before opening new position.
-- Sizing: 10% risk of unified USDT balance; fallback 90% affordability; min qty = 16.
-- Extensive logging to stdout and bybit_ha_bot.log.
+Verbose Bybit hourly Heikin-Ashi trading bot — FIXED for:
+- No Decimal + NoneType arithmetic errors.
+- Proper initial HA open initialization (INITIAL_HA_OPEN used on first run).
+- Robust TP/SL update via /v5/position/trading-stop with logging.
+- Siphoning baseline behavior unchanged (start $2, siphon 25% when balance doubles, baseline set to remaining).
 """
 
 import os
 import time
 import json
-import math
 import hmac
 import hashlib
 import requests
@@ -33,59 +21,50 @@ from pathlib import Path
 from typing import Optional, Tuple, Dict, Any
 
 # ---------- CONFIG ----------
-getcontext().prec = 12  # decimal precision
+getcontext().prec = 12
 
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "")
 
-# Set to True to use testnet (use testnet keys); otherwise mainnet
 USE_TESTNET = os.getenv("USE_TESTNET", "False").lower() in ("1", "true", "yes")
 BASE_URL = "https://api-testnet.bybit.com" if USE_TESTNET else "https://api.bybit.com"
 
 SYMBOL = os.getenv("SYMBOL", "TRXUSDT")
-CATEGORY = "linear"  # linear perpetual
-
+CATEGORY = "linear"
 LEVERAGE = int(os.getenv("LEVERAGE", "75"))
 
 MIN_QTY = int(os.getenv("MIN_QTY", "16"))
-RISK_PERCENT = Decimal(os.getenv("RISK_PERCENT", "0.10"))     # 10% risk
-FALLBACK_USAGE = Decimal(os.getenv("FALLBACK_USAGE", "0.90")) # 90% fallback
-PIP = Decimal(os.getenv("PIP", "0.0001"))                     # 1 pip adjustment
-TP_BUFFER_PCT = Decimal(os.getenv("TP_BUFFER_PCT", "0.001"))  # 0.1% buffer
-RR = Decimal("1")                                             # 1:1 RR
+RISK_PERCENT = Decimal(os.getenv("RISK_PERCENT", "0.10"))
+FALLBACK_USAGE = Decimal(os.getenv("FALLBACK_USAGE", "0.90"))
+PIP = Decimal(os.getenv("PIP", "0.0001"))
+TP_BUFFER_PCT = Decimal(os.getenv("TP_BUFFER_PCT", "0.001"))  # 0.1%
+RR = Decimal("1")
 
-# Siphon settings requested by you:
-START_BALANCE = Decimal(os.getenv("START_BALANCE", "2"))      # initial baseline $2
-SIPHON_RATIO = Decimal(os.getenv("SIPHON_RATIO", "0.25"))     # siphon 25% of balance when triggered
-FUND_ACCOUNT_TYPE = os.getenv("FUND_ACCOUNT_TYPE", "FUND")    # destination account type for transfer
+START_BALANCE = Decimal(os.getenv("START_BALANCE", "2"))  # user requested start $2
+SIPHON_RATIO = Decimal(os.getenv("SIPHON_RATIO", "0.25"))
+FUND_ACCOUNT_TYPE = os.getenv("FUND_ACCOUNT_TYPE", "FUND")
 
-# Initial HA open requested:
-INITIAL_HA_OPEN = Decimal(os.getenv("INITIAL_HA_OPEN", "0.33123"))
+INITIAL_HA_OPEN = Decimal(os.getenv("INITIAL_HA_OPEN", "0.33097"))
 
 # Persistence files
 LOG_FILE = Path("bybit_ha_bot.log")
 HA_STATE_FILE = Path("ha_state.json")
 SIPHON_FILE = Path("siphon_baseline.json")
 
-# API timeouts / retries
 REQUEST_TIMEOUT = 15
-RETRY_SLEEP = 1.0
 
 # ---------- UTIL ----------
 def _now_iso():
     return datetime.now(timezone.utc).astimezone().isoformat()
 
-def _log_to_file(line: str):
+def log(msg: str):
+    line = f"{_now_iso()} | {msg}"
+    print(line)
     try:
         with open(LOG_FILE, "a") as f:
             f.write(line + "\n")
     except Exception:
         pass
-
-def log(msg: str):
-    line = f"{_now_iso()} | {msg}"
-    print(line)
-    _log_to_file(line)
 
 def dec(x) -> Decimal:
     if isinstance(x, Decimal):
@@ -93,10 +72,10 @@ def dec(x) -> Decimal:
     try:
         return Decimal(str(x))
     except Exception:
-        return Decimal(0)
+        return Decimal("0")
 
 def fmt_price(d: Decimal) -> str:
-    # Format with up to 8 decimal places (Bybit commonly accepts up to 8)
+    # Bybit typically accepts up to 8 decimals
     return format(d.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN), 'f')
 
 def now_ms() -> str:
@@ -105,7 +84,7 @@ def now_ms() -> str:
 def sign_hmac_sha256(message: str) -> str:
     return hmac.new(BYBIT_API_SECRET.encode(), message.encode(), hashlib.sha256).hexdigest()
 
-# ---------- PERSISTENCE ----------
+# ---------- PERSIST ----------
 def save_json_file(path: Path, data: dict):
     try:
         path.write_text(json.dumps(data))
@@ -123,14 +102,26 @@ def load_json_file(path: Path) -> Optional[dict]:
 def save_ha_state(ha_open: Decimal, ha_close: Decimal):
     save_json_file(HA_STATE_FILE, {"ha_open": str(ha_open), "ha_close": str(ha_close)})
 
-def load_ha_state() -> Tuple[Optional[Decimal], Optional[Decimal]]:
+def load_ha_state() -> Tuple[Decimal, Decimal]:
+    """
+    Always return Decimals for ha_open and ha_close.
+    If no file, return INITIAL_HA_OPEN for both.
+    """
     d = load_json_file(HA_STATE_FILE)
     if not d:
-        return None, None
+        return INITIAL_HA_OPEN, INITIAL_HA_OPEN
     try:
-        return dec(d.get("ha_open")), dec(d.get("ha_close"))
-    except Exception:
-        return None, None
+        ha_open = dec(d.get("ha_open", str(INITIAL_HA_OPEN)))
+        ha_close = dec(d.get("ha_close", str(INITIAL_HA_OPEN)))
+        # guard: if either is None-like, set to initial
+        if ha_open is None:
+            ha_open = INITIAL_HA_OPEN
+        if ha_close is None:
+            ha_close = INITIAL_HA_OPEN
+        return ha_open, ha_close
+    except Exception as e:
+        log(f"load_ha_state parse error: {e}; falling back to INITIAL_HA_OPEN")
+        return INITIAL_HA_OPEN, INITIAL_HA_OPEN
 
 def save_siphon_baseline(val: Decimal):
     save_json_file(SIPHON_FILE, {"baseline": str(val)})
@@ -140,11 +131,15 @@ def load_siphon_baseline() -> Decimal:
     if not d:
         return START_BALANCE
     try:
-        return dec(d.get("baseline", str(START_BALANCE)))
-    except Exception:
+        baseline = dec(d.get("baseline", str(START_BALANCE)))
+        if baseline is None:
+            return START_BALANCE
+        return baseline
+    except Exception as e:
+        log(f"load_siphon_baseline parse error: {e}; falling back to START_BALANCE")
         return START_BALANCE
 
-# ---------- HTTP / Bybit helpers (v5 prehash signing pattern) ----------
+# ---------- HTTP Helpers ----------
 def bybit_public_get(path: str, params: dict = None) -> dict:
     url = BASE_URL + path
     try:
@@ -152,9 +147,7 @@ def bybit_public_get(path: str, params: dict = None) -> dict:
         r.raise_for_status()
         return r.json()
     except Exception as e:
-        # include response text if available
-        txt = getattr(e, 'response', None)
-        log(f"Public GET error: {e} | resp_text={getattr(r, 'text', 'none')}")
+        log(f"Public GET error path={path} params={params} exc={e} resp_text={getattr(e, 'response', None)}")
         raise
 
 def bybit_private_request(path: str, params: dict = None, method: str = "POST") -> dict:
@@ -179,20 +172,20 @@ def bybit_private_request(path: str, params: dict = None, method: str = "POST") 
         r.raise_for_status()
         return r.json()
     except Exception as e:
-        # log full response text for debugging if available
+        # try to include response text if available
         resp_text = None
         try:
             resp_text = r.text
         except Exception:
             resp_text = "no response text"
-        log(f"Private request error: {e} | path={path} | params={params} | resp_text={resp_text}")
+        log(f"Private request error: path={path} method={method} params={params} exc={e} resp_text={resp_text}")
         raise
 
 # ---------- MARKET DATA & HEIKIN-ASHI ----------
 def fetch_recent_1h_raw(symbol: str = SYMBOL, limit: int = 10) -> list:
     """
-    Fetches recent 1h OHLC candles and returns list oldest->newest of dicts:
-    {"open": Decimal, "high": Decimal, "low": Decimal, "close": Decimal, "start_at": int}
+    Returns list oldest->newest of candles with float values to avoid mixing Decimal/None.
+    Each candle: {"open": Decimal, "high": Decimal, "low": Decimal, "close": Decimal, "start_at": int}
     """
     path = "/v5/market/kline"
     params = {"category": CATEGORY, "symbol": symbol, "interval": "60", "limit": limit}
@@ -215,24 +208,33 @@ def fetch_recent_1h_raw(symbol: str = SYMBOL, limit: int = 10) -> list:
             open_p = dec(r.get("open")); high = dec(r.get("high")); low = dec(r.get("low")); close = dec(r.get("close"))
         else:
             continue
+        # ensure no None; coerce to Decimal
+        open_p = open_p if open_p is not None else Decimal("0")
+        high = high if high is not None else Decimal("0")
+        low = low if low is not None else Decimal("0")
+        close = close if close is not None else Decimal("0")
         candles.append({"open": open_p, "high": high, "low": low, "close": close, "start_at": start})
     candles = sorted(candles, key=lambda x: x["start_at"])
     return candles
 
-def compute_heiken_ashi_series(raw_candles: list, initial_ha_open: Optional[Decimal] = None) -> list:
+def compute_heiken_ashi_series(raw_candles: list, initial_ha_open: Decimal, initial_ha_close: Decimal) -> list:
     """
-    Compute HA for each raw candle oldest -> newest.
-    If initial_ha_open is provided, it is treated as prev_ha_open for the first calculation.
+    raw_candles: list oldest->newest with Decimal prices
+    initial_ha_open & initial_ha_close: Decimals (used as prev_ha_open/prev_ha_close for the first computation)
+    Always returns Decimal fields and never uses None in arithmetic.
     """
     ha = []
-    prev_ha_open = dec(initial_ha_open) if initial_ha_open is not None else None
-    prev_ha_close = None
-    for r in raw_candles:
+    prev_ha_open = dec(initial_ha_open)
+    prev_ha_close = dec(initial_ha_close)
+    # We'll compute HA for each raw candle sequentially.
+    for idx, r in enumerate(raw_candles):
         o, h, l, c = dec(r["open"]), dec(r["high"]), dec(r["low"]), dec(r["close"])
         ha_close = (o + h + l + c) / Decimal(4)
-        if prev_ha_open is None:
+        if idx == 0 and (prev_ha_open is None or prev_ha_close is None):
+            # Fallback safe compute
             ha_open = (o + c) / Decimal(2)
         else:
+            # Use prev values (we ensured they are Decimal above)
             ha_open = (prev_ha_open + prev_ha_close) / Decimal(2)
         ha_high = max(h, ha_open, ha_close)
         ha_low = min(l, ha_open, ha_close)
@@ -245,7 +247,6 @@ def approx_equal(a: Decimal, b: Decimal, tol: Decimal = PIP) -> bool:
     return abs(a - b) <= tol
 
 def detect_signal_from_ha(last_ha: dict) -> str:
-    """Return 'buy', 'sell' or 'none'"""
     if last_ha["close"] > last_ha["open"] and approx_equal(last_ha["open"], last_ha["low"]):
         return "buy"
     if last_ha["close"] < last_ha["open"] and approx_equal(last_ha["open"], last_ha["high"]):
@@ -253,13 +254,8 @@ def detect_signal_from_ha(last_ha: dict) -> str:
     return "none"
 
 def compute_sl_tp_using_ha(signal: str, ha_candle: dict, entry_price: Decimal) -> Tuple[Decimal, Decimal]:
-    """
-    SL uses HA values (± pip). TP = 1:1 RR + 0.1% buffer.
-    Returns (sl, tp) as Decimal.
-    """
     if signal == "buy":
         sl = dec(ha_candle["low"]) - PIP
-        # safety: ensure sl below entry
         if sl >= entry_price:
             sl = entry_price - PIP
         risk = entry_price - sl
@@ -267,20 +263,15 @@ def compute_sl_tp_using_ha(signal: str, ha_candle: dict, entry_price: Decimal) -
         return sl, tp
     elif signal == "sell":
         sl = dec(ha_candle["high"]) + PIP
-        # safety: ensure sl above entry
         if sl <= entry_price:
             sl = entry_price + PIP
         risk = sl - entry_price
         tp = entry_price - (risk * RR) - (entry_price * TP_BUFFER_PCT)
         return sl, tp
     else:
-        raise ValueError("signal must be 'buy' or 'sell'")
+        raise ValueError("signal must be buy or sell")
 
 def calculate_qty_from_risk(balance_usdt: Decimal, entry: Decimal, sl: Decimal, risk_pct: Decimal = RISK_PERCENT) -> int:
-    """
-    Basic sizing: qty = floor((balance * risk_pct) / stop_distance)
-    Note: assumes 1 contract ~= 1 quote unit. Adjust contract multiplier if needed.
-    """
     stop_dist = abs(entry - sl)
     if stop_dist <= Decimal("0"):
         raise ValueError("stop distance must be > 0")
@@ -290,24 +281,20 @@ def calculate_qty_from_risk(balance_usdt: Decimal, entry: Decimal, sl: Decimal, 
         qty = MIN_QTY
     return qty
 
-# ---------- BALANCE & POSITIONS (v5 endpoints) ----------
+# ---------- BALANCE & POSITIONS ----------
 def get_unified_balance_usdt() -> Decimal:
-    """
-    Returns walletBalance or totalBalance of USDT in unified wallet as Decimal.
-    """
     try:
         res = bybit_private_request("/v5/account/wallet-balance", {"coin": "USDT"}, method="GET")
         result = res.get("result") or {}
-        # different shapes; try common ones
+        # Try several shapes
         if isinstance(result, dict):
             lst = result.get("list") or []
             for item in lst:
-                # item might be {"coin":"USDT","walletBalance":...} or nested
                 if item.get("coin") == "USDT":
                     wb = item.get("walletBalance") or item.get("totalBalance") or item.get("availableToWithdraw")
                     if wb is not None:
                         return dec(wb)
-            # try nested
+            # nested
             for it in lst:
                 if isinstance(it, dict):
                     for k, v in it.items():
@@ -328,9 +315,6 @@ def get_unified_balance_usdt() -> Decimal:
     raise RuntimeError("Could not fetch unified balance; inspect API response")
 
 def get_current_position(symbol: str = SYMBOL) -> dict:
-    """
-    Returns best-effort position info dict: {'qty': Decimal, 'side': 'Buy'/'Sell'/None, 'raw': ...}
-    """
     try:
         res = bybit_private_request("/v5/position/list", {"category": CATEGORY, "symbol": symbol}, method="GET")
         result = res.get("result") or {}
@@ -345,12 +329,8 @@ def get_current_position(symbol: str = SYMBOL) -> dict:
         log(f"get_current_position error: {e}")
         return {"qty": Decimal("0"), "side": None, "raw": {}}
 
-# ---------- ORDER FUNCTIONS (attach on create, fallback, update trading-stop) ----------
+# ---------- ORDERS & TP/SL UPDATE ----------
 def place_market_order_attach_tp_sl(symbol: str, side: str, qty: int, tp_price: Decimal, sl_price: Decimal) -> dict:
-    """
-    Attempt to create a market order with takeProfit and stopLoss fields. Returns API response dict.
-    side: "Buy" or "Sell"
-    """
     body = {
         "category": CATEGORY,
         "symbol": symbol,
@@ -372,7 +352,6 @@ def place_market_order_attach_tp_sl(symbol: str, side: str, qty: int, tp_price: 
     return res
 
 def place_market_order_raw(symbol: str, side: str, qty: int) -> dict:
-    """Place a market order without TP/SL attached. Returns API response dict."""
     body = {
         "category": CATEGORY,
         "symbol": symbol,
@@ -390,9 +369,6 @@ def place_market_order_raw(symbol: str, side: str, qty: int) -> dict:
     return res
 
 def update_position_trading_stop(symbol: str, take_profit: Optional[Decimal] = None, stop_loss: Optional[Decimal] = None) -> dict:
-    """
-    Update active position TP/SL using /v5/position/trading-stop
-    """
     body = {"category": CATEGORY, "symbol": symbol}
     if take_profit is not None:
         body["takeProfit"] = fmt_price(take_profit)
@@ -405,22 +381,14 @@ def update_position_trading_stop(symbol: str, take_profit: Optional[Decimal] = N
     log(f"update_position_trading_stop response: {res}")
     return res
 
-# ---------- SIPHON (before trade) ----------
+# ---------- SIPHON ----------
 def siphon_check_and_transfer_before_trade():
-    """
-    Load baseline from disk. If unified balance >= 2 * baseline:
-      - transfer 25% of unified balance to FUND account via /v5/asset/transfer
-      - set new baseline to remaining balance (balance - siphoned)
-      - persist baseline
-      - log event fully
-    """
     baseline = load_siphon_baseline()
     try:
         bal = get_unified_balance_usdt()
     except Exception as e:
         log(f"Siphon: could not get balance: {e}")
         return
-
     log(f"SIPHON CHECK: baseline={baseline} unified_balance={bal}")
     if bal >= baseline * 2:
         amount = (bal * SIPHON_RATIO).quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
@@ -439,34 +407,62 @@ def siphon_check_and_transfer_before_trade():
         except Exception as e:
             log(f"SIPHON transfer failed: {e}")
 
-# ---------- HIGH LEVEL: Open / Update Trades ----------
-def open_trade_if_signal(signal: str, entry_price: Decimal, sl_price: Decimal, tp_price: Decimal, balance: Decimal):
+# ---------- HIGH-LEVEL TRADE HANDLING ----------
+def should_modify_tp_sl(existing: dict, new_tp: Decimal, new_sl: Decimal) -> Tuple[bool, bool]:
     """
-    High-level open trade logic:
-    - siphon check before trade
-    - sizing (10% risk, fallback to 90% affordability)
-    - close opposite position if exists (one-way)
-    - place market order with TP/SL attached; fallback to raw market then trading-stop attach
-    - record in-memory open trade (best-effort)
+    Decide whether to modify TP and/or SL for an existing trade.
+    existing: dict with keys 'entry','tp','sl','direction'
+    Returns (modify_tp, modify_sl)
+    Logic:
+      - For buy:
+          modify TP if new TP profit > current TP profit AND new SL loss <= current SL loss
+          modify SL if new SL loss < current SL loss AND new TP profit >= current TP profit
+      - For sell: symmetric
     """
-    # 1) Siphon before trade
+    if not existing:
+        return False, False
+    direction = existing.get("direction")
+    entry = dec(existing.get("entry"))
+    cur_tp = dec(existing.get("tp"))
+    cur_sl = dec(existing.get("sl"))
+    modify_tp = False
+    modify_sl = False
+    if direction == "buy":
+        new_tp_profit = new_tp - entry
+        cur_tp_profit = cur_tp - entry
+        new_sl_loss = entry - new_sl
+        cur_sl_loss = entry - cur_sl
+        if new_tp_profit > cur_tp_profit and new_sl_loss <= cur_sl_loss:
+            modify_tp = True
+        if new_sl_loss < cur_sl_loss and new_tp_profit >= cur_tp_profit:
+            modify_sl = True
+    elif direction == "sell":
+        new_tp_profit = entry - new_tp
+        cur_tp_profit = entry - cur_tp
+        new_sl_loss = new_sl - entry
+        cur_sl_loss = cur_sl - entry
+        if new_tp_profit > cur_tp_profit and new_sl_loss <= cur_sl_loss:
+            modify_tp = True
+        if new_sl_loss < cur_sl_loss and new_tp_profit >= cur_tp_profit:
+            modify_sl = True
+    return modify_tp, modify_sl
+
+def open_trade_if_signal(signal: str, entry_price: Decimal, sl_price: Decimal, tp_price: Decimal, balance: Decimal) -> Optional[dict]:
+    # Siphon before opening
     try:
         siphon_check_and_transfer_before_trade()
     except Exception as e:
-        log(f"Siphon pre-check error: {e}")
+        log(f"Siphon pre-check failed: {e}")
 
-    # 2) sizing
-    qty = MIN_QTY
+    # sizing
     try:
         qty = calculate_qty_from_risk(balance, entry_price, sl_price, RISK_PERCENT)
     except Exception as e:
         log(f"Sizing error: {e}; using MIN_QTY")
         qty = MIN_QTY
 
-    # check affordability: (rough check)
     est_cost = dec(qty) * entry_price
     if est_cost > balance * RISK_PERCENT:
-        # fallback sizing using fallback balance (90% of balance)
         fallback_balance = (balance * FALLBACK_USAGE)
         try:
             qty = calculate_qty_from_risk(fallback_balance, entry_price, sl_price, Decimal("1.0"))
@@ -479,49 +475,45 @@ def open_trade_if_signal(signal: str, entry_price: Decimal, sl_price: Decimal, t
 
     log(f"SIZING: balance={balance} entry={entry_price} sl={sl_price} qty={qty}")
 
-    # 3) Check existing position in one-way mode and close opposite if present
+    # one-way: close opposite if present
     pos = get_current_position(SYMBOL)
     pos_qty = pos.get("qty", Decimal("0"))
     pos_side = pos.get("side")
-    has_pos = pos_qty and pos_qty != 0
-
-    intended_side = "Buy" if signal == "buy" else "Sell"
-
-    if has_pos and pos_side:
-        # If existing side is opposite, close it first
+    if pos_qty and pos_qty != 0 and pos_side:
+        # close if opposite
         if pos_side.lower().startswith("buy") and signal == "sell":
-            log(f"Existing LONG position detected (qty={pos_qty}). Closing before opening SELL.")
+            log(f"Existing LONG position detected (qty={pos_qty}). Closing before SELL.")
             try:
                 close_position_reduce_only(SYMBOL, pos_qty, pos_side)
                 time.sleep(1)
             except Exception as e:
-                log(f"Failed to close existing long: {e}; aborting new trade")
+                log(f"Failed to close existing long: {e}; abort")
                 return None
         elif pos_side.lower().startswith("sell") and signal == "buy":
-            log(f"Existing SHORT position detected (qty={pos_qty}). Closing before opening BUY.")
+            log(f"Existing SHORT position detected (qty={pos_qty}). Closing before BUY.")
             try:
                 close_position_reduce_only(SYMBOL, pos_qty, pos_side)
                 time.sleep(1)
             except Exception as e:
-                log(f"Failed to close existing short: {e}; aborting new trade")
+                log(f"Failed to close existing short: {e}; abort")
                 return None
 
-    # 4) Place market order with TP/SL attach (best-effort)
+    # place market order with attached TP/SL
+    side_str = "Buy" if signal == "buy" else "Sell"
     try:
-        resp = place_market_order_attach_tp_sl(SYMBOL, intended_side, qty, tp_price, sl_price)
-        log(f"Order create resp: {resp}")
+        resp = place_market_order_attach_tp_sl(SYMBOL, side_str, qty, tp_price, sl_price)
+        log(f"Order create response: {resp}")
         return {"direction": signal, "entry": entry_price, "sl": sl_price, "tp": tp_price, "qty": qty, "api_response": resp}
     except Exception as e:
-        log(f"Place market with attach failed: {e}")
-        # fallback: raw market order, then attach via trading-stop
+        log(f"place_market_order_attach_tp_sl failed: {e}")
+        # fallback
         try:
-            resp_raw = place_market_order_raw(SYMBOL, intended_side, qty)
-            log(f"Raw market order resp: {resp_raw}")
-            # attempt trading-stop attach
+            resp_raw = place_market_order_raw(SYMBOL, side_str, qty)
+            log(f"Raw market order response: {resp_raw}")
             time.sleep(1)
             try:
                 attach_resp = update_position_trading_stop(SYMBOL, take_profit=tp_price, stop_loss=sl_price)
-                log(f"Attached TP/SL via trading-stop: {attach_resp}")
+                log(f"Attached via trading-stop: {attach_resp}")
             except Exception as ee:
                 log(f"Attach via trading-stop failed: {ee}")
             return {"direction": signal, "entry": entry_price, "sl": sl_price, "tp": tp_price, "qty": qty, "api_response": resp_raw}
@@ -531,58 +523,49 @@ def open_trade_if_signal(signal: str, entry_price: Decimal, sl_price: Decimal, t
 
 # ---------- MAIN LOOP ----------
 def main_loop():
-    # sanity checks
     if not BYBIT_API_KEY or not BYBIT_API_SECRET:
-        log("ERROR: BYBIT_API_KEY and BYBIT_API_SECRET environment variables must be set.")
+        log("ERROR: BYBIT_API_KEY and BYBIT_API_SECRET must be set in environment.")
         raise SystemExit("Missing API credentials")
 
-    # Load persisted HA state or initialize with explicit initial HA open
     saved_open, saved_close = load_ha_state()
-    if saved_open is None:
-        prev_ha_open = INITIAL_HA_OPEN
-        log(f"No persisted HA state detected. Using INITIAL_HA_OPEN = {INITIAL_HA_OPEN}")
-    else:
-        prev_ha_open = saved_open
-        log(f"Loaded persisted HA state ha_open={prev_ha_open} ha_close={saved_close}")
+    # load_ha_state always returns Decimals and defaults to INITIAL_HA_OPEN
+    prev_ha_open = saved_open
+    prev_ha_close = saved_close
+    log(f"Starting with prev_ha_open={prev_ha_open} prev_ha_close={prev_ha_close}")
 
-    # Ensure siphon baseline exists
     if not SIPHON_FILE.exists():
         save_siphon_baseline(START_BALANCE)
         log(f"Persisted initial siphon baseline = {START_BALANCE}")
 
     last_processed_hour = None
-    open_trade_state: Dict[str, Any] = {}  # in-memory best-effort state
+    open_trade_state: Dict[str, Any] = {}
 
-    log("Bot started (verbose). Waiting for top-of-hour events...")
+    log("Bot started (fixed). Waiting for top-of-hour...")
 
     while True:
         now = datetime.now(timezone.utc)
-        # run at top of hour (first minute)
         if now.minute == 0 and now.hour != last_processed_hour:
             try:
                 log(f"Top-of-hour: {now.isoformat()} - fetching candles")
-                raw_candles = fetch_recent_1h_raw(SYMBOL, limit=6)
-                if not raw_candles or len(raw_candles) < 1:
-                    log("No candles returned; skipping")
+                raw = fetch_recent_1h_raw(SYMBOL, limit=6)
+                if not raw or len(raw) < 1:
+                    log("No candles returned; skipping hour")
                     last_processed_hour = now.hour
                     time.sleep(10)
                     continue
 
-                # compute HA series using persisted prev_ha_open for continuity
-                ha_series = compute_heiken_ashi_series(raw_candles, initial_ha_open=prev_ha_open)
+                # compute HA series using persisted prev_ha_open & prev_ha_close
+                ha_series = compute_heiken_ashi_series(raw, initial_ha_open=prev_ha_open, initial_ha_close=prev_ha_close)
                 last_ha = ha_series[-1]
-                # Save HA state for next run
+                # persist HA
                 save_ha_state(last_ha["open"], last_ha["close"])
-                prev_ha_open = last_ha["open"]
+                prev_ha_open, prev_ha_close = last_ha["open"], last_ha["close"]
 
-                # Get the closed raw candle (the most recent closed one)
-                closed = raw_candles[-1]
+                closed = raw[-1]
                 entry_price = dec(closed["close"])
-                # detect signal
-                signal = detect_signal_from_ha(last_ha)  # buy / sell / none
+                signal = detect_signal_from_ha(last_ha)
                 candle_color = "green" if last_ha["close"] > last_ha["open"] else "red"
 
-                # log raw + ha + signal info
                 log(json.dumps({
                     "symbol": SYMBOL,
                     "raw_last": {"open": str(closed["open"]), "high": str(closed["high"]), "low": str(closed["low"]), "close": str(closed["close"])},
@@ -592,20 +575,19 @@ def main_loop():
                 }))
 
                 if signal in ("buy", "sell"):
-                    # compute SL & TP based on HA
                     sl_price, tp_price = compute_sl_tp_using_ha(signal, last_ha, entry_price)
-                    log(f"Computed SL={sl_price} TP={tp_price} (entry={entry_price})")
+                    log(f"Computed (entry={entry_price}) sl={sl_price} tp={tp_price}")
 
-                    # BEFORE placing trade: siphon check & transfer if needed
+                    # siphon before trade
                     try:
                         siphon_check_and_transfer_before_trade()
                     except Exception as e:
-                        log(f"Siphon check failed: {e}")
+                        log(f"Siphon pre-check failed: {e}")
 
-                    # fetch balance for sizing
+                    # fetch balance
                     try:
                         balance = get_unified_balance_usdt()
-                        log(f"Unified balance fetched: {balance}")
+                        log(f"Unified balance: {balance}")
                     except Exception as e:
                         log(f"Could not fetch unified balance: {e}; skipping trade this hour")
                         balance = None
@@ -613,24 +595,41 @@ def main_loop():
                     if balance is None:
                         log("Skipping trade due to missing balance.")
                     else:
-                        # open trade
-                        opened = open_trade_if_signal(signal, entry_price, sl_price, tp_price, balance)
-                        if opened:
-                            log(f"Trade opened: {opened}")
-                            open_trade_state = opened
+                        if not open_trade_state:
+                            # no open trade — try to open
+                            opened = open_trade_if_signal(signal, entry_price, sl_price, tp_price, balance)
+                            if opened:
+                                open_trade_state = opened
+                                log(f"Trade opened: {opened}")
+                            else:
+                                log("Trade opening failed or aborted.")
                         else:
-                            log("Trade open attempt failed or aborted.")
+                            # trade open: consider updating TP/SL if improved
+                            modify_tp, modify_sl = should_modify_tp_sl(open_trade_state, tp_price, sl_price)
+                            if modify_tp or modify_sl:
+                                tp_arg = tp_price if modify_tp else None
+                                sl_arg = sl_price if modify_sl else None
+                                try:
+                                    log(f"Modifying position trading-stop modify_tp={modify_tp} modify_sl={modify_sl} tp={tp_arg} sl={sl_arg}")
+                                    mod_res = update_position_trading_stop(SYMBOL, take_profit=tp_arg, stop_loss=sl_arg)
+                                    log(f"Trading-stop update response: {mod_res}")
+                                    if modify_tp:
+                                        open_trade_state["tp"] = tp_price
+                                    if modify_sl:
+                                        open_trade_state["sl"] = sl_price
+                                except Exception as e:
+                                    log(f"trading-stop modification failed: {e}")
+                            else:
+                                log("Existing trade present and no beneficial TP/SL update detected.")
 
                 else:
-                    log("No valid signal this hour.")
+                    log("No signal this hour.")
 
-                # mark processed hour
                 last_processed_hour = now.hour
 
             except Exception as e:
                 log(f"Hourly processing error: {e}")
 
-        # sleep a bit to avoid busy-loop
         time.sleep(5)
 
 if __name__ == "__main__":
