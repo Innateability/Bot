@@ -45,7 +45,7 @@ START_BALANCE = Decimal(os.getenv("START_BALANCE", "2"))  # user requested start
 SIPHON_RATIO = Decimal(os.getenv("SIPHON_RATIO", "0.25"))
 FUND_ACCOUNT_TYPE = os.getenv("FUND_ACCOUNT_TYPE", "FUND")
 
-INITIAL_HA_OPEN = Decimal(os.getenv("INITIAL_HA_OPEN", "0.33143"))
+INITIAL_HA_OPEN = Decimal(os.getenv("INITIAL_HA_OPEN", "0.33097"))
 
 # Persistence files
 LOG_FILE = Path("bybit_ha_bot.log")
