@@ -18,7 +18,7 @@ from pybit.unified_trading import HTTP
 # ---------------- CONFIG (ENV overrides available) ----------------
 SYMBOL = os.environ.get("SYMBOL", "TRXUSDT")
 TIMEFRAME = os.environ.get("TIMEFRAME", "60")   # minutes
-INITIAL_HA_OPEN = float(os.environ.get("INITIAL_HA_OPEN", "0.31680"))
+INITIAL_HA_OPEN = float(os.environ.get("INITIAL_HA_OPEN", "0.32893"))
 PIP = float(os.environ.get("PIP", "0.0001"))  # buffer applied to SL
 TICK_SIZE = float(os.environ.get("TICK_SIZE", "0.00001"))
 QTY_STEP = float(os.environ.get("QTY_STEP", "1"))
