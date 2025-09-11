@@ -289,9 +289,9 @@ def run_once(raw=None):
         raw = fetch_candles(SYMBOL, TIMEFRAME, limit=200)
     # else raw passed by simulator stepping
 
-    if not raw or len(raw) < 2:
-        logger.warning("Not enough candles")
-        return
+    first_ts = raw[0]["ts"] / 1000  # ms → seconds
+    first_time = datetime.utcfromtimestamp(first_ts).strftime("%Y-%m-%d %H:%M:%S UTC")
+    logger.info("First candle retrieved starts at: %s", first_time)
 
     # drop in-progress candle in live mode
     if not SIMULATION_MODE:
