@@ -34,7 +34,7 @@ BALANCE_USE_PERCENT = 0.45  # use 45% of balance for position sizing
 FALLBACK_PERCENT = 0.45     # fallback if margin too high
 
 # Simulation
-SIMULATION_MODE = os.environ.get("SIMULATION_MODE", "true").lower() in ("1", "true", "yes")
+SIMULATION_MODE = os.environ.get("SIMULATION_MODE", "false").lower() in ("1", "true", "yes")
 INITIAL_BALANCE = float(os.environ.get("INITIAL_BALANCE", "5.0"))
 sim_balance = INITIAL_BALANCE
 sim_positions = []  # list of dicts: {side, entry, qty, sl, tp, entry_ts}
