@@ -360,16 +360,15 @@ def run_simulation_from_api(limit=1000):
     logger.info("Remaining open positions (if any): %s", sim_positions)
 
 # ---------------- SCHEDULER ----------------
-def wait_until_next_cycle(hours=4, offset=1):
+def wait_until_next_cycle(hours=4):
     now = datetime.utcnow()
     cycle_seconds = hours * 3600
-    elapsed = (now.hour - offset) * 3600 + now.minute * 60 + now.second
+    elapsed = now.hour * 3600 + now.minute * 60 + now.second
     to_wait = cycle_seconds - (elapsed % cycle_seconds)
     if to_wait <= 0:
         to_wait += cycle_seconds
-    logger.info("Sleeping %d seconds until next cycle (offset %d)", to_wait, offset)
+    logger.info("Sleeping %d seconds until next cycle", to_wait)
     time.sleep(to_wait)
-
 # ---------------- ENTRY POINT ----------------
 if __name__ == "__main__":
     logger.info("Starting HA bot — hedge mode, isolated margin | SIMULATION=%s", SIMULATION_MODE)
@@ -382,4 +381,5 @@ if __name__ == "__main__":
                 run_once()
             except Exception:
                 logger.exception("Error in run_once")
-            wait_until_next_cycle(4, offset=1)
+            wait_until_next_cycle(4)
+            
