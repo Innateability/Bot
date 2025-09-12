@@ -11,6 +11,7 @@ Live Heikin-Ashi Bot for Bybit USDT Perpetual (Hedge Mode, Isolated Margin)
 - Enforces MIN_NEW_ORDER_QTY for new trades
 - Does NOT modify open trades
 - Persistent trade history
+- Optional TEST_MODE for quick buy testing
 """
 
 import os
@@ -25,7 +26,7 @@ from pybit.unified_trading import HTTP
 # ---------------- CONFIG ----------------
 SYMBOL = os.environ.get("SYMBOL", "TRXUSDT")
 TIMEFRAME = os.environ.get("TIMEFRAME", "240")  # 4h
-INITIAL_HA_OPEN = float(os.environ.get("INITIAL_HA_OPEN", "0.34548"))
+INITIAL_HA_OPEN = float(os.environ.get("INITIAL_HA_OPEN", "0.34756"))
 TICK_SIZE = float(os.environ.get("TICK_SIZE", "0.00001"))
 QTY_STEP = float(os.environ.get("QTY_STEP", "1"))
 LEVERAGE = int(os.environ.get("LEVERAGE", "75"))
@@ -34,6 +35,7 @@ FALLBACK_PERCENT = float(os.environ.get("FALLBACK_PERCENT", "0.90"))
 MIN_NEW_ORDER_QTY = float(os.environ.get("MIN_NEW_ORDER_QTY", "16"))
 STATE_FILE = os.environ.get("STATE_FILE", "ha_state.json")
 TRADE_HISTORY_FILE = os.environ.get("TRADE_HISTORY_FILE", "trade_history.json")
+TEST_MODE = os.environ.get("TEST_MODE", "true").lower() in ("1","true","yes")
 
 API_KEY = os.environ.get("BYBIT_API_KEY")
 API_SECRET = os.environ.get("BYBIT_API_SECRET")
@@ -110,7 +112,6 @@ def timeframe_ms() -> int:
 def fetch_candles(symbol: str, interval: str = TIMEFRAME, limit: int = 200):
     out = session.get_kline(category="linear", symbol=symbol, interval=interval, limit=limit)
     res = out.get("result", {}) or out
-
     if isinstance(res, dict) and "list" in res:
         parsed = []
         for r in res["list"]:
@@ -292,6 +293,24 @@ def run_once():
         success = place_market_with_tp_sl(sig["signal"], SYMBOL, qty, sl, tp)
         log_trade(sig["signal"], entry, sl, tp, qty, balance, status="placed" if success else "failed")
 
+# ---------------- TEST FUNCTION ----------------
+def test_buy_trade():
+    """
+    Places a buy of 16 contracts immediately for testing.
+    """
+    logger.info("=== Running test buy trade ===")
+    balance = get_balance_usdt()
+    logger.info("Balance before test trade: %.8f USDT", balance)
+
+    entry = 0.348  # dummy entry or latest price
+    sl = entry - 0.002
+    tp = entry + 0.004
+    qty = 16
+
+    ensure_hedge_and_isolated(SYMBOL)
+    set_symbol_leverage(SYMBOL, LEVERAGE)
+    place_market_with_tp_sl("Buy", SYMBOL, qty, sl, tp)
+
 # ---------------- SCHEDULER ----------------
 def wait_until_next_4h():
     now = datetime.utcnow()
@@ -305,10 +324,14 @@ def wait_until_next_4h():
 # ---------------- ENTRY ----------------
 if __name__=="__main__":
     logger.info("Starting HA 4h live bot — testnet=%s, symbol=%s", TESTNET, SYMBOL)
-    wait_until_next_4h()
-    while True:
-        try:
-            run_once()
-        except Exception as e:
-            logger.exception("run_once failed: %s", e)
+    
+    if TEST_MODE:
+        test_buy_trade()  # only runs if TEST_MODE=true
+    else:
         wait_until_next_4h()
+        while True:
+            try:
+                run_once()
+            except Exception as e:
+                logger.exception("run_once failed: %s", e)
+            wait_until_next_4h()
