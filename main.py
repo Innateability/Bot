@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 """
-Bybit Heikin-Ashi live/sim bot — Custom Rules
-- Simulation mode runs through Bybit candles locally and updates sim balance when TP/SL hit.
-- Uses persisted HA open for TradingView consistency.
+Live Heikin-Ashi Bot for Bybit USDT Perpetual (Hedge Mode, Isolated Margin)
+
+- Uses 4h timeframe (TIMEFRAME="240")
+- Logs last two raw + HA candles
+- Evaluates Buy/Sell signals
+- Computes SL/TP 2:1 RR + 0.1%
+- Robust USDT balance fetch
+- Hedge mode + isolated margin
+- Enforces MIN_NEW_ORDER_QTY for new trades
+- Does NOT modify open trades
+- Persistent trade history
 """
 
 import os
@@ -11,55 +19,33 @@ import json
 import logging
 from math import floor
 from datetime import datetime
+
 from pybit.unified_trading import HTTP
 
 # ---------------- CONFIG ----------------
 SYMBOL = os.environ.get("SYMBOL", "TRXUSDT")
 TIMEFRAME = os.environ.get("TIMEFRAME", "240")  # 4h
-INITIAL_HA_OPEN = float(os.environ.get("INITIAL_HA_OPEN", "0.34379"))
-PIP = float(os.environ.get("PIP", "0.0001"))
+INITIAL_HA_OPEN = float(os.environ.get("INITIAL_HA_OPEN", "0.34548"))
 TICK_SIZE = float(os.environ.get("TICK_SIZE", "0.00001"))
 QTY_STEP = float(os.environ.get("QTY_STEP", "1"))
 LEVERAGE = int(os.environ.get("LEVERAGE", "75"))
+RISK_PERCENT = float(os.environ.get("RISK_PERCENT", "0.10"))
+FALLBACK_PERCENT = float(os.environ.get("FALLBACK_PERCENT", "0.90"))
+MIN_NEW_ORDER_QTY = float(os.environ.get("MIN_NEW_ORDER_QTY", "16"))
+STATE_FILE = os.environ.get("STATE_FILE", "ha_state.json")
+TRADE_HISTORY_FILE = os.environ.get("TRADE_HISTORY_FILE", "trade_history.json")
 
-API_KEY = os.environ.get("BYBIT_API_KEY", "")
-API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
+API_KEY = os.environ.get("BYBIT_API_KEY")
+API_SECRET = os.environ.get("BYBIT_API_SECRET")
 TESTNET = os.environ.get("BYBIT_TESTNET", "false").lower() in ("1", "true", "yes")
 ACCOUNT_TYPE = os.environ.get("BYBIT_ACCOUNT_TYPE", "UNIFIED")
-
-STATE_FILE = os.environ.get("STATE_FILE", "ha_state.json")
-
-# Risk rules
-RISK_PERCENT = 0.045
-BALANCE_USE_PERCENT = 0.45
-FALLBACK_PERCENT = 0.45
-
-# Simulation
-SIMULATION_MODE = os.environ.get("SIMULATION_MODE", "false").lower() in ("1", "true", "yes")
-INITIAL_BALANCE = float(os.environ.get("INITIAL_BALANCE", "100.0"))
-sim_balance = INITIAL_BALANCE
-sim_positions = []
 
 # ---------------- LOG ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("ha_bot")
 
 # ---------------- CLIENT ----------------
-session = HTTP(testnet=TESTNET, api_key=API_KEY or None, api_secret=API_SECRET or None)
-if SIMULATION_MODE:
-    logger.info("Running in SIMULATION MODE with starting balance %.2f USDT", sim_balance)
-
-# ---------------- HELPERS ----------------
-def round_price(p: float) -> float:
-    return round(round(p / TICK_SIZE) * TICK_SIZE, 8)
-
-def floor_to_step(x: float, step: float) -> float:
-    if step <= 0:
-        return x
-    return floor(x / step) * step
-
-def timeframe_ms() -> int:
-    return int(TIMEFRAME) * 60 * 1000
+session = HTTP(testnet=TESTNET, api_key=API_KEY, api_secret=API_SECRET)
 
 # ---------------- STATE ----------------
 def load_state():
@@ -75,36 +61,86 @@ def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
 
+# ---------------- TRADE HISTORY ----------------
+def load_trade_history():
+    if not os.path.exists(TRADE_HISTORY_FILE):
+        return []
+    try:
+        with open(TRADE_HISTORY_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def save_trade_history(history):
+    with open(TRADE_HISTORY_FILE, "w") as f:
+        json.dump(history, f, indent=2)
+
+def log_trade(signal, entry, sl, tp, qty, balance, status="pending"):
+    history = load_trade_history()
+    history.append({
+        "timestamp": int(datetime.utcnow().timestamp()),
+        "signal": signal,
+        "entry": entry,
+        "sl": sl,
+        "tp": tp,
+        "qty": qty,
+        "balance": balance,
+        "status": status
+    })
+    save_trade_history(history)
+    logger.info("Logged trade: %s %s qty=%.8f entry=%.8f SL=%.8f TP=%.8f balance=%.8f",
+                datetime.utcnow().isoformat(), signal, qty, entry, sl, tp, balance)
+
+# ---------------- HELPERS ----------------
+def round_price(p: float) -> float:
+    if TICK_SIZE <= 0:
+        return p
+    ticks = round(p / TICK_SIZE)
+    return round(ticks * TICK_SIZE, 8)
+
+def floor_to_step(x: float, step: float) -> float:
+    if step <= 0:
+        return x
+    return floor(x / step) * step
+
+def timeframe_ms() -> int:
+    return int(TIMEFRAME) * 60 * 1000
+
 # ---------------- KLINES ----------------
 def fetch_candles(symbol: str, interval: str = TIMEFRAME, limit: int = 200):
     out = session.get_kline(category="linear", symbol=symbol, interval=interval, limit=limit)
-    rows = out.get("result", {}).get("list", []) if isinstance(out.get("result"), dict) else []
-    candles = []
-    for r in rows:
-        try:
-            ts = int(r[0])
-            o = float(r[1]); h = float(r[2]); l = float(r[3]); c = float(r[4])
-            candles.append({"ts": ts, "open": o, "high": h, "low": l, "close": c})
-        except Exception:
-            continue
-    candles.sort(key=lambda x: x["ts"])
-    return candles
+    res = out.get("result", {}) or out
+
+    if isinstance(res, dict) and "list" in res:
+        parsed = []
+        for r in res["list"]:
+            try:
+                parsed.append({
+                    "ts": int(r[0]),
+                    "open": float(r[1]),
+                    "high": float(r[2]),
+                    "low": float(r[3]),
+                    "close": float(r[4])
+                })
+            except Exception:
+                continue
+        parsed.sort(key=lambda x: x["ts"])
+        return parsed
+    raise RuntimeError("Unexpected kline response shape: {}".format(res))
 
 # ---------------- HEIKIN-ASHI ----------------
 def compute_heikin_ashi(raw_candles, persisted_open=None):
     ha = []
-    prev_ha_open, prev_ha_close = None, None
+    prev_ha_open = None
+    prev_ha_close = None
     n = len(raw_candles)
     for i, c in enumerate(raw_candles):
         ro, rh, rl, rc = c["open"], c["high"], c["low"], c["close"]
         ha_close = (ro + rh + rl + rc) / 4.0
         if i == n - 1:
-            ha_open = float(persisted_open) if persisted_open is not None else INITIAL_HA_OPEN
+            ha_open = float(persisted_open) if persisted_open is not None else float(INITIAL_HA_OPEN)
         else:
-            if prev_ha_open is None:
-                ha_open = (ro + rc) / 2.0
-            else:
-                ha_open = (prev_ha_open + prev_ha_close) / 2.0
+            ha_open = (prev_ha_open + prev_ha_close)/2.0 if prev_ha_open is not None else (ro+rc)/2.0
         ha_high = max(rh, ha_open, ha_close)
         ha_low = min(rl, ha_open, ha_close)
         ha.append({
@@ -115,85 +151,164 @@ def compute_heikin_ashi(raw_candles, persisted_open=None):
         prev_ha_open, prev_ha_close = ha_open, ha_close
     return ha
 
-# ---------------- ENTRY SIGNAL ----------------
+# ---------------- SIGNAL ----------------
 def evaluate_signal(ha_list):
-    if len(ha_list) < 2:
+    if len(ha_list) < 1:
         return None
-    prev_candle, last_candle = ha_list[-2], ha_list[-1]
-
-    # BUY: last is green + higher high
-    if last_candle["ha_close"] > last_candle["ha_open"] and last_candle["ha_high"] > prev_candle["ha_high"]:
+    last = ha_list[-1]
+    green = last["ha_close"] > last["ha_open"]
+    red = last["ha_close"] < last["ha_open"]
+    if green and last["ha_high"] > ha_list[-2]["ha_high"]:
         return {"signal": "Buy"}
-
-    # SELL: last is red + lower low
-    if last_candle["ha_close"] < last_candle["ha_open"] and last_candle["ha_low"] < prev_candle["ha_low"]:
+    if red and last["ha_low"] < ha_list[-2]["ha_low"]:
         return {"signal": "Sell"}
-
     return None
 
-# ---------------- MAIN RUN-ONCE ----------------
-def run_once(raw=None):
-    logger.info("=== New cycle ===")
+# ---------------- BALANCE & POSITIONS ----------------
+def get_balance_usdt():
+    try:
+        out = session.get_wallet_balance(accountType=ACCOUNT_TYPE, coin="USDT")
+    except Exception as e:
+        logger.exception("get_wallet_balance error: %s", e)
+        raise
+    res = out.get("result", {}) or out
+    if isinstance(res, dict) and "USDT" in res:
+        u = res["USDT"]
+        for key in ("available_balance", "availableBalance", "walletBalance"):
+            if key in u:
+                try:
+                    return float(u[key])
+                except Exception:
+                    continue
+    raise RuntimeError("Unable to parse wallet balance response")
+
+def get_open_position(symbol):
+    try:
+        out = session.get_positions(category="linear", symbol=symbol)
+    except Exception:
+        return None
+    res = out.get("result", {}) or out
+    if isinstance(res, dict) and "list" in res and len(res["list"]) > 0:
+        return res["list"][0]
+    return None
+
+# ---------------- ORDER HELPERS ----------------
+def ensure_hedge_and_isolated(symbol):
+    try:
+        session.switch_position_mode(category="linear", symbol=symbol, mode=1)  # Hedge
+        logger.info("Hedge mode enabled for %s", symbol)
+    except Exception as e:
+        logger.debug("switch_position_mode ignored: %s", e)
+
+def set_symbol_leverage(symbol, leverage):
+    try:
+        session.set_leverage(category="linear", symbol=symbol, buyLeverage=leverage, sellLeverage=leverage)
+        logger.info("Set leverage=%sx for %s", leverage, symbol)
+    except Exception as e:
+        logger.warning("set_leverage failed: %s", e)
+
+def place_market_with_tp_sl(signal_side, symbol, qty, sl, tp):
+    side = "Buy" if signal_side=="Buy" else "Sell"
+    try:
+        session.place_order(category="linear", symbol=symbol, side=side,
+                            orderType="Market", qty=str(qty), timeInForce="ImmediateOrCancel", reduceOnly=False)
+        session.set_trading_stop(category="linear", symbol=symbol,
+                                 takeProfit=str(round_price(tp)),
+                                 stopLoss=str(round_price(sl)),
+                                 tpTriggerBy="LastPrice", slTriggerBy="LastPrice")
+        logger.info("Order placed: %s qty=%.8f | SL=%.8f TP=%.8f", side, qty, sl, tp)
+        return True
+    except Exception as e:
+        logger.exception("Order placement failed: %s", e)
+        return False
+
+# ---------------- QTY ----------------
+def compute_qty(entry, sl, balance):
+    risk_usd = balance * RISK_PERCENT
+    per_contract_risk = abs(entry-sl)
+    if per_contract_risk <= 0: return 0
+    qty = risk_usd / per_contract_risk
+    est_margin = (qty*entry)/LEVERAGE
+    if est_margin > balance:
+        qty = (balance*FALLBACK_PERCENT*LEVERAGE)/entry
+    return floor_to_step(qty, QTY_STEP)
+
+# ---------------- MAIN ----------------
+def run_once():
+    logger.info("=== Running 4h check ===")
     state = load_state()
-    persisted_open = state.get("last_ha_open")
+    persisted_ha_open = state.get("last_ha_open")
+    raw = fetch_candles(SYMBOL, TIMEFRAME, limit=200)
 
-    # get candles
-    if raw is None:
-        raw = fetch_candles(SYMBOL, TIMEFRAME, limit=200)
-        retrieval_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-        logger.info("Candles retrieved at (real-world time): %s", retrieval_time)
-
-    if not raw:
-        logger.warning("No candles retrieved")
-        return
-
-    first_ts = raw[0]["ts"] / 1000
-    logger.info("First candle retrieved starts at: %s", datetime.utcfromtimestamp(first_ts).strftime("%Y-%m-%d %H:%M:%S UTC"))
-
-    # cut last incomplete
-    now_ms = int(datetime.utcnow().timestamp() * 1000)
-    if raw[-1]["ts"] + timeframe_ms() > now_ms:
+    # Drop in-progress candle
+    period = timeframe_ms()
+    now_ms = int(datetime.utcnow().timestamp()*1000)
+    if (raw[-1]["ts"] + period) > now_ms + 1000:
         raw = raw[:-1]
+        logger.info("Dropped in-progress candle")
 
-    ha_list = compute_heikin_ashi(raw, persisted_open)
+    ha_list = compute_heikin_ashi(raw, persisted_open=persisted_ha_open)
     last_closed = ha_list[-1]
-    logger.info("Last closed candle time: %s", datetime.utcfromtimestamp(last_closed["ts"]/1000).strftime("%Y-%m-%d %H:%M:%S UTC"))
+    prev_closed = ha_list[-2] if len(ha_list)>=2 else None
 
-    # persist open for next run
-    next_open = (last_closed["ha_open"] + last_closed["ha_close"]) / 2.0
-    state["last_ha_open"] = float(next_open)
+    # Log last two candles
+    if prev_closed:
+        logger.info("Prev RAW: %.8f/%.8f/%.8f/%.8f | HA: %.8f/%.8f/%.8f/%.8f",
+                    prev_closed["raw_open"], prev_closed["raw_high"], prev_closed["raw_low"], prev_closed["raw_close"],
+                    prev_closed["ha_open"], prev_closed["ha_high"], prev_closed["ha_low"], prev_closed["ha_close"])
+    logger.info("Last RAW: %.8f/%.8f/%.8f/%.8f | HA: %.8f/%.8f/%.8f/%.8f",
+                last_closed["raw_open"], last_closed["raw_high"], last_closed["raw_low"], last_closed["raw_close"],
+                last_closed["ha_open"], last_closed["ha_high"], last_closed["ha_low"], last_closed["ha_close"])
+
+    # Persist next HA open
+    state["last_ha_open"] = (last_closed["ha_open"]+last_closed["ha_close"])/2.0
     save_state(state)
 
+    # Evaluate signal
     sig = evaluate_signal(ha_list)
-    if sig:
-        logger.info("Signal detected: %s", sig["signal"])
-    else:
-        logger.info("No valid signal this cycle")
+    if not sig:
+        logger.info("No signal detected")
+        return
 
-# ---------------- ENTRY POINT ----------------
-def wait_until_next_cycle(hours=4):
+    entry = last_closed["raw_close"]
+    sl = state["last_ha_open"]
+    risk = abs(entry-sl)
+    tp = entry + 2*risk + 0.001*entry if sig["signal"]=="Buy" else entry - 2*risk - 0.001*entry
+    sl, tp = round_price(sl), round_price(tp)
+
+    balance = get_balance_usdt()
+    qty = compute_qty(entry, sl, balance)
+    if qty < MIN_NEW_ORDER_QTY: qty = MIN_NEW_ORDER_QTY
+    qty = floor_to_step(qty, QTY_STEP)
+
+    ensure_hedge_and_isolated(SYMBOL)
+    set_symbol_leverage(SYMBOL, LEVERAGE)
+
+    pos = get_open_position(SYMBOL)
+    if pos and float(pos.get("size",0))>0:
+        logger.info("Open position exists; skipping new trade placement")
+        log_trade(sig["signal"], entry, sl, tp, qty, balance, status="skipped_open_position")
+    else:
+        success = place_market_with_tp_sl(sig["signal"], SYMBOL, qty, sl, tp)
+        log_trade(sig["signal"], entry, sl, tp, qty, balance, status="placed" if success else "failed")
+
+# ---------------- SCHEDULER ----------------
+def wait_until_next_4h():
     now = datetime.utcnow()
-    cycle_seconds = hours * 3600
-    elapsed = now.hour * 3600 + now.minute * 60 + now.second
-    to_wait = cycle_seconds - (elapsed % cycle_seconds)
-    if to_wait <= 0:
-        to_wait += cycle_seconds
-    logger.info("Sleeping %d seconds until next cycle", to_wait)
+    seconds = now.minute*60 + now.second
+    elapsed_hours = now.hour % 4
+    to_wait = (4 - elapsed_hours)*3600 - seconds
+    if to_wait <= 0: to_wait = 1
+    logger.info("Sleeping %d seconds until next 4h UTC block", to_wait)
     time.sleep(to_wait)
 
-if __name__ == "__main__":
-    logger.info("Starting HA bot | SIMULATION=%s", SIMULATION_MODE)
-    if SIMULATION_MODE:
-        candles = fetch_candles(SYMBOL, TIMEFRAME, limit=200)
-        for i in range(2, len(candles)):
-            run_once(raw=candles[:i+1])
-            time.sleep(0.1)
-        logger.info("Simulation complete. Final balance=%.2f", sim_balance)
-    else:
-        wait_until_next_cycle(4)
-        while True:
-            try:
-                run_once()
-            except Exception:
-                logger.exception("Error in run_once")
-            wait_until_next_cycle(4)
+# ---------------- ENTRY ----------------
+if __name__=="__main__":
+    logger.info("Starting HA 4h live bot — testnet=%s, symbol=%s", TESTNET, SYMBOL)
+    wait_until_next_4h()
+    while True:
+        try:
+            run_once()
+        except Exception as e:
+            logger.exception("run_once failed: %s", e)
+        wait_until_next_4h()
