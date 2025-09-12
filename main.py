@@ -35,7 +35,7 @@ FALLBACK_PERCENT = float(os.environ.get("FALLBACK_PERCENT", "0.90"))
 MIN_NEW_ORDER_QTY = float(os.environ.get("MIN_NEW_ORDER_QTY", "16"))
 STATE_FILE = os.environ.get("STATE_FILE", "ha_state.json")
 TRADE_HISTORY_FILE = os.environ.get("TRADE_HISTORY_FILE", "trade_history.json")
-TEST_MODE = os.environ.get("TEST_MODE", "true").lower() in ("1","true","yes")
+TEST_MODE = os.environ.get("TEST_MODE", "false").lower() in ("1","true","yes")
 
 API_KEY = os.environ.get("BYBIT_API_KEY")
 API_SECRET = os.environ.get("BYBIT_API_SECRET")
