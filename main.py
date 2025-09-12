@@ -173,28 +173,22 @@ def get_balance_usdt():
         logger.exception("get_wallet_balance error: %s", e)
         raise
 
-    res = out.get("result", {}) or out
+    res = out.get("result", {})
+    if not res:
+        raise RuntimeError(f"Empty result in wallet balance response: {out}")
 
-    # Case 1: Unified Account (list structure)
+    # Unified account → result.list[0].coin[]
     if isinstance(res, dict) and "list" in res:
-        for item in res["list"]:
-            if item.get("coin") == "USDT":
-                for key in ("availableBalance", "walletBalance", "equity"):
-                    if key in item:
-                        try:
-                            return float(item[key])
-                        except Exception:
-                            continue
-
-    # Case 2: Classic Account (dict with "USDT" key)
-    if isinstance(res, dict) and "USDT" in res:
-        u = res["USDT"]
-        for key in ("available_balance", "availableBalance", "walletBalance"):
-            if key in u:
-                try:
-                    return float(u[key])
-                except Exception:
-                    continue
+        for acct in res["list"]:
+            for item in acct.get("coin", []):
+                if item.get("coin") == "USDT":
+                    for key in ("availableToWithdraw", "equity", "walletBalance"):
+                        val = item.get(key)
+                        if val not in (None, "", "null"):
+                            try:
+                                return float(val)
+                            except Exception:
+                                continue
 
     raise RuntimeError(f"Unable to parse wallet balance response: {json.dumps(out)}")
 
