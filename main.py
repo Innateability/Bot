@@ -24,7 +24,7 @@ from datetime import datetime
 from pybit.unified_trading import HTTP
 
 # ---------------- CONFIG ----------------
-SYMBOL = os.environ.get("SYMBOL", "TRXUST")
+SYMBOL = os.environ.get("SYMBOL", "TRXUSDT")
 TIMEFRAME = os.environ.get("TIMEFRAME", "240")  # 4h
 INITIAL_HA_OPEN = float(os.environ.get("INITIAL_HA_OPEN", "0.34756"))
 TICK_SIZE = float(os.environ.get("TICK_SIZE", "0.00001"))
