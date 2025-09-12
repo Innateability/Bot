@@ -26,12 +26,12 @@ from pybit.unified_trading import HTTP
 # ---------------- CONFIG ----------------
 SYMBOL = os.environ.get("SYMBOL", "TRXUSDT")
 TIMEFRAME = os.environ.get("TIMEFRAME", "240")  # 4h
-INITIAL_HA_OPEN = float(os.environ.get("INITIAL_HA_OPEN", "0.34756"))
+INITIAL_HA_OPEN = float(os.environ.get("INITIAL_HA_OPEN", "0.34789"))
 TICK_SIZE = float(os.environ.get("TICK_SIZE", "0.00001"))
 QTY_STEP = float(os.environ.get("QTY_STEP", "1"))
 LEVERAGE = int(os.environ.get("LEVERAGE", "75"))
-RISK_PERCENT = float(os.environ.get("RISK_PERCENT", "0.10"))
-FALLBACK_PERCENT = float(os.environ.get("FALLBACK_PERCENT", "0.90"))
+RISK_PERCENT = float(os.environ.get("RISK_PERCENT", "0.045"))
+FALLBACK_PERCENT = float(os.environ.get("FALLBACK_PERCENT", "0.45"))
 MIN_NEW_ORDER_QTY = float(os.environ.get("MIN_NEW_ORDER_QTY", "16"))
 STATE_FILE = os.environ.get("STATE_FILE", "ha_state.json")
 TRADE_HISTORY_FILE = os.environ.get("TRADE_HISTORY_FILE", "trade_history.json")
