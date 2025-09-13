@@ -26,16 +26,17 @@ from pybit.unified_trading import HTTP
 # ---------------- CONFIG ----------------
 SYMBOL = os.environ.get("SYMBOL", "TRXUSDT")
 TIMEFRAME = os.environ.get("TIMEFRAME", "240")  # 4h
-INITIAL_HA_OPEN = float(os.environ.get("INITIAL_HA_OPEN", "0.34789"))
+INITIAL_HA_OPEN = float(os.environ.get("INITIAL_HA_OPEN", "0.35015"))
 TICK_SIZE = float(os.environ.get("TICK_SIZE", "0.00001"))
 QTY_STEP = float(os.environ.get("QTY_STEP", "1"))
 LEVERAGE = int(os.environ.get("LEVERAGE", "75"))
-RISK_PERCENT = float(os.environ.get("RISK_PERCENT", "0.045"))
-FALLBACK_PERCENT = float(os.environ.get("FALLBACK_PERCENT", "0.45"))
+RISK_PERCENT = float(os.environ.get("RISK_PERCENT", "0.045"))   # 4.5% default
+FALLBACK_PERCENT = float(os.environ.get("FALLBACK_PERCENT", "0.45"))  # 45% default
 MIN_NEW_ORDER_QTY = float(os.environ.get("MIN_NEW_ORDER_QTY", "16"))
+PIP = float(os.environ.get("PIP", "0.00001"))  # 1 pip (adjustable)
 STATE_FILE = os.environ.get("STATE_FILE", "ha_state.json")
 TRADE_HISTORY_FILE = os.environ.get("TRADE_HISTORY_FILE", "trade_history.json")
-TEST_MODE = os.environ.get("TEST_MODE", "false").lower() in ("1","true","yes")
+TEST_MODE = os.environ.get("TEST_MODE", "false").lower() in ("1", "true", "yes")
 
 API_KEY = os.environ.get("BYBIT_API_KEY")
 API_SECRET = os.environ.get("BYBIT_API_SECRET")
@@ -168,23 +169,61 @@ def evaluate_signal(ha_list):
 
 # ---------------- BALANCE & POSITIONS ----------------
 def get_balance_usdt():
-    out = session.get_wallet_balance(accountType=ACCOUNT_TYPE, coin="USDT")
-    res = out.get("result", {})
+    """
+    Robust parsing for Bybit unified response:
+    Example shape observed:
+    { "retCode":0, "result": { "list": [ { ..., "coin": [ { "coin":"USDT", "walletBalance":"0.8833", "equity":"0.8833", ... } ] } ] } }
+    """
+    try:
+        out = session.get_wallet_balance(accountType=ACCOUNT_TYPE, coin="USDT")
+    except Exception as e:
+        logger.exception("get_wallet_balance error: %s", e)
+        raise
+
+    # prefer 'result' from v5 response shape
+    res = out.get("result", {}) if isinstance(out, dict) else {}
     if not res:
         raise RuntimeError(f"Empty result in wallet balance response: {out}")
+
+    # Unified account -> result.list[*].coin[*]
     if isinstance(res, dict) and "list" in res:
         for acct in res["list"]:
-            for item in acct.get("coin", []):
+            coins = acct.get("coin") or []
+            for item in coins:
                 if item.get("coin") == "USDT":
-                    for key in ("availableToWithdraw", "equity", "walletBalance"):
+                    # prefer availableToWithdraw -> equity -> walletBalance -> usdValue
+                    for key in ("availableToWithdraw", "equity", "walletBalance", "usdValue"):
                         val = item.get(key)
                         if val not in (None, "", "null"):
-                            return float(val)
-    raise RuntimeError(f"Unable to parse wallet balance response: {json.dumps(out)}")
+                            try:
+                                return float(val)
+                            except Exception:
+                                continue
+
+    # Fallback: try top-level USDT dict (older shapes)
+    if isinstance(res, dict) and "USDT" in res:
+        u = res["USDT"]
+        for key in ("available_balance", "availableBalance", "walletBalance", "usdValue"):
+            if key in u and u[key] not in (None, "", "null"):
+                try:
+                    return float(u[key])
+                except Exception:
+                    continue
+
+    logger.error("Unable to parse wallet balance response: %s", json.dumps(out))
+    raise RuntimeError("Unable to parse wallet balance response")
 
 def get_open_positions(symbol):
-    out = session.get_positions(category="linear", symbol=symbol)
-    res = out.get("result", {}) or out
+    """
+    Return list of position dicts (may be empty).
+    In hedge mode there may be separate entries for the two sides.
+    """
+    try:
+        out = session.get_positions(category="linear", symbol=symbol)
+    except Exception as e:
+        logger.exception("get_positions error: %s", e)
+        return []
+    res = out.get("result", {}) if isinstance(out, dict) else out
     if isinstance(res, dict) and "list" in res:
         return res["list"]
     return []
@@ -192,51 +231,75 @@ def get_open_positions(symbol):
 # ---------------- ORDER HELPERS ----------------
 def ensure_hedge_and_isolated(symbol):
     try:
-        session.switch_position_mode(category="linear", symbol=symbol, mode=1)  # Hedge
-        logger.info("Hedge mode enabled for %s", symbol)
+        session.switch_position_mode(category="linear", symbol=symbol, mode=1)  # 1 = hedge
+        logger.info("Ensured hedge mode for %s", symbol)
     except Exception as e:
         logger.debug("switch_position_mode ignored: %s", e)
 
+    # NOTE: isolated margin per-symbol might be automatic with unified account settings,
+    # or require additional API calls which vary per account. Keep this as a placeholder.
+    # If you have a specific API call to enforce isolated margin, add it here.
+
 def set_symbol_leverage(symbol, leverage):
-    try:
-        session.set_leverage(category="linear", symbol=symbol,
-                             buyLeverage=leverage, sellLeverage=leverage)
-        logger.info("Set leverage=%sx for %s", leverage, symbol)
-    except Exception as e:
-        logger.warning("set_leverage failed: %s", e)
+    """
+    In hedge mode Bybit requires positionIdx when setting leverage.
+    Try both posIdx 1 and 2 (best-effort).
+    """
+    for pos_idx in (1, 2):
+        try:
+            session.set_leverage(category="linear", symbol=symbol,
+                                 buyLeverage=leverage, sellLeverage=leverage,
+                                 positionIdx=pos_idx)
+            logger.info("Set leverage=%sx for %s (positionIdx=%d)", leverage, symbol, pos_idx)
+        except Exception as e:
+            logger.debug("set_leverage for posIdx=%d failed/ignored: %s", pos_idx, e)
 
 def place_market_with_tp_sl(signal_side, symbol, qty, sl, tp):
+    """
+    Place market order and attach TP/SL in hedge mode using positionIdx=1 for Buy, 2 for Sell.
+    """
     side = "Buy" if signal_side == "Buy" else "Sell"
     positionIdx = 1 if side == "Buy" else 2
     try:
-        session.place_order(
+        # Place market order with positionIdx (required in hedge mode)
+        resp = session.place_order(
             category="linear", symbol=symbol, side=side,
             positionIdx=positionIdx,
             orderType="Market", qty=str(qty),
             timeInForce="ImmediateOrCancel", reduceOnly=False
         )
-        session.set_trading_stop(
+        logger.info("Placed market order: side=%s qty=%s resp=%s", side, qty, resp)
+    except Exception as e:
+        logger.exception("place_order failed: %s", e)
+        return False
+
+    try:
+        # Attach TP/SL with the same positionIdx
+        resp2 = session.set_trading_stop(
             category="linear", symbol=symbol, positionIdx=positionIdx,
             takeProfit=str(round_price(tp)), stopLoss=str(round_price(sl)),
             tpTriggerBy="LastPrice", slTriggerBy="LastPrice"
         )
-        logger.info("Order placed: %s qty=%.8f | SL=%.8f TP=%.8f",
-                    side, qty, sl, tp)
-        return True
+        logger.info("Attached TP=%s SL=%s resp=%s", round_price(tp), round_price(sl), resp2)
     except Exception as e:
-        logger.exception("Order placement failed: %s", e)
-        return False
+        logger.exception("set_trading_stop failed: %s", e)
+
+    return True
 
 # ---------------- QTY ----------------
 def compute_qty(entry, sl, balance):
+    """
+    Compute quantity (base units) using RISK_PERCENT, fallback, leverage and QTY_STEP rounding.
+    """
     risk_usd = balance * RISK_PERCENT
-    per_contract_risk = abs(entry-sl)
+    per_contract_risk = abs(entry - sl)
     if per_contract_risk <= 0:
-        return 0
+        return 0.0
     qty = risk_usd / per_contract_risk
-    est_margin = (qty*entry)/LEVERAGE
+    # estimate margin required and fall back if too large
+    est_margin = (qty * entry) / LEVERAGE
     if est_margin > balance:
-        qty = (balance*FALLBACK_PERCENT*LEVERAGE)/entry
+        qty = (balance * FALLBACK_PERCENT * LEVERAGE) / entry
     return floor_to_step(qty, QTY_STEP)
 
 # ---------------- MAIN ----------------
@@ -244,103 +307,179 @@ def run_once():
     logger.info("=== Running 4h check ===")
     state = load_state()
     persisted_ha_open = state.get("last_ha_open")
-    raw = fetch_candles(SYMBOL, TIMEFRAME, limit=200)
+    try:
+        raw = fetch_candles(SYMBOL, TIMEFRAME, limit=200)
+    except Exception as e:
+        logger.exception("fetch_candles failed: %s", e)
+        return
+
+    if not raw or len(raw) < 2:
+        logger.warning("Not enough candles; skipping")
+        return
 
     # Drop in-progress candle
     period = timeframe_ms()
-    now_ms = int(datetime.utcnow().timestamp()*1000)
+    now_ms = int(datetime.utcnow().timestamp() * 1000)
     if (raw[-1]["ts"] + period) > now_ms + 1000:
+        logger.info("Detected in-progress candle (dropping last returned candle)")
         raw = raw[:-1]
-        logger.info("Dropped in-progress candle")
+        if not raw:
+            logger.warning("No closed candles remain after drop; skipping")
+            return
 
     ha_list = compute_heikin_ashi(raw, persisted_open=persisted_ha_open)
     last_closed = ha_list[-1]
-    prev_closed = ha_list[-2]
+    prev_closed = ha_list[-2] if len(ha_list) >= 2 else None
 
-    # Log last two candles
-    logger.info("Prev RAW %.5f/%.5f/%.5f/%.5f | HA %.5f/%.5f/%.5f/%.5f",
-                prev_closed["raw_open"], prev_closed["raw_high"],
-                prev_closed["raw_low"], prev_closed["raw_close"],
-                prev_closed["ha_open"], prev_closed["ha_high"],
-                prev_closed["ha_low"], prev_closed["ha_close"])
-    logger.info("Last RAW %.5f/%.5f/%.5f/%.5f | HA %.5f/%.5f/%.5f/%.5f",
-                last_closed["raw_open"], last_closed["raw_high"],
-                last_closed["raw_low"], last_closed["raw_close"],
-                last_closed["ha_open"], last_closed["ha_high"],
-                last_closed["ha_low"], last_closed["ha_close"])
+    # Log last two candles (raw + HA)
+    if prev_closed:
+        logger.info("Prev RAW: o/h/l/c = %.8f / %.8f / %.8f / %.8f", prev_closed["raw_open"], prev_closed["raw_high"], prev_closed["raw_low"], prev_closed["raw_close"])
+        logger.info("Prev HA : o/h/l/c = %.8f / %.8f / %.8f / %.8f", prev_closed["ha_open"], prev_closed["ha_high"], prev_closed["ha_low"], prev_closed["ha_close"])
+    logger.info("Last RAW: o/h/l/c = %.8f / %.8f / %.8f / %.8f", last_closed["raw_open"], last_closed["raw_high"], last_closed["raw_low"], last_closed["raw_close"])
+    logger.info("Last HA : o/h/l/c = %.8f / %.8f / %.8f / %.8f", last_closed["ha_open"], last_closed["ha_high"], last_closed["ha_low"], last_closed["ha_close"])
 
-    # Persist next HA open
-    state["last_ha_open"] = (last_closed["ha_open"]+last_closed["ha_close"])/2.0
+    # Persist next HA-open for consistency (used to seed next closed candle if needed)
+    next_ha_open = (last_closed["ha_open"] + last_closed["ha_close"]) / 2.0
+    state["last_ha_open"] = float(next_ha_open)
     save_state(state)
+    logger.info("Persisted next_ha_open = %.8f", next_ha_open)
 
-    # Signal
+    # Evaluate signal based on last closed HA candle
     sig = evaluate_signal(ha_list)
     if not sig:
-        logger.info("No signal detected")
+        logger.info("No signal detected this cycle")
         return
 
-    entry = last_closed["raw_close"]
-    sl = state["last_ha_open"]
-    risk = abs(entry-sl)
-    tp = entry + 2*risk + 0.001*entry if sig["signal"]=="Buy" else entry - 2*risk - 0.001*entry
-    sl, tp = round_price(sl), round_price(tp)
+    # ENTRY = last raw close (closed candle)
+    entry = float(last_closed["raw_close"])
 
-    balance = get_balance_usdt()
+    # SL should be HA low/high of last_closed ± 1 pip (PIP)
+    if sig["signal"] == "Buy":
+        sl_raw = last_closed["ha_low"] - PIP
+        risk = abs(entry - sl_raw)
+        tp_raw = entry + (2.0 * risk) + (0.001 * entry)  # 2:1 RR + 0.1%
+    else:  # Sell
+        sl_raw = last_closed["ha_high"] + PIP
+        risk = abs(entry - sl_raw)
+        tp_raw = entry - (2.0 * risk) - (0.001 * entry)
+
+    sl = round_price(sl_raw)
+    tp = round_price(tp_raw)
+
+    logger.info("Signal=%s | Entry=%.8f | SL=%.8f (raw=%.8f) | TP=%.8f (raw=%.8f) | per-contract risk=%.8f",
+                sig["signal"], entry, sl, sl_raw, tp, tp_raw, risk)
+
+    # Balance & qty
+    try:
+        balance = get_balance_usdt()
+    except Exception as e:
+        logger.exception("Could not fetch balance: %s", e)
+        return
+
+    logger.info("Available USDT balance = %.8f", balance)
     qty = compute_qty(entry, sl, balance)
-    if qty < MIN_NEW_ORDER_QTY: qty = MIN_NEW_ORDER_QTY
-    qty = floor_to_step(qty, QTY_STEP)
+    if qty <= 0:
+        logger.warning("Computed qty <= 0; aborting trade placement")
+        return
 
+    # enforce minimum for NEW trades (16)
+    if qty < MIN_NEW_ORDER_QTY:
+        logger.info("Computed qty %.8f < MIN_NEW_ORDER_QTY %.0f -> using minimum for new order", qty, MIN_NEW_ORDER_QTY)
+        qty = MIN_NEW_ORDER_QTY
+
+    qty = floor_to_step(qty, QTY_STEP)
+    if qty <= 0:
+        logger.warning("Final qty after step rounding <= 0; aborting")
+        return
+
+    # Ensure hedge mode + set leverage
     ensure_hedge_and_isolated(SYMBOL)
     set_symbol_leverage(SYMBOL, LEVERAGE)
 
-    # Check existing positions
+    # Check open positions and decide whether to open
     open_positions = get_open_positions(SYMBOL)
-    side_open = {p["side"]: float(p["size"]) for p in open_positions if float(p.get("size",0))>0}
+    # Build map of open-side -> total size
+    side_open = {}
+    for p in open_positions:
+        try:
+            size = float(p.get("size", 0) or 0)
+        except Exception:
+            size = 0.0
+        side = p.get("side") or p.get("positionSide") or ""
+        if size > 0:
+            side_open[side] = side_open.get(side, 0.0) + size
 
-    if sig["signal"] == "Buy" and side_open.get("Buy",0)>0:
-        logger.info("Buy already open → skip")
-        log_trade("Buy", entry, sl, tp, qty, balance, "skipped_same_side")
-    elif sig["signal"] == "Sell" and side_open.get("Sell",0)>0:
-        logger.info("Sell already open → skip")
-        log_trade("Sell", entry, sl, tp, qty, balance, "skipped_same_side")
+    # Determine if same-side already open (do not duplicate); opposite-side allowed
+    if sig["signal"] == "Buy":
+        # Bybit side names may be "Buy"/"Sell" — check either
+        if side_open.get("Buy", 0) > 0 or side_open.get("LONG", 0) > 0:
+            logger.info("Buy already open -> skipping new buy")
+            log_trade("Buy", entry, sl, tp, qty, balance, status="skipped_same_side")
+            return
     else:
-        success = place_market_with_tp_sl(sig["signal"], SYMBOL, qty, sl, tp)
-        log_trade(sig["signal"], entry, sl, tp, qty, balance,
-                  "placed" if success else "failed")
+        if side_open.get("Sell", 0) > 0 or side_open.get("SHORT", 0) > 0:
+            logger.info("Sell already open -> skipping new sell")
+            log_trade("Sell", entry, sl, tp, qty, balance, status="skipped_same_side")
+            return
+
+    # Place the trade (placed if opposite side exists or no positions)
+    placed = place_market_with_tp_sl(sig["signal"], SYMBOL, qty, sl, tp)
+    log_trade(sig["signal"], entry, sl, tp, qty, balance, status="placed" if placed else "failed")
 
 # ---------------- TEST FUNCTION ----------------
 def test_buy_trade():
     logger.info("=== Running test buy trade ===")
-    balance = get_balance_usdt()
+    try:
+        balance = get_balance_usdt()
+    except Exception as e:
+        logger.exception("Cannot get balance for test: %s", e)
+        return
     logger.info("Balance before test trade: %.8f USDT", balance)
-    entry = 0.348
-    sl = entry - 0.002
-    tp = entry + 0.004
-    qty = 16
+
+    # Use latest closed candle's raw close if available for realistic entry
+    try:
+        candles = fetch_candles(SYMBOL, TIMEFRAME, limit=3)
+        # drop in-progress if present
+        if candles and (candles[-1]["ts"] + timeframe_ms()) > int(datetime.utcnow().timestamp()*1000) + 1000:
+            candles = candles[:-1]
+        entry = candles[-1]["close"] if candles else 0.0
+    except Exception:
+        entry = 0.348  # fallback
+
+    if entry <= 0:
+        entry = 0.348
+
+    sl = entry - PIP * 2  # crude test SL
+    tp = entry + PIP * 4  # crude test TP
+    qty = max(16, floor_to_step(16, QTY_STEP))
+
     ensure_hedge_and_isolated(SYMBOL)
     set_symbol_leverage(SYMBOL, LEVERAGE)
-    place_market_with_tp_sl("Buy", SYMBOL, qty, sl, tp)
+    placed = place_market_with_tp_sl("Buy", SYMBOL, qty, sl, tp)
+    log_trade("Buy", entry, sl, tp, qty, balance, status="test_placed" if placed else "test_failed")
 
 # ---------------- SCHEDULER ----------------
 def wait_until_next_4h():
     now = datetime.utcnow()
-    seconds = now.minute*60 + now.second
+    seconds = now.minute * 60 + now.second
     elapsed_hours = now.hour % 4
-    to_wait = (4 - elapsed_hours)*3600 - seconds
-    if to_wait <= 0: to_wait = 1
-    logger.info("Sleeping %d seconds until next 4h UTC block", to_wait)
+    to_wait = (4 - elapsed_hours) * 3600 - seconds
+    if to_wait <= 0:
+        to_wait = 1
+    logger.info("Sleeping %d seconds until next 4h UTC block (UTC now=%s)", to_wait, now.strftime("%Y-%m-%d %H:%M:%S"))
     time.sleep(to_wait)
 
 # ---------------- ENTRY ----------------
-if __name__=="__main__":
+if __name__ == "__main__":
     logger.info("Starting HA 4h live bot — testnet=%s, symbol=%s", TESTNET, SYMBOL)
     if TEST_MODE:
         test_buy_trade()
     else:
+        # align to next 4h boundary before first run
         wait_until_next_4h()
         while True:
             try:
                 run_once()
-            except Exception as e:
-                logger.exception("run_once failed: %s", e)
+            except Exception:
+                logger.exception("run_once failed")
             wait_until_next_4h()
