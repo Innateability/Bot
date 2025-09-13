@@ -26,7 +26,7 @@ from pybit.unified_trading import HTTP
 # ---------------- CONFIG ----------------
 SYMBOL = os.environ.get("SYMBOL", "TRXUSDT")
 TIMEFRAME = os.environ.get("TIMEFRAME", "240")  # 4h
-INITIAL_HA_OPEN = float(os.environ.get("INITIAL_HA_OPEN", "0.3518"))
+INITIAL_HA_OPEN = float(os.environ.get("INITIAL_HA_OPEN", "0.35043"))
 TICK_SIZE = float(os.environ.get("TICK_SIZE", "0.00001"))
 QTY_STEP = float(os.environ.get("QTY_STEP", "1"))
 LEVERAGE = int(os.environ.get("LEVERAGE", "75"))
@@ -156,18 +156,29 @@ def compute_heikin_ashi(raw_candles, persisted_open=None):
     return ha
 
 # ---------------- SIGNAL ----------------
-def evaluate_signal(ha_list):
-    if len(ha_list) < 2:
-        return None
-    last = ha_list[-1]
-    prev = ha_list[-2]
-    green = last["ha_close"] > last["ha_open"]
-    red = last["ha_close"] < last["ha_open"]
-    if green and last["ha_high"] > prev["ha_high"]:
-        return {"signal": "Buy"}
-    if red and last["ha_low"] < prev["ha_low"]:
-        return {"signal": "Sell"}
-    return None
+def evaluate_signal(prev_ha, last_ha, prev_raw, last_raw, last_seq_low, last_seq_high):
+    """
+    prev_ha: HA candle before the last one
+    last_ha: Last closed HA candle
+    prev_raw: Raw candle before last one
+    last_raw: Last closed raw candle
+    last_seq_low: tracked low of last confirmed red sequence
+    last_seq_high: tracked high of last confirmed green sequence
+    """
+
+    # BUY setup
+    if last_ha["close"] > last_ha["open"]:  # Last candle is GREEN
+        if prev_ha["close"] < prev_ha["open"]:  # Previous candle is RED
+            if prev_raw["low"] > last_seq_low:  # Higher low than last red sequence
+                return "buy", last_raw["low"]
+
+    # SELL setup
+    if last_ha["close"] < last_ha["open"]:  # Last candle is RED
+        if prev_ha["close"] > prev_ha["open"]:  # Previous candle is GREEN
+            if prev_raw["high"] < last_seq_high:  # Lower high than last green sequence
+                return "sell", last_raw["high"]
+
+    return None, None
 
 # ---------------- BALANCE & POSITIONS ----------------
 def get_balance_usdt():
