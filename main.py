@@ -26,12 +26,12 @@ from pybit.unified_trading import HTTP
 # ---------------- CONFIG ----------------
 SYMBOL = os.environ.get("SYMBOL", "TRXUSDT")
 TIMEFRAME = os.environ.get("TIMEFRAME", "240")  # 4h
-INITIAL_HA_OPEN = float(os.environ.get("INITIAL_HA_OPEN", "0.35015"))
+INITIAL_HA_OPEN = float(os.environ.get("INITIAL_HA_OPEN", "0.3515"))
 TICK_SIZE = float(os.environ.get("TICK_SIZE", "0.00001"))
 QTY_STEP = float(os.environ.get("QTY_STEP", "1"))
 LEVERAGE = int(os.environ.get("LEVERAGE", "75"))
-RISK_PERCENT = float(os.environ.get("RISK_PERCENT", "0.045"))   # 4.5% default
-FALLBACK_PERCENT = float(os.environ.get("FALLBACK_PERCENT", "0.45"))  # 45% default
+RISK_PERCENT = float(os.environ.get("RISK_PERCENT", "0.5"))   # 4.5% default
+FALLBACK_PERCENT = float(os.environ.get("FALLBACK_PERCENT", "0.95"))  # 45% default
 MIN_NEW_ORDER_QTY = float(os.environ.get("MIN_NEW_ORDER_QTY", "16"))
 PIP = float(os.environ.get("PIP", "0.00001"))  # 1 pip (adjustable)
 STATE_FILE = os.environ.get("STATE_FILE", "ha_state.json")
@@ -92,7 +92,9 @@ def log_trade(signal, entry, sl, tp, qty, balance, status="pending"):
     })
     save_trade_history(history)
     logger.info("Logged trade: %s %s qty=%.8f entry=%.8f SL=%.8f TP=%.8f balance=%.8f",
-                datetime.utcnow().isoformat(), signal, qty, entry, sl, tp, balance)
+                datetime.utcnow().isoformat(), signal, qty, entry if entry is not None else 0.0,
+                sl if sl is not None else 0.0, tp if tp is not None else 0.0,
+                balance if balance is not None else 0.0)
 
 # ---------------- HELPERS ----------------
 def round_price(p: float) -> float:
@@ -350,6 +352,26 @@ def run_once():
         logger.info("No signal detected this cycle")
         return
 
+    # ---------------- CONFIRMATION FILTER (last 8 closed HA candles) ----------------
+    if len(ha_list) >= 8:
+        recent = ha_list[-8:]
+        green_count = sum(1 for c in recent if c["ha_close"] > c["ha_open"])
+        red_count = sum(1 for c in recent if c["ha_close"] < c["ha_open"])
+        logger.info("Confirmation check (last 8): greens=%d reds=%d", green_count, red_count)
+
+        if sig["signal"] == "Buy" and red_count >= 5:
+            logger.info("Buy signal skipped due to confirmation filter: %d of last 8 were red", red_count)
+            # Log skipped confirmation (no entry/sl/tp/qty known)
+            log_trade("Buy", None, None, None, 0, None, status="skipped_confirmation")
+            return
+
+        if sig["signal"] == "Sell" and green_count >= 5:
+            logger.info("Sell signal skipped due to confirmation filter: %d of last 8 were green", green_count)
+            log_trade("Sell", None, None, None, 0, None, status="skipped_confirmation")
+            return
+    else:
+        logger.info("Not enough candles for confirmation filter (need 8); continuing without confirmation")
+
     # ENTRY = last raw close (closed candle)
     entry = float(last_closed["raw_close"])
 
@@ -483,3 +505,4 @@ if __name__ == "__main__":
             except Exception:
                 logger.exception("run_once failed")
             wait_until_next_4h()
+            
