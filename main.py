@@ -144,8 +144,8 @@ def run_bot():
     c1h = fetch_candles(interval="60")
     c4h = fetch_candles(interval="240")
 
-    ha_1h = heikin_ashi(c1h, initial_open=c1h[0]["open"])  # you can hardcode here
-    ha_4h = heikin_ashi(c4h, initial_open=c4h[0]["open"])  # and here
+    ha_1h = heikin_ashi(c1h, initial_open=0.34779)  # you can hardcode here
+    ha_4h = heikin_ashi(c4h, initial_open=0.34747)  # and here
 
     print(f"First 1H candle: {ha_1h[0]['time']}, HA_open={ha_1h[0]['ha_open']}")
     print(f"First 4H candle: {ha_4h[0]['time']}, HA_open={ha_4h[0]['ha_open']}")
