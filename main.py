@@ -1,9 +1,38 @@
 import requests
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 
-# ==============================
-# Heikin Ashi Conversion
-# ==============================
+# ===== Nigeria Timezone =====
+NIGERIA_TZ = timezone(timedelta(hours=1))  # UTC+1
+
+# ===== Config =====
+PAIR = "TRXUSDT"
+BASE_URL = "https://api.bybit.com"
+
+# Hardcoded initial HA open values (adjust these for consistency with TradingView)
+initial_open_4h = 0.33
+initial_open_1h = 0.35
+
+# Separate balances
+balance_4h = 1000.0
+balance_1h = 1000.0
+
+# ===== Candle Fetch =====
+def fetch_candles(symbol, interval, limit=200):
+    url = f"{BASE_URL}/v5/market/kline"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    res = requests.get(url, params=params).json()
+    candles = []
+    for c in res["result"]["list"][::-1]:  # reverse to oldest → newest
+        candles.append({
+            "time": datetime.fromtimestamp(int(c[0]) / 1000, tz=NIGERIA_TZ),
+            "open": float(c[1]),
+            "high": float(c[2]),
+            "low": float(c[3]),
+            "close": float(c[4])
+        })
+    return candles
+
+# ===== Heikin Ashi =====
 def heikin_ashi(candles, initial_open=None):
     ha_candles = []
     ha_open = initial_open if initial_open is not None else candles[0]["open"]
@@ -11,166 +40,73 @@ def heikin_ashi(candles, initial_open=None):
     for i, c in enumerate(candles):
         ha_close = (c["open"] + c["high"] + c["low"] + c["close"]) / 4
         if i == 0 and initial_open is None:
-            ha_open = c["open"]
+            ha_open = (candles[0]["open"] + candles[0]["close"]) / 2
+            print(f"[INIT] time={c['time']} raw_open={c['open']} raw_close={c['close']} "
+                  f"ha_open={ha_open} ha_close={ha_close}")
         else:
-            ha_open = (ha_open + ha_candles[-1]["ha_close"]) / 2
+            ha_open = (ha_open + ha_close) / 2
+            print(f"[HA] time={c['time']} raw_open={c['open']} raw_close={c['close']} "
+                  f"ha_open={ha_open} ha_close={ha_close}")
 
         ha_high = max(c["high"], ha_open, ha_close)
         ha_low = min(c["low"], ha_open, ha_close)
 
         ha_candles.append({
             "time": c["time"],
-            "open": c["open"], "high": c["high"], "low": c["low"], "close": c["close"],
-            "ha_open": ha_open, "ha_close": ha_close, "ha_high": ha_high, "ha_low": ha_low
+            "ha_open": ha_open,
+            "ha_close": ha_close,
+            "ha_high": ha_high,
+            "ha_low": ha_low,
+            "raw_open": c["open"],
+            "raw_close": c["close"],
+            "raw_high": c["high"],
+            "raw_low": c["low"],
         })
-
     return ha_candles
 
-# ==============================
-# Fetch Candles from Bybit
-# ==============================
-def fetch_candles(symbol="TRXUSDT", interval="60", days=30):
-    url = "https://api.bybit.com/v5/market/kline"
-    limit = days * (24 * 60 // int(interval))  # candles count
-    params = {"category": "linear", "symbol": symbol, "interval": interval, "limit": limit}
-    r = requests.get(url, params=params)
-    data = r.json()["result"]["list"]
-
-    candles = []
-    for row in reversed(data):  # reverse into chronological order
-        ts = datetime.fromtimestamp(int(row[0]) / 1000, tz=timezone.utc).astimezone(
-            timezone(timedelta(hours=1))  # Nigeria time UTC+1
-        )
-        candles.append({
-            "time": ts,
-            "open": float(row[1]), "high": float(row[2]),
-            "low": float(row[3]), "close": float(row[4])
-        })
-    return candles
-
-# ==============================
-# Signal Computation
-# ==============================
-def check_signal(ha_candles):
-    signals = []
-    for i in range(8, len(ha_candles)):
-        last = ha_candles[i]
+# ===== Strategy Signal (simplified) =====
+def check_signals(ha_candles, timeframe, balance):
+    active_trade = None
+    for i in range(2, len(ha_candles)):
         prev = ha_candles[i - 1]
-        recent = ha_candles[i - 8:i]
+        curr = ha_candles[i]
 
-        # Count green/red
-        greens = sum(1 for c in recent if c["ha_close"] > c["ha_open"])
-        reds = 8 - greens
+        # Example: Buy if color flips to green
+        if curr["ha_close"] > curr["ha_open"] and prev["ha_close"] < prev["ha_open"]:
+            print(f"[{timeframe}] Signal: BUY at {curr['time']} (ha_open={curr['ha_open']}, ha_close={curr['ha_close']})")
+            print(f"[{timeframe}] Balance before trade: {balance}")
+            if active_trade:
+                print(f"[{timeframe}] Skipped BUY (active trade exists)")
+            else:
+                active_trade = {"type": "buy", "entry": curr["ha_close"], "sl": curr["ha_low"], "tp": curr["ha_close"] * 1.015}
+                print(f"[{timeframe}] Opened BUY trade: {active_trade}")
 
-        # SELL condition
-        if last["ha_close"] < last["ha_open"] and prev["ha_close"] > prev["ha_open"]:
-            if reds >= 5:
-                sl = max(c["high"] for c in recent if c["ha_close"] > c["ha_open"]) + 0.0001
-                signals.append(("sell", last, prev, sl))
+        # Example: Sell if color flips to red
+        elif curr["ha_close"] < curr["ha_open"] and prev["ha_close"] > prev["ha_open"]:
+            print(f"[{timeframe}] Signal: SELL at {curr['time']} (ha_open={curr['ha_open']}, ha_close={curr['ha_close']})")
+            print(f"[{timeframe}] Balance before trade: {balance}")
+            if active_trade:
+                print(f"[{timeframe}] Skipped SELL (active trade exists)")
+            else:
+                active_trade = {"type": "sell", "entry": curr["ha_close"], "sl": curr["ha_high"], "tp": curr["ha_close"] * 0.985}
+                print(f"[{timeframe}] Opened SELL trade: {active_trade}")
 
-        # BUY condition
-        if last["ha_close"] > last["ha_open"] and prev["ha_close"] < prev["ha_open"]:
-            if greens >= 5:
-                sl = min(c["low"] for c in recent if c["ha_close"] < c["ha_open"]) - 0.0001
-                signals.append(("buy", last, prev, sl))
-
-    return signals
-
-# ==============================
-# Trade Parameters (TP, Risk %)
-# ==============================
-def compute_trade_params(entry, sl, trade_type, timeframe):
-    rr = 1 if timeframe == "1h" else 2
-    risk_pct = 0.1 if timeframe == "1h" else 0.5
-    tp = entry + (entry - sl) * rr if trade_type == "buy" else entry - (sl - entry) * rr
-    tp += entry * 0.001 if trade_type == "buy" else -entry * 0.001
-    return tp, risk_pct
-
-# ==============================
-# Backtest Trades (TP/SL check)
-# ==============================
-def backtest(candles, ha_candles, signals, timeframe):
-    balance = 10
-    trades = []
-    trade_open = False
-
-    for sig in signals:
-        trade_type, last, prev, sl = sig
-        entry = last["close"]
-        tp, risk_pct = compute_trade_params(entry, sl, trade_type, timeframe)
-
-        # LOG the signal candles
-        print(f"\n[{timeframe.upper()} SIGNAL] {trade_type.upper()} at {last['time']}")
-        print(f"Prev RAW o/h/l/c = {prev['open']}/{prev['high']}/{prev['low']}/{prev['close']}")
-        print(f"Prev HA  o/h/l/c = {prev['ha_open']}/{prev['ha_high']}/{prev['ha_low']}/{prev['ha_close']}")
-        print(f"Last RAW o/h/l/c = {last['open']}/{last['high']}/{last['low']}/{last['close']}")
-        print(f"Last HA  o/h/l/c = {last['ha_open']}/{last['ha_high']}/{last['ha_low']}/{last['ha_close']}")
-        print(f"Candidate SL = {sl}, Candidate TP = {tp}, Entry = {entry}")
-        print(f"Balance before trade = {balance}")
-
-        if trade_open:
-            print("⚠️ Trade ignored (already in trade).")
-            continue
-
-        # Open trade
-        qty = balance * risk_pct / abs(entry - sl)
-        trade_open = True
-
-        # Now check future candles
-        start_index = ha_candles.index(last) + 1
-        for j in range(start_index, len(candles)):
-            high, low, tstamp = candles[j]["high"], candles[j]["low"], candles[j]["time"]
-
-            if trade_type == "buy":
-                if low <= sl:
-                    balance -= balance * risk_pct
-                    trades.append((trade_type, last["time"], entry, sl, tp, "SL", balance))
-                    trade_open = False
-                    break
-                elif high >= tp:
-                    balance += balance * risk_pct
-                    trades.append((trade_type, last["time"], entry, sl, tp, "TP", balance))
-                    trade_open = False
-                    break
-
-            if trade_type == "sell":
-                if high >= sl:
-                    balance -= balance * risk_pct
-                    trades.append((trade_type, last["time"], entry, sl, tp, "SL", balance))
-                    trade_open = False
-                    break
-                elif low <= tp:
-                    balance += balance * risk_pct
-                    trades.append((trade_type, last["time"], entry, sl, tp, "TP", balance))
-                    trade_open = False
-                    break
-
-    return trades, balance
-
-# ==============================
-# Run Bot
-# ==============================
+# ===== Runner =====
 def run_bot():
-    # Fetch
-    c1h = fetch_candles(interval="60")
-    c4h = fetch_candles(interval="240")
+    global balance_4h, balance_1h
 
-    # Hardcode initial HA opens if needed
-    ha_1h = heikin_ashi(c1h, initial_open=c1h[0]["open"])
-    ha_4h = heikin_ashi(c4h, initial_open=c4h[0]["open"])
+    c4h = fetch_candles(PAIR, "240", 200)
+    c1h = fetch_candles(PAIR, "60", 200)
 
-    print(f"First 1H candle -> time: {ha_1h[0]['time']}, HA_open: {ha_1h[0]['ha_open']}")
-    print(f"First 4H candle -> time: {ha_4h[0]['time']}, HA_open: {ha_4h[0]['ha_open']}")
+    print(f"\n[4H] First candle time: {c4h[0]['time']}  open={c4h[0]['open']}")
+    print(f"[1H] First candle time: {c1h[0]['time']}  open={c1h[0]['open']}\n")
 
-    signals_1h = check_signal(ha_1h)
-    signals_4h = check_signal(ha_4h)
+    ha_4h = heikin_ashi(c4h, initial_open=initial_open_4h)
+    ha_1h = heikin_ashi(c1h, initial_open=initial_open_1h)
 
-    trades_1h, bal_1h = backtest(c1h, ha_1h, signals_1h, "1h")
-    trades_4h, bal_4h = backtest(c4h, ha_4h, signals_4h, "4h")
+    check_signals(ha_4h, "4H", balance_4h)
+    check_signals(ha_1h, "1H", balance_1h)
 
-    print("\n--- RESULTS ---")
-    print("1H Final Balance:", bal_1h, "Trades:", len(trades_1h))
-    print("4H Final Balance:", bal_4h, "Trades:", len(trades_4h))
 
 if __name__ == "__main__":
     run_bot()
