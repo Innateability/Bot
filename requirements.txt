@@ -1,5 +1,4 @@
-fastapi
-uvicorn
-requests
 pybit
-python-dotenv
+requests
+pytz
+schedule
