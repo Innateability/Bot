@@ -2,8 +2,10 @@ import os
 import time
 import requests
 import schedule
+import threading
 from datetime import datetime, timezone
 from pybit.unified_trading import HTTP
+from flask import Flask
 
 # =========================
 # Config
@@ -12,21 +14,21 @@ API_KEY = os.getenv("BYBIT_API_KEY")
 API_SECRET = os.getenv("BYBIT_API_SECRET")
 SYMBOL = "TRXUSDT"
 INTERVAL = 60   # 1h candles
-LEVERAGE = 20
+LEVERAGE = 75
 
 # Risk settings
 RISK_PERCENT = 0.10
 AFFORDABILITY = 0.95
 
-# Email (SendGrid or SMTP, pick one later)
-EMAIL_USER = os.getenv("EMAIL_USER")
-EMAIL_PASS = os.getenv("EMAIL_PASS")
-EMAIL_TO = os.getenv("EMAIL_TO")
+# Initial HA open (can be set manually)
+INITIAL_OPEN = 0.34696
 
-# =========================
-# Globals
-# =========================
-INITIAL_OPEN = 0.34749  # will store the first HA open
+# Flask app (to keep Render alive)
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "✅ Trading bot is running!"
 
 # =========================
 # Bybit session
@@ -37,7 +39,7 @@ session = HTTP(
     api_secret=API_SECRET
 )
 
-# Ensure one-way mode
+# Force one-way mode
 try:
     session.set_position_mode(symbol=SYMBOL, mode="MergedSingle")
 except Exception as e:
@@ -66,18 +68,15 @@ def fetch_candles(limit=100):
 # Heikin Ashi Conversion
 # =========================
 def heikin_ashi(candles):
-    global INITIAL_OPEN
     ha_candles = []
     for i, c in enumerate(candles):
-        ha_close = (c["open"] + c["high"] + c["low"] + c["close"]) / 4  
-
         if i == 0:
-            ha_open = c["open"]
-            if INITIAL_OPEN is None:
-                INITIAL_OPEN = ha_open  # ✅ store first HA open
+            ha_open = INITIAL_OPEN  # use stored variable
+            ha_close = (c["open"] + c["high"] + c["low"] + c["close"]) / 4
         else:
             prev_ha = ha_candles[-1]
-            ha_open = (prev_ha["open"] + prev_ha["close"]) / 2  
+            ha_open = (prev_ha["open"] + prev_ha["close"]) / 2
+            ha_close = (c["open"] + c["high"] + c["low"] + c["close"]) / 4
 
         ha_high = max(c["high"], ha_open, ha_close)
         ha_low = min(c["low"], ha_open, ha_close)
@@ -89,7 +88,6 @@ def heikin_ashi(candles):
             "low": ha_low,
             "close": ha_close
         })
-
     return ha_candles
 
 # =========================
@@ -128,7 +126,7 @@ def compute_sl_tp(signal, candles):
             sl = signal_candle["low"] - 0.0001
         tp = signal_candle["close"] + (signal_candle["close"] - sl) * 2
         tp += signal_candle["close"] * 0.001
-    else:  # sell
+    else:
         if has_wick:
             sl = prev_candle["high"] + 0.0001
         else:
@@ -151,70 +149,41 @@ def compute_qty(entry, sl, balance):
 # =========================
 # Trade Execution
 # =========================
-def place_trade(signal, entry, sl, tp, qty):
+def place_trade(signal, entry, sl, tp, qty, raw_candle, ha_candle):
     side = "Buy" if signal == "buy" else "Sell"
-
     try:
         session.cancel_all_orders(category="linear", symbol=SYMBOL)
         session.set_leverage(symbol=SYMBOL, buyLeverage=LEVERAGE, sellLeverage=LEVERAGE)
         session.set_trading_stop(symbol=SYMBOL, stopLoss=str(sl), takeProfit=str(tp), category="linear")
         session.place_order(category="linear", symbol=SYMBOL, side=side,
                             orderType="Market", qty=round(qty, 0), timeInForce="GTC", reduceOnly=False)
-        log_trade(signal, entry, sl, tp, qty)
+
+        log_trade(signal, entry, sl, tp, qty, raw_candle, ha_candle)
     except Exception as e:
         print("Trade error:", e)
 
 # =========================
 # Logging
 # =========================
-def log_trade(signal, entry, sl, tp, qty):
+def log_trade(signal, entry, sl, tp, qty, raw_candle, ha_candle):
     with open("trades.log", "a") as f:
-        f.write(f"{datetime.now()} | {signal.upper()} | Entry={entry} SL={sl} TP={tp} QTY={qty}\n")
-
-def log_initial_open():
-    if INITIAL_OPEN is not None:
-        with open("trades.log", "a") as f:
-            f.write(f"{datetime.now()} | INITIAL_HA_OPEN={INITIAL_OPEN}\n")
-        print(f"✅ Initial HA Open logged: {INITIAL_OPEN}")
-
-# =========================
-# Daily Summary
-# =========================
-def send_summary():
-    try:
-        with open("trades.log", "r") as f:
-            trades = f.readlines()
-        today = datetime.now().date()
-        today_trades = [t for t in trades if str(today) in t]
-
-        summary = f"📊 Trade Summary for {today}\n"
-        summary += f"Total Trades: {len(today_trades)}\n"
-        for t in today_trades:
-            summary += t
-
-        print(summary)  # (Later: replace with email send)
-
-    except Exception as e:
-        print("Summary error:", e)
-
-schedule.every().day.at("23:59").do(send_summary)
+        f.write(
+            f"{datetime.now()} | {signal.upper()} | Entry={entry} SL={sl} TP={tp} QTY={qty}\n"
+            f"RAW: O={raw_candle['open']} H={raw_candle['high']} L={raw_candle['low']} C={raw_candle['close']}\n"
+            f"HA : O={ha_candle['open']} H={ha_candle['high']} L={ha_candle['low']} C={ha_candle['close']}\n"
+            f"---\n"
+        )
 
 # =========================
-# Main Loop
+# Main Bot Loop
 # =========================
-def run():
-    global INITIAL_OPEN
+def bot_loop():
     last_range = None
-    balance = 1000  # Simulated balance (replace with API wallet fetch if needed)
+    balance = 1000  # placeholder balance
 
     while True:
         candles = fetch_candles()
         ha_candles = heikin_ashi(candles)
-
-        # log the very first HA open once
-        if INITIAL_OPEN is not None:
-            log_initial_open()
-            INITIAL_OPEN = None  # ensure it logs only once
 
         signal, ratio = check_signal(ha_candles, last_range)
 
@@ -224,13 +193,20 @@ def run():
             qty = compute_qty(entry, sl, balance)
 
             print(f"New Signal: {signal.upper()} | Ratio={ratio:.2f} | Entry={entry} | SL={sl} | TP={tp} | Qty={qty}")
-            place_trade(signal, entry, sl, tp, qty)
+            place_trade(signal, entry, sl, tp, qty, candles[-1], ha_candles[-1])
 
             last_range = signal
 
-        schedule.run_pending()
-        time.sleep(60)  # wait for next check
+        time.sleep(60)
 
+# =========================
+# Run Flask + Bot
+# =========================
 if __name__ == "__main__":
-    run()
+    # Run bot in a separate thread
+    threading.Thread(target=bot_loop, daemon=True).start()
+
+    # Run web service for Render
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
     
