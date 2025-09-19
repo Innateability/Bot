@@ -1,170 +1,236 @@
+import os
+import time
 import requests
-from datetime import datetime, timezone, timedelta
+import schedule
+from datetime import datetime, timezone
+from pybit.unified_trading import HTTP
 
-# ==============================
-# Heikin Ashi Conversion
-# ==============================
-def heikin_ashi(candles, initial_open=None):
-    ha_candles = []
-    ha_open = initial_open if initial_open is not None else candles[0]["open"]
+# =========================
+# Config
+# =========================
+API_KEY = os.getenv("BYBIT_API_KEY")
+API_SECRET = os.getenv("BYBIT_API_SECRET")
+SYMBOL = "TRXUSDT"
+INTERVAL = 60   # 1h candles
+LEVERAGE = 20
 
-    for i, c in enumerate(candles):
-        ha_close = (c["open"] + c["high"] + c["low"] + c["close"]) / 4
-        if i == 0:
-            ha_open_i = ha_open
-        else:
-            ha_open_i = (ha_open_i + ha_candles[-1]["ha_close"]) / 2
-        ha_high = max(c["high"], ha_open_i, ha_close)
-        ha_low = min(c["low"], ha_open_i, ha_close)
+# Risk settings
+RISK_PERCENT = 0.10
+AFFORDABILITY = 0.95
 
-        ha_candles.append({
-            "time": c["time"],
-            "open": c["open"],
-            "high": c["high"],
-            "low": c["low"],
-            "close": c["close"],
-            "ha_open": ha_open_i,
-            "ha_high": ha_high,
-            "ha_low": ha_low,
-            "ha_close": ha_close
-        })
-    return ha_candles
+# Email (SendGrid or SMTP, pick one later)
+EMAIL_USER = os.getenv("EMAIL_USER")
+EMAIL_PASS = os.getenv("EMAIL_PASS")
+EMAIL_TO = os.getenv("EMAIL_TO")
 
-# ==============================
-# Fetch Candles from Bybit
-# ==============================
-def fetch_candles(symbol="TRXUSDT", interval="60", days=30):
+# =========================
+# Globals
+# =========================
+INITIAL_OPEN = 0.34749  # will store the first HA open
+
+# =========================
+# Bybit session
+# =========================
+session = HTTP(
+    testnet=False,
+    api_key=API_KEY,
+    api_secret=API_SECRET
+)
+
+# Ensure one-way mode
+try:
+    session.set_position_mode(symbol=SYMBOL, mode="MergedSingle")
+except Exception as e:
+    print("Position mode setup failed:", e)
+
+# =========================
+# Candle Fetch
+# =========================
+def fetch_candles(limit=100):
     url = "https://api.bybit.com/v5/market/kline"
-    limit = days * (24 * 60 // int(interval))  # approximate candle count
-    params = {"category": "linear", "symbol": symbol, "interval": interval, "limit": limit}
-    r = requests.get(url, params=params)
-    data = r.json()["result"]["list"]
-
+    params = {"category": "linear", "symbol": SYMBOL, "interval": str(INTERVAL), "limit": limit}
+    r = requests.get(url, params=params).json()
+    data = r["result"]["list"]
     candles = []
-    for entry in reversed(data):  # oldest → newest
+    for entry in reversed(data):
         candles.append({
-            "time": datetime.fromtimestamp(int(entry[0]) / 1000, tz=timezone.utc)
-                        .astimezone(timezone(timedelta(hours=1))),  # Lagos time
+            "time": datetime.fromtimestamp(int(entry[0]) / 1000, tz=timezone.utc),
             "open": float(entry[1]),
             "high": float(entry[2]),
             "low": float(entry[3]),
-            "close": float(entry[4]),
+            "close": float(entry[4])
         })
     return candles
 
-# ==============================
-# Run Backtest
-# ==============================
-def run_backtest(ha_candles, timeframe, balance):
-    trades = []
+# =========================
+# Heikin Ashi Conversion
+# =========================
+def heikin_ashi(candles):
+    global INITIAL_OPEN
+    ha_candles = []
+    for i, c in enumerate(candles):
+        ha_close = (c["open"] + c["high"] + c["low"] + c["close"]) / 4  
 
-    for i in range(8, len(ha_candles)):
-        last = ha_candles[i]
-        prev = ha_candles[i - 1]
-        recent = ha_candles[i - 8:i]
-
-        print(f"\n[{timeframe}] Balance before trade check: {balance:.2f}")
-        print(f"[{timeframe}] Candle {last['time']} | RAW O:{last['open']} H:{last['high']} L:{last['low']} C:{last['close']} | HA O:{last['ha_open']} H:{last['ha_high']} L:{last['ha_low']} C:{last['ha_close']}")
-
-        signal = None
-        sl = None
-
-        # SELL condition
-        if last["ha_close"] < last["ha_open"] and prev["ha_close"] > prev["ha_open"]:
-            if sum(1 for c in recent if c["ha_close"] < c["ha_open"]) >= 5:
-                sl = max(c["high"] for c in recent if c["ha_close"] > c["ha_open"]) + 0.0001
-                signal = "sell"
-
-        # BUY condition
-        elif last["ha_close"] > last["ha_open"] and prev["ha_close"] < prev["ha_open"]:
-            if sum(1 for c in recent if c["ha_close"] > c["ha_open"]) >= 5:
-                sl = min(c["low"] for c in recent if c["ha_close"] < c["ha_open"]) - 0.0001
-                signal = "buy"
-
-        if signal and sl:
-            risk_pct = 0.1 if timeframe == "1h" else 0.5
-            if abs((last["close"] - sl) / last["close"]) > 0.05:
-                print(f"[{timeframe}] Signal skipped (SL > 5%) at {last['time']}")
-                continue
-
-            rr = 1 if timeframe == "1h" else 2
-            if signal == "buy":
-                tp = last["close"] + (last["close"] - sl) * rr
-                tp += last["close"] * 0.001
-            else:
-                tp = last["close"] - (sl - last["close"]) * rr
-                tp -= last["close"] * 0.001
-
-            print(f"[{timeframe}] SIGNAL: {signal.upper()} at {last['time']} | Entry={last['close']} SL={sl} TP={tp}")
-
-            entry = last["close"]
-            risk_amount = balance * risk_pct
-            qty = risk_amount / abs(entry - sl)
-
-            # simulate forward until TP/SL
-            outcome = None
-            for j in range(i + 1, len(ha_candles)):
-                c = ha_candles[j]
-                # buy
-                if signal == "buy":
-                    if c["low"] <= sl:
-                        actual_loss = min(risk_amount, risk_amount * ((entry - sl) / abs(entry - sl)))
-                        balance -= actual_loss
-                        outcome = "SL"
-                        print(f"[{timeframe}] SL HIT at {c['time']} | Balance now {balance:.2f}")
-                        break
-                    elif c["high"] >= tp:
-                        actual_gain = risk_amount
-                        balance += actual_gain
-                        outcome = "TP"
-                        print(f"[{timeframe}] TP HIT at {c['time']} | Balance now {balance:.2f}")
-                        break
-                # sell
-                else:
-                    if c["high"] >= sl:
-                        actual_loss = risk_amount
-                        balance -= actual_loss
-                        outcome = "SL"
-                        print(f"[{timeframe}] SL HIT at {c['time']} | Balance now {balance:.2f}")
-                        break
-                    elif c["low"] <= tp:
-                        actual_gain = risk_amount
-                        balance += actual_gain
-                        outcome = "TP"
-                        print(f"[{timeframe}] TP HIT at {c['time']} | Balance now {balance:.2f}")
-                        break
-
-            if outcome:
-                trades.append((signal, last["time"], entry, sl, tp, outcome, balance))
+        if i == 0:
+            ha_open = c["open"]
+            if INITIAL_OPEN is None:
+                INITIAL_OPEN = ha_open  # ✅ store first HA open
         else:
-            print(f"[{timeframe}] No signal at {last['time']}")
+            prev_ha = ha_candles[-1]
+            ha_open = (prev_ha["open"] + prev_ha["close"]) / 2  
 
-    return trades, balance
+        ha_high = max(c["high"], ha_open, ha_close)
+        ha_low = min(c["low"], ha_open, ha_close)
 
-# ==============================
-# Run Bot
-# ==============================
-def run_bot():
-    # fetch both timeframes
-    c1h = fetch_candles(interval="60")
-    c4h = fetch_candles(interval="240")
+        ha_candles.append({
+            "time": c["time"],
+            "open": ha_open,
+            "high": ha_high,
+            "low": ha_low,
+            "close": ha_close
+        })
 
-    # hardcode HA opens
-    ha_1h = heikin_ashi(c1h, initial_open=0.34695)
-    ha_4h = heikin_ashi(c4h, initial_open=0.34779)
+    return ha_candles
 
-    print(f"First 1H candle time: {ha_1h[0]['time']}, HA open: {ha_1h[0]['ha_open']}")
-    print(f"First 4H candle time: {ha_4h[0]['time']}, HA open: {ha_4h[0]['ha_open']}")
+# =========================
+# Strategy: Confirmation Line
+# =========================
+def check_signal(candles, last_range):
+    recent = candles[-8:]
+    greens = sum(1 for c in recent if c["close"] > c["open"])
+    reds = 8 - greens
 
-    balance_1h = 1000
-    balance_4h = 1000
+    ratio = greens / reds if reds > 0 else float("inf")
+    signal = None
 
-    trades_1h, balance_1h = run_backtest(ha_1h, "1h", balance_1h)
-    trades_4h, balance_4h = run_backtest(ha_4h, "4h", balance_4h)
+    if ratio >= 1.67:
+        signal = "buy"
+    elif ratio <= 0.6:
+        signal = "sell"
+    elif 0.95 <= ratio <= 1.05:
+        signal = "sell" if last_range == "buy" else "buy"
 
-    print("\n--- FINAL RESULTS ---")
-    print(f"1H Final Balance: {balance_1h:.2f} | Trades: {len(trades_1h)}")
-    print(f"4H Final Balance: {balance_4h:.2f} | Trades: {len(trades_4h)}")
+    return signal, ratio
+
+# =========================
+# SL & TP Rules
+# =========================
+def compute_sl_tp(signal, candles):
+    signal_candle = candles[-1]
+    prev_candle = candles[-2]
+
+    has_wick = not (signal_candle["high"] == signal_candle["close"] and signal_candle["low"] == signal_candle["close"])
+
+    if signal == "buy":
+        if has_wick:
+            sl = prev_candle["low"] - 0.0001
+        else:
+            sl = signal_candle["low"] - 0.0001
+        tp = signal_candle["close"] + (signal_candle["close"] - sl) * 2
+        tp += signal_candle["close"] * 0.001
+    else:  # sell
+        if has_wick:
+            sl = prev_candle["high"] + 0.0001
+        else:
+            sl = signal_candle["high"] + 0.0001
+        tp = signal_candle["close"] - (sl - signal_candle["close"]) * 2
+        tp -= signal_candle["close"] * 0.001
+
+    return sl, tp
+
+# =========================
+# Position Sizing
+# =========================
+def compute_qty(entry, sl, balance):
+    risk_amount = balance * RISK_PERCENT
+    pip_risk = abs(entry - sl)
+    qty = risk_amount / pip_risk
+    max_qty = balance * AFFORDABILITY / entry
+    return min(qty, max_qty)
+
+# =========================
+# Trade Execution
+# =========================
+def place_trade(signal, entry, sl, tp, qty):
+    side = "Buy" if signal == "buy" else "Sell"
+
+    try:
+        session.cancel_all_orders(category="linear", symbol=SYMBOL)
+        session.set_leverage(symbol=SYMBOL, buyLeverage=LEVERAGE, sellLeverage=LEVERAGE)
+        session.set_trading_stop(symbol=SYMBOL, stopLoss=str(sl), takeProfit=str(tp), category="linear")
+        session.place_order(category="linear", symbol=SYMBOL, side=side,
+                            orderType="Market", qty=round(qty, 0), timeInForce="GTC", reduceOnly=False)
+        log_trade(signal, entry, sl, tp, qty)
+    except Exception as e:
+        print("Trade error:", e)
+
+# =========================
+# Logging
+# =========================
+def log_trade(signal, entry, sl, tp, qty):
+    with open("trades.log", "a") as f:
+        f.write(f"{datetime.now()} | {signal.upper()} | Entry={entry} SL={sl} TP={tp} QTY={qty}\n")
+
+def log_initial_open():
+    if INITIAL_OPEN is not None:
+        with open("trades.log", "a") as f:
+            f.write(f"{datetime.now()} | INITIAL_HA_OPEN={INITIAL_OPEN}\n")
+        print(f"✅ Initial HA Open logged: {INITIAL_OPEN}")
+
+# =========================
+# Daily Summary
+# =========================
+def send_summary():
+    try:
+        with open("trades.log", "r") as f:
+            trades = f.readlines()
+        today = datetime.now().date()
+        today_trades = [t for t in trades if str(today) in t]
+
+        summary = f"📊 Trade Summary for {today}\n"
+        summary += f"Total Trades: {len(today_trades)}\n"
+        for t in today_trades:
+            summary += t
+
+        print(summary)  # (Later: replace with email send)
+
+    except Exception as e:
+        print("Summary error:", e)
+
+schedule.every().day.at("23:59").do(send_summary)
+
+# =========================
+# Main Loop
+# =========================
+def run():
+    global INITIAL_OPEN
+    last_range = None
+    balance = 1000  # Simulated balance (replace with API wallet fetch if needed)
+
+    while True:
+        candles = fetch_candles()
+        ha_candles = heikin_ashi(candles)
+
+        # log the very first HA open once
+        if INITIAL_OPEN is not None:
+            log_initial_open()
+            INITIAL_OPEN = None  # ensure it logs only once
+
+        signal, ratio = check_signal(ha_candles, last_range)
+
+        if signal and signal != last_range:
+            entry = ha_candles[-1]["close"]
+            sl, tp = compute_sl_tp(signal, ha_candles)
+            qty = compute_qty(entry, sl, balance)
+
+            print(f"New Signal: {signal.upper()} | Ratio={ratio:.2f} | Entry={entry} | SL={sl} | TP={tp} | Qty={qty}")
+            place_trade(signal, entry, sl, tp, qty)
+
+            last_range = signal
+
+        schedule.run_pending()
+        time.sleep(60)  # wait for next check
 
 if __name__ == "__main__":
-    run_bot()
+    run()
+    
