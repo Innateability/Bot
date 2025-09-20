@@ -21,7 +21,7 @@ RISK_PERCENT = 0.10
 AFFORDABILITY = 0.95
 
 # Initial HA open (can be set manually)
-INITIAL_OPEN = 0.34696
+INITIAL_OPEN = 0.3473
 
 # Flask app (to keep Render alive)
 app = Flask(__name__)
@@ -39,7 +39,6 @@ session = HTTP(
     api_secret=API_SECRET
 )
 
-# Force one-way mode
 try:
     session.set_position_mode(symbol=SYMBOL, mode="MergedSingle")
 except Exception as e:
@@ -71,7 +70,7 @@ def heikin_ashi(candles):
     ha_candles = []
     for i, c in enumerate(candles):
         if i == 0:
-            ha_open = INITIAL_OPEN  # use stored variable
+            ha_open = INITIAL_OPEN
             ha_close = (c["open"] + c["high"] + c["low"] + c["close"]) / 4
         else:
             prev_ha = ha_candles[-1]
@@ -89,26 +88,6 @@ def heikin_ashi(candles):
             "close": ha_close
         })
     return ha_candles
-
-# =========================
-# Strategy: Confirmation Line
-# =========================
-def check_signal(candles, last_range):
-    recent = candles[-8:]
-    greens = sum(1 for c in recent if c["close"] > c["open"])
-    reds = 8 - greens
-
-    ratio = greens / reds if reds > 0 else float("inf")
-    signal = None
-
-    if ratio >= 1.67:
-        signal = "buy"
-    elif ratio <= 0.6:
-        signal = "sell"
-    elif 0.95 <= ratio <= 1.05:
-        signal = "sell" if last_range == "buy" else "buy"
-
-    return signal, ratio
 
 # =========================
 # SL & TP Rules
@@ -168,45 +147,80 @@ def place_trade(signal, entry, sl, tp, qty, raw_candle, ha_candle):
 def log_trade(signal, entry, sl, tp, qty, raw_candle, ha_candle):
     with open("trades.log", "a") as f:
         f.write(
-            f"{datetime.now()} | {signal.upper()} | Entry={entry} SL={sl} TP={tp} QTY={qty}\n"
+            f"{datetime.now()} | TRADE | {signal.upper()} | Entry={entry} SL={sl} TP={tp} QTY={qty}\n"
+            f"RAW: O={raw_candle['open']} H={raw_candle['high']} L={raw_candle['low']} C={raw_candle['close']}\n"
+            f"HA : O={ha_candle['open']} H={ha_candle['high']} L={ha_candle['low']} C={ha_candle['close']}\n"
+            f"---\n"
+        )
+
+def log_status(ratio, state, raw_candle, ha_candle):
+    with open("status.log", "a") as f:
+        f.write(
+            f"{datetime.now()} | STATUS | Ratio={ratio:.2f} | State={state}\n"
             f"RAW: O={raw_candle['open']} H={raw_candle['high']} L={raw_candle['low']} C={raw_candle['close']}\n"
             f"HA : O={ha_candle['open']} H={ha_candle['high']} L={ha_candle['low']} C={ha_candle['close']}\n"
             f"---\n"
         )
 
 # =========================
-# Main Bot Loop
+# Main Bot Loop with ratio trend tracking
 # =========================
 def bot_loop():
-    last_range = None
+    last_ratio = None
+    last_state = None  # "up" or "down"
     balance = 1000  # placeholder balance
+
+    def hourly_log():
+        candles = fetch_candles()
+        ha_candles = heikin_ashi(candles)
+        ratio = compute_ratio(ha_candles)
+        log_status(ratio, last_state, candles[-1], ha_candles[-1])
+
+    # Schedule hourly logging
+    schedule.every().hour.at(":00").do(hourly_log)
 
     while True:
         candles = fetch_candles()
         ha_candles = heikin_ashi(candles)
 
-        signal, ratio = check_signal(ha_candles, last_range)
+        ratio = compute_ratio(ha_candles)
+        print(f"{datetime.now()} | Ratio={ratio:.2f} | Last Ratio={last_ratio} | State={last_state}")
 
-        if signal and signal != last_range:
-            entry = ha_candles[-1]["close"]
-            sl, tp = compute_sl_tp(signal, ha_candles)
-            qty = compute_qty(entry, sl, balance)
+        if last_ratio is not None:
+            if ratio > last_ratio:  # ratio increased
+                if last_state != "up":
+                    entry = ha_candles[-1]["close"]
+                    sl, tp = compute_sl_tp("buy", ha_candles)
+                    qty = compute_qty(entry, sl, balance)
+                    print(f"📈 Ratio increased → BUY | Entry={entry} | SL={sl} | TP={tp} | Qty={qty}")
+                    place_trade("buy", entry, sl, tp, qty, candles[-1], ha_candles[-1])
+                    last_state = "up"
+            elif ratio < last_ratio:  # ratio decreased
+                if last_state != "down":
+                    entry = ha_candles[-1]["close"]
+                    sl, tp = compute_sl_tp("sell", ha_candles)
+                    qty = compute_qty(entry, sl, balance)
+                    print(f"📉 Ratio decreased → SELL | Entry={entry} | SL={sl} | TP={tp} | Qty={qty}")
+                    place_trade("sell", entry, sl, tp, qty, candles[-1], ha_candles[-1])
+                    last_state = "down"
 
-            print(f"New Signal: {signal.upper()} | Ratio={ratio:.2f} | Entry={entry} | SL={sl} | TP={tp} | Qty={qty}")
-            place_trade(signal, entry, sl, tp, qty, candles[-1], ha_candles[-1])
-
-            last_range = signal
-
+        last_ratio = ratio
+        schedule.run_pending()
         time.sleep(60)
+
+# =========================
+# Helper: Compute Ratio
+# =========================
+def compute_ratio(ha_candles):
+    recent = ha_candles[-8:]
+    greens = sum(1 for c in recent if c["close"] > c["open"])
+    reds = 8 - greens
+    return greens / reds if reds > 0 else float("inf")
 
 # =========================
 # Run Flask + Bot
 # =========================
 if __name__ == "__main__":
-    # Run bot in a separate thread
     threading.Thread(target=bot_loop, daemon=True).start()
-
-    # Run web service for Render
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-    
