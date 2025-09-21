@@ -20,21 +20,21 @@ LEVERAGE = 75
 RISK_PERCENT = 0.10
 AFFORDABILITY = 0.95
 
-# Initial HA open (can be set manually)
-INITIAL_OPEN = 0.34686
+# Initial HA open (set once, can be adjusted manually if needed)
+INITIAL_OPEN = 0.34537
 
-# Flask app (to keep Render alive)
+# Flask app (keeps Railway alive)
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "✅ Trading bot is running!"
+    return "✅ Trading bot is running on Railway!"
 
 # =========================
 # Bybit session
 # =========================
 session = HTTP(
-    testnet=False,
+    testnet=False,  # LIVE not testnet
     api_key=API_KEY,
     api_secret=API_SECRET
 )
@@ -96,20 +96,12 @@ def compute_sl_tp(signal, candles):
     signal_candle = candles[-1]
     prev_candle = candles[-2]
 
-    has_wick = not (signal_candle["high"] == signal_candle["close"] and signal_candle["low"] == signal_candle["close"])
-
     if signal == "buy":
-        if has_wick:
-            sl = prev_candle["low"] - 0.0001
-        else:
-            sl = signal_candle["low"] - 0.0001
+        sl = min(signal_candle["low"], prev_candle["low"]) - 0.0001
         tp = signal_candle["close"] + (signal_candle["close"] - sl) * 2
         tp += signal_candle["close"] * 0.001
     else:
-        if has_wick:
-            sl = prev_candle["high"] + 0.0001
-        else:
-            sl = signal_candle["high"] + 0.0001
+        sl = max(signal_candle["high"], prev_candle["high"]) + 0.0001
         tp = signal_candle["close"] - (sl - signal_candle["close"]) * 2
         tp -= signal_candle["close"] * 0.001
 
@@ -175,7 +167,6 @@ def compute_range(ha_candles):
     elif reds > greens:
         return "sell"
     else:
-        # tie → decided by last candle
         return "buy" if ha_candles[-1]["close"] > ha_candles[-1]["open"] else "sell"
 
 # =========================
@@ -183,7 +174,7 @@ def compute_range(ha_candles):
 # =========================
 def bot_loop():
     last_range = None
-    balance = 1000  # placeholder balance
+    balance = 1000  # TODO: fetch actual account balance via API
 
     def hourly_log():
         candles = fetch_candles()
@@ -196,8 +187,8 @@ def bot_loop():
     while True:
         candles = fetch_candles()
         ha_candles = heikin_ashi(candles)
-
         current_range = compute_range(ha_candles)
+
         print(f"{datetime.now()} | Current Range={current_range} | Last Range={last_range}")
 
         if current_range != last_range:
@@ -218,4 +209,3 @@ if __name__ == "__main__":
     threading.Thread(target=bot_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-    
