@@ -1,7 +1,6 @@
 import os
 import time
 import requests
-import schedule
 from datetime import datetime, timezone
 from pybit.unified_trading import HTTP
 
@@ -25,7 +24,7 @@ INITIAL_OPEN = 0.34537
 # Bybit session
 # =========================
 session = HTTP(
-    testnet=False,  # LIVE not testnet
+    testnet=False,  # LIVE mode
     api_key=API_KEY,
     api_secret=API_SECRET
 )
@@ -99,6 +98,17 @@ def compute_sl_tp(signal, candles):
     return sl, tp
 
 # =========================
+# Fetch Real Balance (Unified Account)
+# =========================
+def fetch_balance():
+    try:
+        res = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+        return float(res["result"]["list"][0]["coin"][0]["walletBalance"])
+    except Exception as e:
+        print("Balance fetch error:", e)
+        return 0
+
+# =========================
 # Position Sizing
 # =========================
 def compute_qty(entry, sl, balance):
@@ -161,38 +171,40 @@ def compute_range(ha_candles):
         return "buy" if ha_candles[-1]["close"] > ha_candles[-1]["open"] else "sell"
 
 # =========================
+# Helper: Wait for next full hour
+# =========================
+def wait_for_next_hour():
+    now = datetime.now()
+    next_hour = (now.replace(minute=0, second=0, microsecond=0) +
+                 timedelta(hours=1))
+    wait_seconds = (next_hour - now).total_seconds()
+    print(f"⏳ Waiting {wait_seconds:.0f}s until next full hour...")
+    time.sleep(wait_seconds)
+
+# =========================
 # Main Bot Loop
 # =========================
 def bot_loop():
     last_range = None
-    balance = 1000  # TODO: fetch actual account balance via API
-
-    def hourly_log():
-        candles = fetch_candles()
-        ha_candles = heikin_ashi(candles)
-        current_range = compute_range(ha_candles)
-        log_status(current_range, candles[-1], ha_candles[-1])
-
-    # Schedule hourly logging
-    schedule.every().hour.at(":00").do(hourly_log)
 
     while True:
+        wait_for_next_hour()
+
         candles = fetch_candles()
         ha_candles = heikin_ashi(candles)
         current_range = compute_range(ha_candles)
 
+        log_status(current_range, candles[-1], ha_candles[-1])
         print(f"{datetime.now()} | Current Range={current_range} | Last Range={last_range}")
 
         if current_range != last_range:
+            balance = fetch_balance()   # ✅ live unified balance
             entry = ha_candles[-1]["close"]
             sl, tp = compute_sl_tp(current_range, ha_candles)
             qty = compute_qty(entry, sl, balance)
             print(f"🔄 New Range → {current_range.upper()} | Entry={entry} | SL={sl} | TP={tp} | Qty={qty}")
             place_trade(current_range, entry, sl, tp, qty, candles[-1], ha_candles[-1])
             last_range = current_range
-
-        schedule.run_pending()
-        time.sleep(60)
 
 # =========================
 # Run Bot
