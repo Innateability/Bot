@@ -2,10 +2,8 @@ import os
 import time
 import requests
 import schedule
-import threading
 from datetime import datetime, timezone
 from pybit.unified_trading import HTTP
-from flask import Flask
 
 # =========================
 # Config
@@ -22,13 +20,6 @@ AFFORDABILITY = 0.95
 
 # Initial HA open (set once, can be adjusted manually if needed)
 INITIAL_OPEN = 0.34537
-
-# Flask app (keeps Railway alive)
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "✅ Trading bot is running on Railway!"
 
 # =========================
 # Bybit session
@@ -182,6 +173,7 @@ def bot_loop():
         current_range = compute_range(ha_candles)
         log_status(current_range, candles[-1], ha_candles[-1])
 
+    # Schedule hourly logging
     schedule.every().hour.at(":00").do(hourly_log)
 
     while True:
@@ -203,9 +195,8 @@ def bot_loop():
         time.sleep(60)
 
 # =========================
-# Run Flask + Bot
+# Run Bot
 # =========================
 if __name__ == "__main__":
-    threading.Thread(target=bot_loop, daemon=True).start()
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    bot_loop()
+    
