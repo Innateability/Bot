@@ -1,7 +1,7 @@
 import os
 import time
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pybit.unified_trading import HTTP
 
 # =========================
@@ -17,22 +17,17 @@ LEVERAGE = 75
 RISK_PERCENT = 0.10
 AFFORDABILITY = 0.95
 
-# Initial HA open (set once, can be adjusted manually if needed)
+# Initial HA open (manual set)
 INITIAL_OPEN = 0.34537
 
 # =========================
-# Bybit session
+# Bybit session (Unified Account)
 # =========================
 session = HTTP(
-    testnet=False,  # LIVE mode
+    testnet=False,
     api_key=API_KEY,
     api_secret=API_SECRET
 )
-
-try:
-    session.set_position_mode(symbol=SYMBOL, mode="MergedSingle")
-except Exception as e:
-    print("Position mode setup failed:", e)
 
 # =========================
 # Candle Fetch
@@ -88,12 +83,12 @@ def compute_sl_tp(signal, candles):
 
     if signal == "buy":
         sl = min(signal_candle["low"], prev_candle["low"]) - 0.0001
-        tp = signal_candle["close"] + (signal_candle["close"] - sl) * 2
-        tp += signal_candle["close"] * 0.001
+        tp = signal_candle["close"] + (signal_candle["close"] - sl) * 1
+        tp += signal_candle["close"] * 0.005  # +0.5%
     else:
         sl = max(signal_candle["high"], prev_candle["high"]) + 0.0001
-        tp = signal_candle["close"] - (sl - signal_candle["close"]) * 2
-        tp -= signal_candle["close"] * 0.001
+        tp = signal_candle["close"] - (sl - signal_candle["close"]) * 1
+        tp -= signal_candle["close"] * 0.005  # -0.5%
 
     return sl, tp
 
@@ -114,9 +109,33 @@ def fetch_balance():
 def compute_qty(entry, sl, balance):
     risk_amount = balance * RISK_PERCENT
     pip_risk = abs(entry - sl)
+    if pip_risk == 0:
+        return 0
     qty = risk_amount / pip_risk
     max_qty = balance * AFFORDABILITY / entry
     return min(qty, max_qty)
+
+# =========================
+# Close Existing Position
+# =========================
+def close_open_position():
+    try:
+        positions = session.get_positions(category="linear", symbol=SYMBOL)["result"]["list"]
+        for pos in positions:
+            if float(pos["size"]) > 0:
+                side = pos["side"]
+                size = pos["size"]
+                session.place_order(
+                    category="linear",
+                    symbol=SYMBOL,
+                    side="Sell" if side == "Buy" else "Buy",
+                    orderType="Market",
+                    qty=size,
+                    reduceOnly=True
+                )
+                print(f"✅ Closed {side} position of size {size}")
+    except Exception as e:
+        print("Close position error:", e)
 
 # =========================
 # Trade Execution
@@ -124,13 +143,23 @@ def compute_qty(entry, sl, balance):
 def place_trade(signal, entry, sl, tp, qty, raw_candle, ha_candle):
     side = "Buy" if signal == "buy" else "Sell"
     try:
+        close_open_position()  # ✅ ensure no opposite trade is left
         session.cancel_all_orders(category="linear", symbol=SYMBOL)
         session.set_leverage(symbol=SYMBOL, buyLeverage=LEVERAGE, sellLeverage=LEVERAGE)
-        session.set_trading_stop(symbol=SYMBOL, stopLoss=str(sl), takeProfit=str(tp), category="linear")
-        session.place_order(category="linear", symbol=SYMBOL, side=side,
-                            orderType="Market", qty=round(qty, 0), timeInForce="GTC", reduceOnly=False)
+        session.place_order(
+            category="linear",
+            symbol=SYMBOL,
+            side=side,
+            orderType="Market",
+            qty=round(qty, 0),
+            timeInForce="GTC",
+            reduceOnly=False,
+            stopLoss=str(sl),
+            takeProfit=str(tp)
+        )
 
         log_trade(signal, entry, sl, tp, qty, raw_candle, ha_candle)
+        print(f"🚀 Opened {side} trade | Entry={entry} | SL={sl} | TP={tp} | Qty={qty}")
     except Exception as e:
         print("Trade error:", e)
 
@@ -198,13 +227,13 @@ def bot_loop():
         print(f"{datetime.now()} | Current Range={current_range} | Last Range={last_range}")
 
         if current_range != last_range:
-            balance = fetch_balance()   # ✅ live unified balance
+            balance = fetch_balance()
             entry = ha_candles[-1]["close"]
             sl, tp = compute_sl_tp(current_range, ha_candles)
             qty = compute_qty(entry, sl, balance)
-            print(f"🔄 New Range → {current_range.upper()} | Entry={entry} | SL={sl} | TP={tp} | Qty={qty}")
-            place_trade(current_range, entry, sl, tp, qty, candles[-1], ha_candles[-1])
-            last_range = current_range
+            if qty > 0:
+                place_trade(current_range, entry, sl, tp, qty, candles[-1], ha_candles[-1])
+                last_range = current_range
 
 # =========================
 # Run Bot
