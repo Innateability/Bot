@@ -21,7 +21,7 @@ RISK_PERCENT = 0.10
 AFFORDABILITY = 0.95
 
 # Initial HA open (can be set manually)
-INITIAL_OPEN = 0.3473
+INITIAL_OPEN = 0.34686
 
 # Flask app (to keep Render alive)
 app = Flask(__name__)
@@ -153,69 +153,63 @@ def log_trade(signal, entry, sl, tp, qty, raw_candle, ha_candle):
             f"---\n"
         )
 
-def log_status(ratio, state, raw_candle, ha_candle):
+def log_status(range_dir, raw_candle, ha_candle):
     with open("status.log", "a") as f:
         f.write(
-            f"{datetime.now()} | STATUS | Ratio={ratio:.2f} | State={state}\n"
+            f"{datetime.now()} | STATUS | Range={range_dir}\n"
             f"RAW: O={raw_candle['open']} H={raw_candle['high']} L={raw_candle['low']} C={raw_candle['close']}\n"
             f"HA : O={ha_candle['open']} H={ha_candle['high']} L={ha_candle['low']} C={ha_candle['close']}\n"
             f"---\n"
         )
 
 # =========================
-# Main Bot Loop with ratio trend tracking
+# Helper: Compute Range
+# =========================
+def compute_range(ha_candles):
+    recent = ha_candles[-8:]
+    greens = sum(1 for c in recent if c["close"] > c["open"])
+    reds = 8 - greens
+
+    if greens > reds:
+        return "buy"
+    elif reds > greens:
+        return "sell"
+    else:
+        # tie → decided by last candle
+        return "buy" if ha_candles[-1]["close"] > ha_candles[-1]["open"] else "sell"
+
+# =========================
+# Main Bot Loop
 # =========================
 def bot_loop():
-    last_ratio = None
-    last_state = None  # "up" or "down"
+    last_range = None
     balance = 1000  # placeholder balance
 
     def hourly_log():
         candles = fetch_candles()
         ha_candles = heikin_ashi(candles)
-        ratio = compute_ratio(ha_candles)
-        log_status(ratio, last_state, candles[-1], ha_candles[-1])
+        current_range = compute_range(ha_candles)
+        log_status(current_range, candles[-1], ha_candles[-1])
 
-    # Schedule hourly logging
     schedule.every().hour.at(":00").do(hourly_log)
 
     while True:
         candles = fetch_candles()
         ha_candles = heikin_ashi(candles)
 
-        ratio = compute_ratio(ha_candles)
-        print(f"{datetime.now()} | Ratio={ratio:.2f} | Last Ratio={last_ratio} | State={last_state}")
+        current_range = compute_range(ha_candles)
+        print(f"{datetime.now()} | Current Range={current_range} | Last Range={last_range}")
 
-        if last_ratio is not None:
-            if ratio > last_ratio:  # ratio increased
-                if last_state != "up":
-                    entry = ha_candles[-1]["close"]
-                    sl, tp = compute_sl_tp("buy", ha_candles)
-                    qty = compute_qty(entry, sl, balance)
-                    print(f"📈 Ratio increased → BUY | Entry={entry} | SL={sl} | TP={tp} | Qty={qty}")
-                    place_trade("buy", entry, sl, tp, qty, candles[-1], ha_candles[-1])
-                    last_state = "up"
-            elif ratio < last_ratio:  # ratio decreased
-                if last_state != "down":
-                    entry = ha_candles[-1]["close"]
-                    sl, tp = compute_sl_tp("sell", ha_candles)
-                    qty = compute_qty(entry, sl, balance)
-                    print(f"📉 Ratio decreased → SELL | Entry={entry} | SL={sl} | TP={tp} | Qty={qty}")
-                    place_trade("sell", entry, sl, tp, qty, candles[-1], ha_candles[-1])
-                    last_state = "down"
+        if current_range != last_range:
+            entry = ha_candles[-1]["close"]
+            sl, tp = compute_sl_tp(current_range, ha_candles)
+            qty = compute_qty(entry, sl, balance)
+            print(f"🔄 New Range → {current_range.upper()} | Entry={entry} | SL={sl} | TP={tp} | Qty={qty}")
+            place_trade(current_range, entry, sl, tp, qty, candles[-1], ha_candles[-1])
+            last_range = current_range
 
-        last_ratio = ratio
         schedule.run_pending()
         time.sleep(60)
-
-# =========================
-# Helper: Compute Ratio
-# =========================
-def compute_ratio(ha_candles):
-    recent = ha_candles[-8:]
-    greens = sum(1 for c in recent if c["close"] > c["open"])
-    reds = 8 - greens
-    return greens / reds if reds > 0 else float("inf")
 
 # =========================
 # Run Flask + Bot
@@ -224,3 +218,4 @@ if __name__ == "__main__":
     threading.Thread(target=bot_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+    
