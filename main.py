@@ -17,14 +17,14 @@ LEVERAGE = 75
 RISK_PERCENT = 0.10
 AFFORDABILITY = 0.95
 
-# Initial HA open (manual set)
-INITIAL_OPEN = 0.34537
+# Initial HA open (set once, can be adjusted manually if needed)
+INITIAL_OPEN = 0.34551
 
 # =========================
 # Bybit session (Unified Account)
 # =========================
 session = HTTP(
-    testnet=False,
+    testnet=False,  # LIVE mode
     api_key=API_KEY,
     api_secret=API_SECRET
 )
@@ -109,33 +109,9 @@ def fetch_balance():
 def compute_qty(entry, sl, balance):
     risk_amount = balance * RISK_PERCENT
     pip_risk = abs(entry - sl)
-    if pip_risk == 0:
-        return 0
     qty = risk_amount / pip_risk
     max_qty = balance * AFFORDABILITY / entry
     return min(qty, max_qty)
-
-# =========================
-# Close Existing Position
-# =========================
-def close_open_position():
-    try:
-        positions = session.get_positions(category="linear", symbol=SYMBOL)["result"]["list"]
-        for pos in positions:
-            if float(pos["size"]) > 0:
-                side = pos["side"]
-                size = pos["size"]
-                session.place_order(
-                    category="linear",
-                    symbol=SYMBOL,
-                    side="Sell" if side == "Buy" else "Buy",
-                    orderType="Market",
-                    qty=size,
-                    reduceOnly=True
-                )
-                print(f"✅ Closed {side} position of size {size}")
-    except Exception as e:
-        print("Close position error:", e)
 
 # =========================
 # Trade Execution
@@ -143,7 +119,6 @@ def close_open_position():
 def place_trade(signal, entry, sl, tp, qty, raw_candle, ha_candle):
     side = "Buy" if signal == "buy" else "Sell"
     try:
-        close_open_position()  # ✅ ensure no opposite trade is left
         session.cancel_all_orders(category="linear", symbol=SYMBOL)
         session.set_leverage(symbol=SYMBOL, buyLeverage=LEVERAGE, sellLeverage=LEVERAGE)
         session.place_order(
@@ -159,7 +134,6 @@ def place_trade(signal, entry, sl, tp, qty, raw_candle, ha_candle):
         )
 
         log_trade(signal, entry, sl, tp, qty, raw_candle, ha_candle)
-        print(f"🚀 Opened {side} trade | Entry={entry} | SL={sl} | TP={tp} | Qty={qty}")
     except Exception as e:
         print("Trade error:", e)
 
@@ -183,6 +157,23 @@ def log_status(range_dir, raw_candle, ha_candle):
             f"HA : O={ha_candle['open']} H={ha_candle['high']} L={ha_candle['low']} C={ha_candle['close']}\n"
             f"---\n"
         )
+
+# =========================
+# Full OHLC Logger
+# =========================
+def log_ohlc(raw_candles, ha_candles, tag="CANDLES"):
+    with open("ohlc.log", "a") as f:
+        f.write(f"{datetime.now()} | {tag} | {len(raw_candles)} candles logged\n")
+        for i in range(len(raw_candles)):
+            rc = raw_candles[i]
+            hc = ha_candles[i]
+            f.write(
+                f"RAW {i}: O={rc['open']:.5f} H={rc['high']:.5f} "
+                f"L={rc['low']:.5f} C={rc['close']:.5f} | "
+                f"HA: O={hc['open']:.5f} H={hc['high']:.5f} "
+                f"L={hc['low']:.5f} C={hc['close']:.5f}\n"
+            )
+        f.write("---\n")
 
 # =========================
 # Helper: Compute Range
@@ -223,17 +214,20 @@ def bot_loop():
         ha_candles = heikin_ashi(candles)
         current_range = compute_range(ha_candles)
 
+        # 🔹 Log all OHLC values every hour
+        log_ohlc(candles, ha_candles, tag="HOURLY_LOG")
+
         log_status(current_range, candles[-1], ha_candles[-1])
         print(f"{datetime.now()} | Current Range={current_range} | Last Range={last_range}")
 
         if current_range != last_range:
-            balance = fetch_balance()
+            balance = fetch_balance()   # ✅ live unified balance
             entry = ha_candles[-1]["close"]
             sl, tp = compute_sl_tp(current_range, ha_candles)
             qty = compute_qty(entry, sl, balance)
-            if qty > 0:
-                place_trade(current_range, entry, sl, tp, qty, candles[-1], ha_candles[-1])
-                last_range = current_range
+            print(f"🔄 New Range → {current_range.upper()} | Entry={entry} | SL={sl} | TP={tp} | Qty={qty}")
+            place_trade(current_range, entry, sl, tp, qty, candles[-1], ha_candles[-1])
+            last_range = current_range
 
 # =========================
 # Run Bot
