@@ -18,7 +18,7 @@ RISK_PERCENT = 0.10
 AFFORDABILITY = 0.95
 
 # Initial HA open (set once, can be adjusted manually if needed)
-INITIAL_OPEN = 0.34551
+INITIAL_OPEN = 0.33555
 
 # =========================
 # Bybit session (Unified Account)
