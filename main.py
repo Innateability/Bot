@@ -1,70 +1,79 @@
 import os
 import time
+import hmac
+import hashlib
 import requests
-from datetime import datetime, timezone, timedelta
-from pybit.unified_trading import HTTP
+from datetime import datetime, timedelta
 
 # =========================
-# Config
+# CONFIG
 # =========================
 API_KEY = os.getenv("BYBIT_API_KEY")
 API_SECRET = os.getenv("BYBIT_API_SECRET")
+BASE_URL = "https://api.bybit.com"
+
 SYMBOL = "TRXUSDT"
-INTERVAL = 60   # 1h candles
-LEVERAGE = 75
-
-# Risk settings
-RISK_PERCENT = 0.10
-AFFORDABILITY = 0.95
-
-# Initial HA open (set once, can be adjusted manually if needed)
-INITIAL_OPEN = 0.33555
+RISK_PERCENT = 0.1
+INITIAL_HA_OPEN = 0.3551  # 👈 Hardcode your initial HA open here
 
 # =========================
-# Bybit session (Unified Account)
+# BYBIT API HELPERS
 # =========================
-session = HTTP(
-    testnet=False,  # LIVE mode
-    api_key=API_KEY,
-    api_secret=API_SECRET
-)
+def send_signed_request(method, endpoint, params=None):
+    if params is None:
+        params = {}
+    timestamp = str(int(time.time() * 1000))
+    params["api_key"] = API_KEY
+    params["timestamp"] = timestamp
+    sorted_params = sorted(params.items())
+    query = "&".join([f"{k}={v}" for k, v in sorted_params])
+    signature = hmac.new(
+        API_SECRET.encode("utf-8"), query.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    params["sign"] = signature
 
-# =========================
-# Candle Fetch
-# =========================
-def fetch_candles(limit=100):
-    url = "https://api.bybit.com/v5/market/kline"
-    params = {"category": "linear", "symbol": SYMBOL, "interval": str(INTERVAL), "limit": limit}
-    r = requests.get(url, params=params).json()
-    data = r["result"]["list"]
+    url = BASE_URL + endpoint
+    if method == "POST":
+        response = requests.post(url, data=params)
+    else:
+        response = requests.get(url, params=params)
+    return response.json()
+
+def fetch_candles():
+    endpoint = "/v5/market/kline"
+    params = {"symbol": SYMBOL, "interval": "60", "limit": 200}
+    r = send_signed_request("GET", endpoint, params)
     candles = []
-    for entry in reversed(data):
+    for c in r["result"]["list"][::-1]:  # reverse to oldest → newest
         candles.append({
-            "time": datetime.fromtimestamp(int(entry[0]) / 1000, tz=timezone.utc),
-            "open": float(entry[1]),
-            "high": float(entry[2]),
-            "low": float(entry[3]),
-            "close": float(entry[4])
+            "time": int(c[0]),
+            "open": float(c[1]),
+            "high": float(c[2]),
+            "low": float(c[3]),
+            "close": float(c[4]),
         })
     return candles
 
+def fetch_balance():
+    endpoint = "/v5/account/wallet-balance"
+    params = {"accountType": "UNIFIED", "coin": "USDT"}
+    r = send_signed_request("GET", endpoint, params)
+    balance = float(r["result"]["list"][0]["coin"][0]["walletBalance"])
+    return balance
+
 # =========================
-# Heikin Ashi Conversion
+# HEIKIN ASHI CONVERSION
 # =========================
-def heikin_ashi(candles):
+def convert_to_heikin_ashi(candles):
     ha_candles = []
     for i, c in enumerate(candles):
+        ha_close = (c["open"] + c["high"] + c["low"] + c["close"]) / 4
         if i == 0:
-            ha_open = INITIAL_OPEN
-            ha_close = (c["open"] + c["high"] + c["low"] + c["close"]) / 4
+            ha_open = INITIAL_HA_OPEN   # 👈 uses hardcoded starting value
         else:
-            prev_ha = ha_candles[-1]
-            ha_open = (prev_ha["open"] + prev_ha["close"]) / 2
-            ha_close = (c["open"] + c["high"] + c["low"] + c["close"]) / 4
-
+            ha_open = (ha_candles[-1]["open"] + ha_candles[-1]["close"]) / 2
         ha_high = max(c["high"], ha_open, ha_close)
         ha_low = min(c["low"], ha_open, ha_close)
-
         ha_candles.append({
             "time": c["time"],
             "open": ha_open,
@@ -75,91 +84,52 @@ def heikin_ashi(candles):
     return ha_candles
 
 # =========================
-# SL & TP Rules
+# STRATEGY LOGIC
 # =========================
-def compute_sl_tp(signal, candles):
-    signal_candle = candles[-1]
-    prev_candle = candles[-2]
-
-    if signal == "buy":
-        sl = min(signal_candle["low"], prev_candle["low"]) - 0.0001
-        tp = signal_candle["close"] + (signal_candle["close"] - sl) * 1
-        tp += signal_candle["close"] * 0.005  # +0.5%
+def compute_range(ha_candles, lookback=8):
+    recent = ha_candles[-lookback:]
+    greens = sum(1 for c in recent if c["close"] > c["open"])
+    reds = lookback - greens
+    if greens > reds:
+        return "buy"
+    elif reds > greens:
+        return "sell"
     else:
-        sl = max(signal_candle["high"], prev_candle["high"]) + 0.0001
-        tp = signal_candle["close"] - (sl - signal_candle["close"]) * 1
-        tp -= signal_candle["close"] * 0.005  # -0.5%
+        return "buy" if ha_candles[-1]["close"] > ha_candles[-1]["open"] else "sell"
 
+def compute_sl_tp(direction, ha_candles):
+    last = ha_candles[-1]
+    prev = ha_candles[-2]
+    if direction == "buy":
+        if last["low"] == last["close"]:  # no wick
+            sl = last["low"]
+        else:
+            sl = prev["low"]
+        rr = (last["close"] - sl)
+        tp = last["close"] + (2 * rr) + (0.001 * last["close"])
+    else:
+        if last["high"] == last["close"]:  # no wick
+            sl = last["high"]
+        else:
+            sl = prev["high"]
+        rr = (sl - last["close"])
+        tp = last["close"] - (2 * rr) - (0.001 * last["close"])
     return sl, tp
 
-# =========================
-# Fetch Real Balance (Unified Account)
-# =========================
-def fetch_balance():
-    try:
-        res = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
-        return float(res["result"]["list"][0]["coin"][0]["walletBalance"])
-    except Exception as e:
-        print("Balance fetch error:", e)
-        return 0
-
-# =========================
-# Position Sizing
-# =========================
 def compute_qty(entry, sl, balance):
     risk_amount = balance * RISK_PERCENT
-    pip_risk = abs(entry - sl)
-    qty = risk_amount / pip_risk
-    max_qty = balance * AFFORDABILITY / entry
-    return min(qty, max_qty)
+    stop_distance = abs(entry - sl)
+    if stop_distance == 0:
+        return 1
+    qty = risk_amount / stop_distance
+    return max(1, int(qty))  # ✅ always at least 1 whole contract
+
+def place_trade(direction, entry, sl, tp, qty, raw_last, ha_last):
+    print(f"🚀 {direction.upper()} order | Entry={entry} SL={sl} TP={tp} Qty={qty}")
+    # Live trading would be placed here – for now we simulate
 
 # =========================
-# Trade Execution
-# =========================
-def place_trade(signal, entry, sl, tp, qty, raw_candle, ha_candle):
-    side = "Buy" if signal == "buy" else "Sell"
-    try:
-        session.cancel_all_orders(category="linear", symbol=SYMBOL)
-        session.set_leverage(symbol=SYMBOL, buyLeverage=LEVERAGE, sellLeverage=LEVERAGE)
-        session.place_order(
-            category="linear",
-            symbol=SYMBOL,
-            side=side,
-            orderType="Market",
-            qty=round(qty, 0),
-            timeInForce="GTC",
-            reduceOnly=False,
-            stopLoss=str(sl),
-            takeProfit=str(tp)
-        )
-
-        log_trade(signal, entry, sl, tp, qty, raw_candle, ha_candle)
-    except Exception as e:
-        print("Trade error:", e)
-
-# =========================
-# Logging
-# =========================
-def log_trade(signal, entry, sl, tp, qty, raw_candle, ha_candle):
-    with open("trades.log", "a") as f:
-        f.write(
-            f"{datetime.now()} | TRADE | {signal.upper()} | Entry={entry} SL={sl} TP={tp} QTY={qty}\n"
-            f"RAW: O={raw_candle['open']} H={raw_candle['high']} L={raw_candle['low']} C={raw_candle['close']}\n"
-            f"HA : O={ha_candle['open']} H={ha_candle['high']} L={ha_candle['low']} C={ha_candle['close']}\n"
-            f"---\n"
-        )
-
-def log_status(range_dir, raw_candle, ha_candle):
-    with open("status.log", "a") as f:
-        f.write(
-            f"{datetime.now()} | STATUS | Range={range_dir}\n"
-            f"RAW: O={raw_candle['open']} H={raw_candle['high']} L={raw_candle['low']} C={raw_candle['close']}\n"
-            f"HA : O={ha_candle['open']} H={ha_candle['high']} L={ha_candle['low']} C={ha_candle['close']}\n"
-            f"---\n"
-        )
-
-# =========================
-# Full OHLC Logger
+# LOGGING
 # =========================
 def log_ohlc(raw_candles, ha_candles, tag="CANDLES"):
     with open("ohlc.log", "a") as f:
@@ -176,62 +146,48 @@ def log_ohlc(raw_candles, ha_candles, tag="CANDLES"):
         f.write("---\n")
 
 # =========================
-# Helper: Compute Range
-# =========================
-def compute_range(ha_candles):
-    recent = ha_candles[-8:]
-    greens = sum(1 for c in recent if c["close"] > c["open"])
-    reds = 8 - greens
-
-    if greens > reds:
-        return "buy"
-    elif reds > greens:
-        return "sell"
-    else:
-        return "buy" if ha_candles[-1]["close"] > ha_candles[-1]["open"] else "sell"
-
-# =========================
-# Helper: Wait for next full hour
+# BOT LOOP
 # =========================
 def wait_for_next_hour():
     now = datetime.now()
-    next_hour = (now.replace(minute=0, second=0, microsecond=0) +
-                 timedelta(hours=1))
-    wait_seconds = (next_hour - now).total_seconds()
-    print(f"⏳ Waiting {wait_seconds:.0f}s until next full hour...")
-    time.sleep(wait_seconds)
+    next_hour = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
+    wait_time = (next_hour - now).total_seconds()
+    print(f"⏳ Waiting {int(wait_time)}s until next full hour...")
+    time.sleep(wait_time)
 
-# =========================
-# Main Bot Loop
-# =========================
 def bot_loop():
     last_range = None
+    first_test_done = False
 
     while True:
         wait_for_next_hour()
-
         candles = fetch_candles()
-        ha_candles = heikin_ashi(candles)
+        ha_candles = convert_to_heikin_ashi(candles)
         current_range = compute_range(ha_candles)
 
-        # 🔹 Log all OHLC values every hour
         log_ohlc(candles, ha_candles, tag="HOURLY_LOG")
 
-        log_status(current_range, candles[-1], ha_candles[-1])
         print(f"{datetime.now()} | Current Range={current_range} | Last Range={last_range}")
 
-        if current_range != last_range:
-            balance = fetch_balance()   # ✅ live unified balance
+        # ✅ Run the one-time 16 contracts test trade
+        if not first_test_done:
+            entry = ha_candles[-1]["close"]
+            sl, tp = compute_sl_tp("sell", ha_candles)
+            qty = 16  # fixed for test
+            place_trade("sell", entry, sl, tp, qty, candles[-1], ha_candles[-1])
+            first_test_done = True
+
+        # ✅ Live trading starts after test
+        elif current_range != last_range:
+            balance = fetch_balance()
             entry = ha_candles[-1]["close"]
             sl, tp = compute_sl_tp(current_range, ha_candles)
             qty = compute_qty(entry, sl, balance)
-            print(f"🔄 New Range → {current_range.upper()} | Entry={entry} | SL={sl} | TP={tp} | Qty={qty}")
             place_trade(current_range, entry, sl, tp, qty, candles[-1], ha_candles[-1])
             last_range = current_range
 
 # =========================
-# Run Bot
+# START
 # =========================
 if __name__ == "__main__":
     bot_loop()
-    
