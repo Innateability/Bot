@@ -1,187 +1,169 @@
 import os
 import time
-import logging
 import math
+import logging
 from datetime import datetime, timezone
 from pybit.unified_trading import HTTP
 
 # ---------------- LOGGING ----------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 logger = logging.getLogger(__name__)
 
-# ---------------- API KEYS ----------------
+# ---------------- CONFIG ----------------
 API_KEY = os.getenv("BYBIT_API_KEY")
 API_SECRET = os.getenv("BYBIT_API_SECRET")
-
-if not API_KEY or not API_SECRET:
-    raise ValueError("❌ API keys not found in environment variables.")
-
-session = HTTP(
-    testnet=False,
-    api_key=API_KEY,
-    api_secret=API_SECRET
-)
-
-# ---------------- SETTINGS ----------------
 SYMBOL = "TRXUSDT"
-RISK = 0.10           # 10% of balance
-FALLBACK = 0.95       # fallback if not enough balance
-INITIAL_HA_OPEN = 0.3460 # <- you must set manually for consistency
-LAST_7_COLORS = "rrggrrg"  # <- example input, update before running
-TIMEFRAME = 60        # 1 hour (minutes)
-LAST_RANGE = None     # persisted trend state
+RISK_PER_TRADE = 0.10  # 10%
+FALLBACK = 0.95
+TP_RR = 2.0
+TP_EXTRA = 0.001  # +0.1%
+INITIAL_HA_OPEN = 0.33961  # 👈 set this manually for consistency with TradingView
 
-# ---------------- HA CALCULATION ----------------
-def heikin_ashi_transform(candles, initial_ha_open):
-    """Convert raw candles to HA candles forward from initial HA open."""
-    ha_candles = []
-    ha_open = initial_ha_open
+session = HTTP(api_key=API_KEY, api_secret=API_SECRET)
 
-    for o, h, l, c, ts in candles:
+last_range = None
+first_logged = False  # ensures first candle log only once
+
+# ---------------- HEIKIN ASHI ----------------
+def heikin_ashi_transform(raw_candles, initial_open):
+    ha = []
+    ha_open = initial_open
+    for o, h, l, c, ts in raw_candles:
         ha_close = (o + h + l + c) / 4
         ha_open = (ha_open + ha_close) / 2
         ha_high = max(h, ha_open, ha_close)
         ha_low = min(l, ha_open, ha_close)
-        ha_candles.append({
-            "ts": ts,
+        ha.append({
+            "ts": datetime.fromtimestamp(ts / 1000, tz=timezone.utc),
             "raw": (o, h, l, c),
             "ha": (ha_open, ha_high, ha_low, ha_close)
         })
+    return ha
 
-    return ha_candles
-
-# ---------------- SIGNAL LOGIC ----------------
+# ---------------- SIGNAL DETECTION ----------------
 def detect_signal(ha_candles):
-    global LAST_RANGE
-    last_8 = ha_candles[-8:]
+    global last_range
 
-    # count red vs green
-    red = sum(1 for c in last_8 if c["ha"][3] < c["ha"][0])
-    green = len(last_8) - red
+    last8 = ha_candles[-8:]
+    colors = ["g" if c["ha"][3] >= c["ha"][0] else "r" for c in last8]
+    greens = colors.count("g")
+    reds = colors.count("r")
+    last_color = colors[-1]
 
-    if red > green:
-        new_range = "sell"
-    elif green > red:
-        new_range = "buy"
+    if greens > reds:
+        current = "buy"
+    elif reds > greens:
+        current = "sell"
     else:
-        last_close = last_8[-1]["ha"][3]
-        last_open = last_8[-1]["ha"][0]
-        new_range = "buy" if last_close > last_open else "sell"
+        current = "buy" if last_color == "g" else "sell"
 
-    if LAST_RANGE != new_range:
-        LAST_RANGE = new_range
-        return new_range
-    return None  # no new signal
+    logger.info("Current Range=%s | Last Range=%s", current, last_range)
 
-# ---------------- WICK-BASED SL ----------------
-def get_stoploss(signal, ha_candles):
-    last = ha_candles[-1]["ha"]
-    prev = ha_candles[-2]["ha"]
+    if current != last_range:
+        last_range = current
+        return current
+    return None
 
-    ha_open, ha_high, ha_low, ha_close = last
-    prev_high, prev_low = ha_candles[-2]["raw"][1], ha_candles[-2]["raw"][2]
-    last_high, last_low = ha_candles[-1]["raw"][1], ha_candles[-1]["raw"][2]
+# ---------------- SL & TP LOGIC ----------------
+def calc_sl_tp(signal, ha_candles):
+    last_raw = ha_candles[-1]["raw"]
+    prev_raw = ha_candles[-2]["raw"]
+    o, h, l, c = last_raw
+    po, ph, pl, pc = prev_raw
 
     if signal == "sell":
-        has_upper_wick = ha_high > max(ha_open, ha_close)
-        return prev_high if has_upper_wick else last_high
+        upper_wick = h > max(o, c)
+        sl = ph if upper_wick else h
+        rr = abs(c - sl)
+        tp = c - rr * TP_RR - (c * TP_EXTRA)
+        return c, sl, tp
 
     elif signal == "buy":
-        has_lower_wick = ha_low < min(ha_open, ha_close)
-        return prev_low if has_lower_wick else last_low
+        lower_wick = l < min(o, c)
+        sl = pl if lower_wick else l
+        rr = abs(sl - c)
+        tp = c + rr * TP_RR + (c * TP_EXTRA)
+        return c, sl, tp
 
-# ---------------- ACCOUNT + ORDER ----------------
-def get_balance():
-    resp = session.get_wallet_balance(accountType="UNIFIED")
-    balance = float(resp["result"]["list"][0]["coin"][0]["equity"])
-    return balance
-
+# ---------------- ORDER ----------------
 def place_trade(signal, ha_candles):
     balance = get_balance()
-    entry = ha_candles[-1]["raw"][3]  # close price
-    sl = get_stoploss(signal, ha_candles)
-    risk_amt = balance * RISK
-
-    # qty = risk / |entry - sl|
-    stop_distance = abs(entry - sl)
-    qty = risk_amt / stop_distance if stop_distance else 0
-    qty = max(0, math.floor(qty * entry))  # approximate qty
-
-    if qty <= 0:
-        logger.warning("⚠️ Qty too small, skipping trade.")
+    if not balance:
         return
+    risk_amount = balance * RISK_PER_TRADE
+    entry, sl, tp = calc_sl_tp(signal, ha_candles)
 
-    # TP = 2 * RR + 0.1%
-    rr = 2
-    tp = entry + (entry - sl) * rr if signal == "buy" else entry - (sl - entry) * rr
-    tp *= 1.001  # add +0.1%
+    # position size
+    qty = risk_amount / abs(entry - sl)
+    qty = math.floor(qty * FALLBACK * 100) / 100  # round down
+
+    logger.info("🚀 %s order | Entry=%s SL=%s TP=%s Qty=%s", signal.upper(), entry, sl, tp, qty)
 
     side = "Buy" if signal == "buy" else "Sell"
-    logger.info("Placing %s trade | entry=%.5f sl=%.5f tp=%.5f qty=%.2f balance=%.2f",
-                side, entry, sl, tp, qty, balance)
-
     try:
-        resp = session.place_order(
+        session.place_order(
             category="linear",
             symbol=SYMBOL,
             side=side,
             orderType="Market",
-            qty=str(qty),
-            timeInForce="IOC",
+            qty=qty,
+            takeProfit=tp,
+            stopLoss=sl,
+            tpTriggerBy="LastPrice",
+            slTriggerBy="LastPrice",
             reduceOnly=False
         )
-        logger.info("✅ Order response: %s", resp)
     except Exception as e:
-        logger.exception("❌ Order placement failed")
+        logger.error("Order error: %s", e)
+
+# ---------------- BALANCE ----------------
+def get_balance():
+    try:
+        resp = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+        return float(resp["result"]["list"][0]["coin"][0]["equity"])
+    except Exception as e:
+        logger.error("Balance fetch error: %s", e)
+        return None
 
 # ---------------- MAIN LOOP ----------------
 def run_once():
+    global first_logged
     now = datetime.now(timezone.utc)
     logger.info("=== Running at %s ===", now.strftime("%Y-%m-%d %H:%M:%S"))
 
     # fetch candles
-    resp = session.get_kline(
-        category="linear",
-        symbol=SYMBOL,
-        interval="60",
-        limit=20
-    )
+    resp = session.get_kline(category="linear", symbol=SYMBOL, interval="60", limit=20)
     raw_candles = [
         (float(x["open"]), float(x["high"]), float(x["low"]), float(x["close"]), int(x["start"]))
         for x in reversed(resp["result"]["list"])
     ]
 
-    # 👉 Log the raw OHLC of the FIRST candle (for INITIAL_HA_OPEN reference)
-    first_candle = raw_candles[0]
-    logger.info("First raw candle used for HA computation: %s", first_candle)
+    # log the first candle once for HA seeding
+    if not first_logged:
+        first_candle = raw_candles[0]
+        logger.info("📌 First raw candle for HA seed: %s", first_candle)
+        first_logged = True
 
-    # build HA candles
+    # build HA
     ha_candles = heikin_ashi_transform(raw_candles, INITIAL_HA_OPEN)
 
-    # log candles
+    # log last 8
     for c in ha_candles[-8:]:
         logger.info("RAW %s | %s | HA %s", c["ts"], c["raw"], c["ha"])
 
-    # detect signal
     signal = detect_signal(ha_candles)
     if signal:
         place_trade(signal, ha_candles)
     else:
         logger.info("No trend change — no trade")
 
-def wait_until_next_hour():
-    now = datetime.now(timezone.utc)
-    to_wait = 3600 - (now.minute * 60 + now.second)
-    logger.info("Sleeping %d seconds until next hour", to_wait)
-    time.sleep(to_wait)
+def main():
+    while True:
+        now = datetime.now(timezone.utc)
+        wait = 3600 - (now.minute * 60 + now.second)
+        logger.info("⏳ Waiting %ss until next full hour...", wait)
+        time.sleep(wait + 1)
+        run_once()
 
 if __name__ == "__main__":
-    while True:
-        try:
-            run_once()
-        except Exception:
-            logger.exception("Error in run_once")
-        wait_until_next_hour()
+    main()
