@@ -13,10 +13,9 @@ TP_EXTRA = 0.001        # +0.1%
 
 INTERVAL = "3"          # Bybit 3-minute candles
 CANDLE_SECONDS = 180    # 3 minutes
-LEVERAGE = 75           # leverage
 
 # Initial HA open (from earliest of last 8 candles)
-INITIAL_HA_OPEN = 0.34024
+INITIAL_HA_OPEN = 0.33985
 ha_open_state = INITIAL_HA_OPEN   # rolling HA open
 
 last_range = None
@@ -64,22 +63,19 @@ def get_balance():
     resp = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
     return float(resp["result"]["list"][0]["coin"][0]["walletBalance"])
 
-def calculate_qty(balance, entry, sl, leverage=LEVERAGE):
-    """Calculate position size with leverage and fallback logic."""
+def calculate_qty(balance, entry, sl):
+    """Calculate position size with fallback (no double leverage issue)."""
     risk_amount = balance * RISK_PER_TRADE
     risk_per_unit = abs(entry - sl)
 
     if risk_per_unit <= 0:
         return 0
 
-    # base qty with leverage
-    qty = (risk_amount / risk_per_unit) * (1 / entry) * leverage
-    qty = int(qty)
+    qty = int(risk_amount / risk_per_unit)
 
-    if qty < 1:
-        # fallback: 95% of balance with leverage
-        fallback_margin = balance * FALLBACK
-        qty = int((fallback_margin * leverage) / entry)
+    if qty < 1 or qty * entry > balance:
+        # fallback = 95% of balance into trade
+        qty = int((balance * FALLBACK) / entry)
 
     return qty
 
@@ -136,10 +132,10 @@ def run_once():
 
     balance = get_balance()
     last = ha_candles[-1]
-    entry = last["ha_close"]
 
     if current_range == "sell":
         sl = raw_candles[-2][1] if has_upper_wick(last) else last["raw"][1]
+        entry = last["ha_close"]
         risk = abs(sl - entry)
         if risk == 0:
             logging.warning("Risk=0, skipping trade.")
@@ -150,6 +146,7 @@ def run_once():
 
     elif current_range == "buy":
         sl = raw_candles[-2][2] if has_lower_wick(last) else last["raw"][2]
+        entry = last["ha_close"]
         risk = abs(entry - sl)
         if risk == 0:
             logging.warning("Risk=0, skipping trade.")
