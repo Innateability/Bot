@@ -15,7 +15,7 @@ INTERVAL = "3"          # Bybit 3-minute
 CANDLE_SECONDS = 180    # 3 minutes in seconds
 
 # Initial HA open (hardcode from TradingView if needed)
-INITIAL_HA_OPEN = 0.34
+INITIAL_HA_OPEN = 0.3398
 
 # State for trend tracking
 last_range = None
