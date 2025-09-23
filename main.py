@@ -15,7 +15,7 @@ INTERVAL = "3"          # Bybit 3-minute candles
 CANDLE_SECONDS = 180    # 3 minutes
 
 # Initial HA open (from earliest of last 8 candles)
-INITIAL_HA_OPEN = 0.33938
+INITIAL_HA_OPEN = 0.33791
 ha_open_state = INITIAL_HA_OPEN   # rolling HA open
 
 last_range = None
@@ -96,6 +96,44 @@ def place_order(side, entry, sl, tp, qty):
     except Exception as e:
         logging.error("Error placing order: %s", e)
 
+# ================== CLOSE ALL POSITIONS ==================
+def close_all_positions():
+    """Close all open positions for the symbol."""
+    positions = session.get_positions(category="linear", symbol=SYMBOL)
+    for p in positions["result"]["list"]:
+        long_size = float(p.get("longSize", 0))
+        short_size = float(p.get("shortSize", 0))
+
+        if long_size > 0:
+            try:
+                session.place_order(
+                    category="linear",
+                    symbol=SYMBOL,
+                    side="Sell",
+                    orderType="Market",
+                    qty=str(long_size),
+                    timeInForce="IOC",
+                    reduceOnly=True
+                )
+                logging.info("Closed existing long position: %s contracts", long_size)
+            except Exception as e:
+                logging.error("Error closing long position: %s", e)
+
+        if short_size > 0:
+            try:
+                session.place_order(
+                    category="linear",
+                    symbol=SYMBOL,
+                    side="Buy",
+                    orderType="Market",
+                    qty=str(short_size),
+                    timeInForce="IOC",
+                    reduceOnly=True
+                )
+                logging.info("Closed existing short position: %s contracts", short_size)
+            except Exception as e:
+                logging.error("Error closing short position: %s", e)
+
 # ================== CORE LOGIC ==================
 def run_once():
     global last_range, ha_open_state
@@ -128,6 +166,9 @@ def run_once():
 
     if current_range == last_range:
         return
+
+    # ✅ Close all positions before opening new trade
+    close_all_positions()
     last_range = current_range
 
     balance = get_balance()
