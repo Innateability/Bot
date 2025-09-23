@@ -13,9 +13,10 @@ TP_EXTRA = 0.001        # +0.1%
 
 INTERVAL = "3"          # Bybit 3-minute candles
 CANDLE_SECONDS = 180    # 3 minutes
+LEVERAGE = 75           # leverage
 
 # Initial HA open (from earliest of last 8 candles)
-INITIAL_HA_OPEN = 0.34037
+INITIAL_HA_OPEN = 0.34024
 ha_open_state = INITIAL_HA_OPEN   # rolling HA open
 
 last_range = None
@@ -63,16 +64,35 @@ def get_balance():
     resp = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
     return float(resp["result"]["list"][0]["coin"][0]["walletBalance"])
 
+def calculate_qty(balance, entry, sl, leverage=LEVERAGE):
+    """Calculate position size with leverage and fallback logic."""
+    risk_amount = balance * RISK_PER_TRADE
+    risk_per_unit = abs(entry - sl)
+
+    if risk_per_unit <= 0:
+        return 0
+
+    # base qty with leverage
+    qty = (risk_amount / risk_per_unit) * (1 / entry) * leverage
+    qty = int(qty)
+
+    if qty < 1:
+        # fallback: 95% of balance with leverage
+        fallback_margin = balance * FALLBACK
+        qty = int((fallback_margin * leverage) / entry)
+
+    return qty
+
 def place_order(side, entry, sl, tp, qty):
     try:
-        logging.info("🚀 %s order | Entry=%.5f SL=%.5f TP=%.5f Qty=%.2f",
+        logging.info("🚀 %s order | Entry=%.5f SL=%.5f TP=%.5f Qty=%d",
                      side.upper(), entry, sl, tp, qty)
         resp = session.place_order(
             category="linear",
             symbol=SYMBOL,
             side=side.capitalize(),
             orderType="Market",
-            qty=str(int(qty)),  # nearest whole number
+            qty=str(qty),
             timeInForce="IOC",
             reduceOnly=False
         )
@@ -115,45 +135,27 @@ def run_once():
     last_range = current_range
 
     balance = get_balance()
-    risk_amount = balance * RISK_PER_TRADE
     last = ha_candles[-1]
+    entry = last["ha_close"]
 
     if current_range == "sell":
         sl = raw_candles[-2][1] if has_upper_wick(last) else last["raw"][1]
-        entry = last["ha_close"]
         risk = abs(sl - entry)
-
         if risk == 0:
             logging.warning("Risk=0, skipping trade.")
             return
-
         tp = entry - (risk * RR) - (entry * TP_EXTRA)
-        qty = risk_amount / risk
-
-        # fallback if unaffordable
-        max_qty = (balance * FALLBACK) / entry
-        if qty * entry > balance:
-            qty = max_qty
-
+        qty = calculate_qty(balance, entry, sl)
         place_order("Sell", entry, sl, tp, qty)
 
     elif current_range == "buy":
         sl = raw_candles[-2][2] if has_lower_wick(last) else last["raw"][2]
-        entry = last["ha_close"]
         risk = abs(entry - sl)
-
         if risk == 0:
             logging.warning("Risk=0, skipping trade.")
             return
-
         tp = entry + (risk * RR) + (entry * TP_EXTRA)
-        qty = risk_amount / risk
-
-        # fallback if unaffordable
-        max_qty = (balance * FALLBACK) / entry
-        if qty * entry > balance:
-            qty = max_qty
-
+        qty = calculate_qty(balance, entry, sl)
         place_order("Buy", entry, sl, tp, qty)
 
 # ================== MAIN LOOP ==================
@@ -170,3 +172,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
