@@ -15,7 +15,7 @@ INTERVAL = "3"          # Bybit 3-minute candles
 CANDLE_SECONDS = 180    # 3 minutes
 
 # Initial HA open (from earliest of last 8 candles)
-INITIAL_HA_OPEN = 0.33939
+INITIAL_HA_OPEN = 0.33938
 ha_open_state = INITIAL_HA_OPEN   # rolling HA open
 
 last_range = None
@@ -71,13 +71,13 @@ def calculate_qty(balance, entry, sl):
     if risk_per_unit <= 0:
         return 0
 
-    qty = int(risk_amount / risk_per_unit)
+    qty = int(risk_amount / risk_per_unit * 75)
 
     if qty < 1 or qty * entry > balance:
         # fallback = 95% of balance into trade
-        qty = int((balance * FALLBACK) / entry)
+        qty = int((balance * FALLBACK) / entry * 75)
 
-    return qty * 75
+    return qty 
 
 def place_order(side, entry, sl, tp, qty):
     try:
