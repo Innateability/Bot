@@ -77,7 +77,7 @@ def calculate_qty(balance, entry, sl):
         # fallback = 95% of balance into trade
         qty = int((balance * FALLBACK) / entry)
 
-    return qty
+    return qty * 75
 
 def place_order(side, entry, sl, tp, qty):
     try:
