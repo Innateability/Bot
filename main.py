@@ -15,7 +15,7 @@ INTERVAL = "3"          # Bybit 3-minute candles
 CANDLE_SECONDS = 180    # 3 minutes
 
 # Initial HA open (from earliest of last 8 candles)
-INITIAL_HA_OPEN = 0.33976
+INITIAL_HA_OPEN = 0.34037
 ha_open_state = INITIAL_HA_OPEN   # rolling HA open
 
 last_range = None
@@ -170,4 +170,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
