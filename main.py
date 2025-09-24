@@ -10,22 +10,18 @@ RISK_PER_TRADE = 0.10   # 10% of balance
 FALLBACK = 0.95         # fallback % if qty unaffordable
 LEVERAGE = 75
 INTERVAL = "3"          # 3m candles
-CANDLE_SECONDS = 180    # 3 minutes in seconds
+CANDLE_SECONDS = 180    # 3 minutes
 WINDOW = 8              # rolling HA candle window
-INITIAL_HA_OPEN = 0.33784 # manually set
+INITIAL_HA_OPEN = 0.3378 # manually set
 ROUNDING = 5
 
 # ================== API KEYS ==================
 API_KEY = os.getenv("BYBIT_API_KEY")
 API_SECRET = os.getenv("BYBIT_API_SECRET")
-
 session = HTTP(testnet=False, api_key=API_KEY, api_secret=API_SECRET)
 
 # ================== LOGGING ==================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 
 # ================== GLOBAL STATE ==================
 ha_candles = []
@@ -46,19 +42,16 @@ def fetch_candles(limit=WINDOW):
     return candles
 
 def build_initial_ha():
-    """Build the initial 8 HA candles using manually set INITIAL_HA_OPEN as the oldest candle's HA Open."""
+    """Build initial 8 HA candles using pasted INITIAL_HA_OPEN for oldest candle."""
     global ha_candles, ha_open_state, initial_ha_open_time
-
     raw_candles = fetch_candles(limit=WINDOW)
     ha_candles = []
 
     for i, c in enumerate(raw_candles):
         ha_close = (c["o"] + c["h"] + c["l"] + c["c"]) / 4
         if i == 0:
-            # Oldest candle uses your pasted INITIAL_HA_OPEN
             ha_open_candle = INITIAL_HA_OPEN
         else:
-            # Subsequent candles use previous HA candle
             ha_open_candle = (ha_candles[-1]["ha"]["o"] + ha_candles[-1]["ha"]["c"]) / 2
 
         ha_high = max(c["h"], ha_open_candle, ha_close)
@@ -90,7 +83,6 @@ def get_balance():
     return float(resp["result"]["list"][0]["coin"][0]["walletBalance"])
 
 def calc_qty(balance, entry, risk, risk_amount):
-    """Calculate leveraged quantity, fallback if necessary, minus 1."""
     qty = (risk_amount * LEVERAGE) / (risk * entry)
     max_qty = (balance * FALLBACK * LEVERAGE) / entry
     if qty * entry / LEVERAGE > balance:
@@ -117,10 +109,10 @@ def place_order(side, entry, sl, tp, qty):
         logging.error("Error placing order: %s", e)
 
 def process_new_candle_rolling():
-    """Process the newly closed candle, update HA list, compute signal, place orders."""
+    """Process just closed candle, compute signal, SL/TP, execute order, then update rolling HA list."""
     global ha_candles, ha_open_state, last_signal
 
-    raw_candle = fetch_candles(limit=1)[0]
+    raw_candle = fetch_candles(limit=2)[-1]  # last closed candle
     ts, raw_o, raw_h, raw_l, raw_c = map(float, [raw_candle["time"], raw_candle["o"], raw_candle["h"], raw_candle["l"], raw_candle["c"]])
 
     ha_close = (raw_o + raw_h + raw_l + raw_c) / 4
@@ -136,14 +128,9 @@ def process_new_candle_rolling():
         "color": color
     }
 
-    # Update rolling list
-    ha_candles.append(candle)
-    if len(ha_candles) > WINDOW:
-        ha_candles.pop(0)
-    ha_open_state = ha_open
+    # Log and use for signal first
     log_candle(candle)
 
-    # Determine signal
     green = sum(1 for c in ha_candles if c["color"] == "green")
     red   = sum(1 for c in ha_candles if c["color"] == "red")
 
@@ -152,7 +139,7 @@ def process_new_candle_rolling():
     elif red > green:
         signal = "sell"
     else:
-        signal = "buy" if ha_candles[-1]["ha"]["c"] > ha_candles[-1]["ha"]["o"] else "sell"
+        signal = "buy" if candle["ha"]["c"] > candle["ha"]["o"] else "sell"
 
     logging.info(f"Signal={signal} | Last Signal={last_signal}")
 
@@ -160,33 +147,38 @@ def process_new_candle_rolling():
         last_signal = signal
         balance = get_balance()
         risk_amount = balance * RISK_PER_TRADE
-        entry = ha_candles[-1]["ha"]["c"]
-        last = ha_candles[-1]
-        prev = ha_candles[-2] if len(ha_candles) > 1 else last
+        entry = candle["ha"]["c"]
+        prev = ha_candles[-1] if ha_candles else candle
 
-        # ----------------- BUY -----------------
+        # BUY
         if signal == "buy":
-            if last['ha']['l'] < min(last['ha']['o'], last['ha']['c']):
+            if candle['ha']['l'] < min(candle['ha']['o'], candle['ha']['c']):
                 sl = prev['ha']['l'] - 0.0001
             else:
-                sl = last['ha']['l'] - 0.0001
+                sl = candle['ha']['l'] - 0.0001
             risk = entry - sl
             tp = entry + (2 * risk) + (entry * 0.001)
             qty = calc_qty(balance, entry, risk, risk_amount)
             if qty > 0:
                 place_order("Buy", entry, sl, tp, qty)
 
-        # ----------------- SELL -----------------
+        # SELL
         elif signal == "sell":
-            if last['ha']['h'] > max(last['ha']['o'], last['ha']['c']):
+            if candle['ha']['h'] > max(candle['ha']['o'], candle['ha']['c']):
                 sl = prev['ha']['h'] + 0.0001
             else:
-                sl = last['ha']['h'] + 0.0001
+                sl = candle['ha']['h'] + 0.0001
             risk = sl - entry
             tp = entry - (2 * risk) - (entry * 0.001)
             qty = calc_qty(balance, entry, risk, risk_amount)
             if qty > 0:
                 place_order("Sell", entry, sl, tp, qty)
+
+    # Update rolling list AFTER using for signals/orders
+    ha_candles.append(candle)
+    if len(ha_candles) > WINDOW:
+        ha_candles.pop(0)
+    ha_open_state = ha_open
 
 # ================== MAIN LOOP ==================
 def main():
