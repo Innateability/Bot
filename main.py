@@ -16,7 +16,7 @@ CANDLE_SECONDS = 180    # 3 minutes
 PIP = 0.0001            # 1 pip adjustment
 
 # Initial HA open (used only on the first run)
-INITIAL_HA_OPEN = 0.33743
+INITIAL_HA_OPEN = 0.33732
 ha_open_state = INITIAL_HA_OPEN   # rolling HA open
 first_run = True
 
