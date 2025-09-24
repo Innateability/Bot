@@ -12,7 +12,7 @@ LEVERAGE = 75
 INTERVAL = "3"          # 3m candles
 CANDLE_SECONDS = 180    # 3 minutes in seconds
 WINDOW = 8              # rolling HA candle window
-INITIAL_HA_OPEN = 0.33801  # manually set
+INITIAL_HA_OPEN = 0.338 # manually set
 ROUNDING = 5
 
 # ================== API KEYS ==================
@@ -46,23 +46,29 @@ def fetch_candles(limit=WINDOW):
     return candles
 
 def build_initial_ha():
-    """Build the initial HA candles using manually set INITIAL_HA_OPEN."""
+    """Build the initial 8 HA candles using manually set INITIAL_HA_OPEN as the oldest candle's HA Open."""
     global ha_candles, ha_open_state, initial_ha_open_time
 
     raw_candles = fetch_candles(limit=WINDOW)
-    ha_open = INITIAL_HA_OPEN
     ha_candles = []
 
-    for c in raw_candles:
+    for i, c in enumerate(raw_candles):
         ha_close = (c["o"] + c["h"] + c["l"] + c["c"]) / 4
-        ha_open = (ha_open + ha_close) / 2
-        ha_high = max(c["h"], ha_open, ha_close)
-        ha_low = min(c["l"], ha_open, ha_close)
+        if i == 0:
+            # Oldest candle uses your pasted INITIAL_HA_OPEN
+            ha_open_candle = INITIAL_HA_OPEN
+        else:
+            # Subsequent candles use previous HA candle
+            ha_open_candle = (ha_candles[-1]["ha"]["o"] + ha_candles[-1]["ha"]["c"]) / 2
+
+        ha_high = max(c["h"], ha_open_candle, ha_close)
+        ha_low  = min(c["l"], ha_open_candle, ha_close)
+
         candle = {
             "time": datetime.fromtimestamp(c["time"]/1000),
             "raw": {"o": c["o"], "h": c["h"], "l": c["l"], "c": c["c"]},
-            "ha": {"o": ha_open, "h": ha_high, "l": ha_low, "c": ha_close},
-            "color": "green" if ha_close >= ha_open else "red"
+            "ha": {"o": ha_open_candle, "h": ha_high, "l": ha_low, "c": ha_close},
+            "color": "green" if ha_close >= ha_open_candle else "red"
         }
         ha_candles.append(candle)
 
