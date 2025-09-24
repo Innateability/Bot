@@ -12,7 +12,7 @@ LEVERAGE = 75
 INTERVAL = "3"          # 3m candles
 CANDLE_SECONDS = 180    # 3 minutes
 WINDOW = 8              # rolling HA candle window
-INITIAL_HA_OPEN = 0.33849  # manually set
+INITIAL_HA_OPEN = 0.3382  # manually set
 ROUNDING = 5
 
 # ================== API KEYS ==================
@@ -25,7 +25,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 
 # ================== GLOBAL STATE ==================
 ha_candles = []
-ha_open_state = INITIAL_HA_OPEN
 last_signal = None
 initial_ha_open_time = None
 
@@ -44,7 +43,7 @@ def fetch_candles(limit=WINDOW+1):
 
 def build_initial_ha():
     """Build initial 8 HA candles using pasted INITIAL_HA_OPEN for oldest candle."""
-    global ha_candles, ha_open_state, initial_ha_open_time
+    global ha_candles, initial_ha_open_time
     raw_candles = fetch_candles(limit=WINDOW)
     ha_candles = []
 
@@ -53,7 +52,8 @@ def build_initial_ha():
         if i == 0:
             ha_open_candle = INITIAL_HA_OPEN
         else:
-            ha_open_candle = (ha_candles[-1]["ha"]["o"] + ha_candles[-1]["ha"]["c"]) / 2
+            prev = ha_candles[-1]["ha"]
+            ha_open_candle = (prev["o"] + prev["c"]) / 2
 
         ha_high = max(c["h"], ha_open_candle, ha_close)
         ha_low  = min(c["l"], ha_open_candle, ha_close)
@@ -66,7 +66,6 @@ def build_initial_ha():
         }
         ha_candles.append(candle)
 
-    ha_open_state = ha_candles[-1]["ha"]["o"]
     initial_ha_open_time = ha_candles[0]["time"]
     logging.info(f"Initial HA Open set to {INITIAL_HA_OPEN} at {initial_ha_open_time}")
 
@@ -111,14 +110,15 @@ def place_order(side, entry, sl, tp, qty):
 
 def process_new_candle_rolling():
     """Process just closed candle, compute signal, SL/TP, execute order, then update rolling HA list."""
-    global ha_candles, ha_open_state, last_signal
+    global ha_candles, last_signal
 
     raw_candles = fetch_candles(limit=2)
     raw_candle = raw_candles[0]  # second-to-last = last fully closed
     ts, raw_o, raw_h, raw_l, raw_c = map(float, [raw_candle["time"], raw_candle["o"], raw_candle["h"], raw_candle["l"], raw_candle["c"]])
 
     ha_close = (raw_o + raw_h + raw_l + raw_c) / 4
-    ha_open = (ha_open_state + ha_close) / 2
+    prev_ha = ha_candles[-1]["ha"]
+    ha_open = (prev_ha["o"] + prev_ha["c"]) / 2
     ha_high = max(raw_h, ha_open, ha_close)
     ha_low = min(raw_l, ha_open, ha_close)
     color = "green" if ha_close >= ha_open else "red"
@@ -130,9 +130,9 @@ def process_new_candle_rolling():
         "color": color
     }
 
-    # Log and use for signal first
     log_candle(candle)
 
+    # Determine signal
     green = sum(1 for c in ha_candles if c["color"] == "green")
     red   = sum(1 for c in ha_candles if c["color"] == "red")
 
@@ -150,7 +150,7 @@ def process_new_candle_rolling():
         balance = get_balance()
         risk_amount = balance * RISK_PER_TRADE
         entry = candle["ha"]["c"]
-        prev = ha_candles[-1] if ha_candles else candle
+        prev = ha_candles[-1]
 
         # BUY
         if signal == "buy":
@@ -176,11 +176,10 @@ def process_new_candle_rolling():
             if qty > 0:
                 place_order("Sell", entry, sl, tp, qty)
 
-    # Update rolling list AFTER using for signals/orders
+    # Update rolling HA list
     ha_candles.append(candle)
     if len(ha_candles) > WINDOW:
         ha_candles.pop(0)
-    ha_open_state = ha_open
 
 # ================== MAIN LOOP ==================
 def main():
