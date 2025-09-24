@@ -15,7 +15,8 @@ INTERVAL = "3"          # Bybit 3-minute candles
 CANDLE_SECONDS = 180
 PIP = 0.0001
 
-INITIAL_HA_OPEN = 0.33785
+INITIAL_HA_OPEN = 0.3378
+
 ha_open_state = INITIAL_HA_OPEN
 first_run = True
 
