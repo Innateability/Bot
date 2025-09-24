@@ -7,16 +7,18 @@ from pybit.unified_trading import HTTP
 # ================== CONFIG ==================
 SYMBOL = "TRXUSDT"
 RISK_PER_TRADE = 0.10   # 10% of balance
-FALLBACK = 0.95         # fallback = 95% of balance if 10% risk is unaffordable
+FALLBACK = 0.95         # fallback = 95% of balance if risk trade not affordable
 RR = 2.0                # 2:1 RR
 TP_EXTRA = 0.001        # +0.1%
 
 INTERVAL = "3"          # Bybit 3-minute candles
 CANDLE_SECONDS = 180    # 3 minutes
+PIP = 0.0001            # 1 pip adjustment
 
-# Initial HA open (from earliest of last 8 candles)
-INITIAL_HA_OPEN = 0.33755
+# Initial HA open (used only on the first run)
+INITIAL_HA_OPEN = 0.33743
 ha_open_state = INITIAL_HA_OPEN   # rolling HA open
+first_run = True
 
 last_range = None
 
@@ -64,57 +66,25 @@ def get_balance():
     return float(resp["result"]["list"][0]["coin"][0]["walletBalance"])
 
 def calculate_qty(balance, entry, sl):
-    """Calculate position size with leverage and fallback."""
+    """Calculate position size with fallback (no double leverage issue)."""
     risk_amount = balance * RISK_PER_TRADE
     risk_per_unit = abs(entry - sl)
 
     if risk_per_unit <= 0:
         return 0
 
-    qty = int(risk_amount / risk_per_unit * 75) # leverage applied
-    qty -= 1
+    qty = int(risk_amount / risk_per_unit * 75) - 1  # leverage * minus 1
 
-    if qty < 1 or qty * entry > balance * 75:
-        # fallback = 95% of balance into trade with leverage
-        qty = int((balance * FALLBACK) / entry * 75)
-        qty -= 1
+    if qty < 1 or qty * entry > balance:
+        qty = int((balance * FALLBACK) / entry * 75) - 1
 
-    return qty 
-
-def close_all_positions():
-    """Close all open positions for the symbol."""
-    try:
-        pos = session.get_positions(category="linear", symbol=SYMBOL)
-        if "result" not in pos or "list" not in pos["result"]:
-            logging.warning("No positions found in response: %s", pos)
-            return
-
-        for p in pos["result"]["list"]:
-            size = float(p.get("size", 0))
-            side = p.get("side", "")
-            if size > 0:
-                # If long → close with Sell, if short → close with Buy
-                closing_side = "Sell" if side.lower() == "buy" else "Buy"
-                logging.info("⚠️ Closing %s position | Size=%.2f", side, size)
-                resp = session.place_order(
-                    category="linear",
-                    symbol=SYMBOL,
-                    side=closing_side,
-                    orderType="Market",
-                    qty=str(int(size)),
-                    timeInForce="IOC",
-                    reduceOnly=True
-                )
-                logging.info("Close response: %s", resp)
-    except Exception as e:
-        logging.error("Error closing positions: %s", e)
+    return max(qty, 1)
 
 def place_order(side, entry, sl, tp, qty):
     try:
         logging.info("🚀 %s order | Entry=%.5f SL=%.5f TP=%.5f Qty=%d",
                      side.upper(), entry, sl, tp, qty)
 
-        # Open position
         resp = session.place_order(
             category="linear",
             symbol=SYMBOL,
@@ -122,48 +92,76 @@ def place_order(side, entry, sl, tp, qty):
             orderType="Market",
             qty=str(qty),
             timeInForce="IOC",
-            reduceOnly=False
+            reduceOnly=False,
+            stopLoss=str(sl),
+            takeProfit=str(tp),
+            tpTriggerBy="LastPrice",
+            slTriggerBy="LastPrice"
         )
-        logging.info("Entry response: %s", resp)
-
-        # Attach TP
-        tp_order = session.place_order(
-            category="linear",
-            symbol=SYMBOL,
-            side="Sell" if side.lower() == "buy" else "Buy",
-            orderType="Limit",
-            qty=str(qty),
-            price=str(round(tp, 5)),
-            timeInForce="GTC",
-            reduceOnly=True
-        )
-        logging.info("TP response: %s", tp_order)
-
-        # Attach SL
-        sl_order = session.place_order(
-            category="linear",
-            symbol=SYMBOL,
-            side="Sell" if side.lower() == "buy" else "Buy",
-            orderType="StopMarket",
-            qty=str(qty),
-            stopPx=str(round(sl, 5)),
-            triggerDirection=2 if side.lower() == "buy" else 1,
-            timeInForce="GTC",
-            reduceOnly=True
-        )
-        logging.info("SL response: %s", sl_order)
-
+        logging.info("Order response: %s", resp)
     except Exception as e:
         logging.error("Error placing order: %s", e)
 
+# ================== CLOSE ALL POSITIONS ==================
+def close_all_positions():
+    """Close all open positions for the symbol."""
+    positions = session.get_positions(category="linear", symbol=SYMBOL)
+    for p in positions["result"]["list"]:
+        long_size = float(p.get("longSize", 0))
+        short_size = float(p.get("shortSize", 0))
+
+        if long_size > 0:
+            try:
+                session.place_order(
+                    category="linear",
+                    symbol=SYMBOL,
+                    side="Sell",
+                    orderType="Market",
+                    qty=str(long_size),
+                    timeInForce="IOC",
+                    reduceOnly=True
+                )
+                logging.info("Closed existing long position: %s contracts", long_size)
+            except Exception as e:
+                logging.error("Error closing long position: %s", e)
+
+        if short_size > 0:
+            try:
+                session.place_order(
+                    category="linear",
+                    symbol=SYMBOL,
+                    side="Buy",
+                    orderType="Market",
+                    qty=str(short_size),
+                    timeInForce="IOC",
+                    reduceOnly=True
+                )
+                logging.info("Closed existing short position: %s contracts", short_size)
+            except Exception as e:
+                logging.error("Error closing short position: %s", e)
+
 # ================== CORE LOGIC ==================
 def run_once():
-    global last_range, ha_open_state
+    global last_range, ha_open_state, first_run
 
     logging.info("=== Running at %s ===", datetime.utcnow())
 
     raw_candles = fetch_candles(limit=8)
-    ha_candles, ha_open_state = compute_heikin_ashi(raw_candles, ha_open_state)
+
+    # Log raw candles
+    for i, r in enumerate(raw_candles, 1):
+        logging.info("Raw %d | O=%.5f H=%.5f L=%.5f C=%.5f", i, r[0], r[1], r[2], r[3])
+
+    # On first run, use INITIAL_HA_OPEN
+    if first_run:
+        ha_candles, ha_open_state = compute_heikin_ashi(raw_candles, INITIAL_HA_OPEN)
+        first_run = False
+    else:
+        ha_candles, ha_open_state = compute_heikin_ashi(raw_candles, ha_open_state)
+
+    # Log HA candles
+    for i, c in enumerate(ha_candles, 1):
+        logging.info("HA %d | O=%.5f H=%.5f L=%.5f C=%.5f", i, c["ha_open"], c["ha_high"], c["ha_low"], c["ha_close"])
 
     # determine trend
     green = sum(1 for c in ha_candles if c["ha_close"] > c["ha_open"])
@@ -189,8 +187,7 @@ def run_once():
     last = ha_candles[-1]
 
     if current_range == "sell":
-        sl = raw_candles[-2][1] if has_upper_wick(last) else last["raw"][1]
-        sl += 0.0001
+        sl = (raw_candles[-2][1] if has_upper_wick(last) else last["raw"][1]) + PIP
         entry = last["ha_close"]
         risk = abs(sl - entry)
         if risk == 0:
@@ -201,8 +198,7 @@ def run_once():
         place_order("Sell", entry, sl, tp, qty)
 
     elif current_range == "buy":
-        sl = raw_candles[-2][2] if has_lower_wick(last) else last["raw"][2]
-        sl -= 0.0001
+        sl = (raw_candles[-2][2] if has_lower_wick(last) else last["raw"][2]) - PIP
         entry = last["ha_close"]
         risk = abs(entry - sl)
         if risk == 0:
@@ -226,4 +222,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
