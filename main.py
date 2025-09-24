@@ -17,7 +17,7 @@ INTERVAL = 3             # 3m timeframe
 WINDOW = 8               # number of HA candles to keep rolling
 
 # ====== MANUAL INITIAL HA OPEN ======
-INITIAL_HA_OPEN = 0.33611
+INITIAL_HA_OPEN = 0.3361
 
 # ================== API KEYS ==================
 API_KEY = os.getenv("BYBIT_API_KEY")
