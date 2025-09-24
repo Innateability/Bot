@@ -9,10 +9,10 @@ SYMBOL = "TRXUSDT"
 RISK_PER_TRADE = 0.10   # 10% of balance
 FALLBACK = 0.95         # fallback % if qty unaffordable
 LEVERAGE = 75
-INTERVAL = "3"          # 3m candles
-CANDLE_SECONDS = 180    # 3 minutes
+INTERVAL = "60"          # 3m candles
+CANDLE_SECONDS = 3600    # 3 minutes
 WINDOW = 8              # rolling HA candle window
-INITIAL_HA_OPEN = 0.3382  # manually set
+INITIAL_HA_OPEN = 0.3379  # manually set
 ROUNDING = 5
 
 # ================== API KEYS ==================
