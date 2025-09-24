@@ -1,4 +1,3 @@
-ah
 import os
 import time
 import logging
@@ -8,7 +7,7 @@ from pybit.unified_trading import HTTP
 # ================== CONFIG ==================
 SYMBOL = "TRXUSDT"
 RISK_PER_TRADE = 0.10   # 10% of balance
-FALLBACK = 0.95         # fallback = 95% of balance if risk trade not affordable
+FALLBACK = 0.95         # fallback = 95% of balance if 10% risk is unaffordable
 RR = 2.0                # 2:1 RR
 TP_EXTRA = 0.001        # +0.1%
 
@@ -16,7 +15,7 @@ INTERVAL = "3"          # Bybit 3-minute candles
 CANDLE_SECONDS = 180    # 3 minutes
 
 # Initial HA open (from earliest of last 8 candles)
-INITIAL_HA_OPEN = 0.33791
+INITIAL_HA_OPEN = 0.33788
 ha_open_state = INITIAL_HA_OPEN   # rolling HA open
 
 last_range = None
@@ -65,25 +64,55 @@ def get_balance():
     return float(resp["result"]["list"][0]["coin"][0]["walletBalance"])
 
 def calculate_qty(balance, entry, sl):
-    """Calculate position size with fallback (no double leverage issue)."""
+    """Calculate position size with leverage and fallback."""
     risk_amount = balance * RISK_PER_TRADE
     risk_per_unit = abs(entry - sl)
 
     if risk_per_unit <= 0:
         return 0
 
-    qty = int(risk_amount / risk_per_unit * 75)
+    qty = int(risk_amount / risk_per_unit * 75)  # leverage applied
 
-    if qty < 1 or qty * entry > balance:
-        # fallback = 95% of balance into trade
+    if qty < 1 or qty * entry > balance * 75:
+        # fallback = 95% of balance into trade with leverage
         qty = int((balance * FALLBACK) / entry * 75)
 
     return qty 
+
+def close_all_positions():
+    """Close all open positions for the symbol."""
+    try:
+        pos = session.get_positions(category="linear", symbol=SYMBOL)
+        if "result" not in pos or "list" not in pos["result"]:
+            logging.warning("No positions found in response: %s", pos)
+            return
+
+        for p in pos["result"]["list"]:
+            size = float(p.get("size", 0))
+            side = p.get("side", "")
+            if size > 0:
+                # If long → close with Sell, if short → close with Buy
+                closing_side = "Sell" if side.lower() == "buy" else "Buy"
+                logging.info("⚠️ Closing %s position | Size=%.2f", side, size)
+                resp = session.place_order(
+                    category="linear",
+                    symbol=SYMBOL,
+                    side=closing_side,
+                    orderType="Market",
+                    qty=str(int(size)),
+                    timeInForce="IOC",
+                    reduceOnly=True
+                )
+                logging.info("Close response: %s", resp)
+    except Exception as e:
+        logging.error("Error closing positions: %s", e)
 
 def place_order(side, entry, sl, tp, qty):
     try:
         logging.info("🚀 %s order | Entry=%.5f SL=%.5f TP=%.5f Qty=%d",
                      side.upper(), entry, sl, tp, qty)
+
+        # Open position
         resp = session.place_order(
             category="linear",
             symbol=SYMBOL,
@@ -93,47 +122,37 @@ def place_order(side, entry, sl, tp, qty):
             timeInForce="IOC",
             reduceOnly=False
         )
-        logging.info("Order response: %s", resp)
+        logging.info("Entry response: %s", resp)
+
+        # Attach TP
+        tp_order = session.place_order(
+            category="linear",
+            symbol=SYMBOL,
+            side="Sell" if side.lower() == "buy" else "Buy",
+            orderType="Limit",
+            qty=str(qty),
+            price=str(round(tp, 5)),
+            timeInForce="GTC",
+            reduceOnly=True
+        )
+        logging.info("TP response: %s", tp_order)
+
+        # Attach SL
+        sl_order = session.place_order(
+            category="linear",
+            symbol=SYMBOL,
+            side="Sell" if side.lower() == "buy" else "Buy",
+            orderType="StopMarket",
+            qty=str(qty),
+            stopPx=str(round(sl, 5)),
+            triggerDirection=2 if side.lower() == "buy" else 1,
+            timeInForce="GTC",
+            reduceOnly=True
+        )
+        logging.info("SL response: %s", sl_order)
+
     except Exception as e:
         logging.error("Error placing order: %s", e)
-
-# ================== CLOSE ALL POSITIONS ==================
-def close_all_positions():
-    """Close all open positions for the symbol."""
-    positions = session.get_positions(category="linear", symbol=SYMBOL)
-    for p in positions["result"]["list"]:
-        long_size = float(p.get("longSize", 0))
-        short_size = float(p.get("shortSize", 0))
-
-        if long_size > 0:
-            try:
-                session.place_order(
-                    category="linear",
-                    symbol=SYMBOL,
-                    side="Sell",
-                    orderType="Market",
-                    qty=str(long_size),
-                    timeInForce="IOC",
-                    reduceOnly=True
-                )
-                logging.info("Closed existing long position: %s contracts", long_size)
-            except Exception as e:
-                logging.error("Error closing long position: %s", e)
-
-        if short_size > 0:
-            try:
-                session.place_order(
-                    category="linear",
-                    symbol=SYMBOL,
-                    side="Buy",
-                    orderType="Market",
-                    qty=str(short_size),
-                    timeInForce="IOC",
-                    reduceOnly=True
-                )
-                logging.info("Closed existing short position: %s contracts", short_size)
-            except Exception as e:
-                logging.error("Error closing short position: %s", e)
 
 # ================== CORE LOGIC ==================
 def run_once():
@@ -142,15 +161,7 @@ def run_once():
     logging.info("=== Running at %s ===", datetime.utcnow())
 
     raw_candles = fetch_candles(limit=8)
-    first = raw_candles[0]
-    logging.info("Raw first candle (for HA init): O=%.5f H=%.5f L=%.5f C=%.5f",
-                 *first[:4])
-
     ha_candles, ha_open_state = compute_heikin_ashi(raw_candles, ha_open_state)
-
-    for i, c in enumerate(ha_candles, 1):
-        logging.info("HA %d | O=%.5f H=%.5f L=%.5f C=%.5f | Raw=%s",
-                     i, c["ha_open"], c["ha_high"], c["ha_low"], c["ha_close"], c["raw"])
 
     # determine trend
     green = sum(1 for c in ha_candles if c["ha_close"] > c["ha_open"])
