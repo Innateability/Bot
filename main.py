@@ -71,11 +71,13 @@ def calculate_qty(balance, entry, sl):
     if risk_per_unit <= 0:
         return 0
 
-    qty = int(risk_amount / risk_per_unit * 75)  # leverage applied
+    qty = int(risk_amount / risk_per_unit * 75) # leverage applied
+    qty -= 1
 
     if qty < 1 or qty * entry > balance * 75:
         # fallback = 95% of balance into trade with leverage
         qty = int((balance * FALLBACK) / entry * 75)
+        qty -= 1
 
     return qty 
 
@@ -188,6 +190,7 @@ def run_once():
 
     if current_range == "sell":
         sl = raw_candles[-2][1] if has_upper_wick(last) else last["raw"][1]
+        sl += 0.0001
         entry = last["ha_close"]
         risk = abs(sl - entry)
         if risk == 0:
@@ -199,6 +202,7 @@ def run_once():
 
     elif current_range == "buy":
         sl = raw_candles[-2][2] if has_lower_wick(last) else last["raw"][2]
+        sl -= 0.0001
         entry = last["ha_close"]
         risk = abs(entry - sl)
         if risk == 0:
