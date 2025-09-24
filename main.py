@@ -12,7 +12,7 @@ LEVERAGE = 75
 INTERVAL = "3"          # 3m candles
 CANDLE_SECONDS = 180    # 3 minutes
 WINDOW = 8              # rolling HA candle window
-INITIAL_HA_OPEN = 0.3378 # manually set
+INITIAL_HA_OPEN = 0.33849  # manually set
 ROUNDING = 5
 
 # ================== API KEYS ==================
@@ -30,15 +30,16 @@ last_signal = None
 initial_ha_open_time = None
 
 # ================== FUNCTIONS ==================
-def fetch_candles(limit=WINDOW):
+def fetch_candles(limit=WINDOW+1):
     """Fetch last N raw candles from Bybit."""
     resp = session.get_kline(category="linear", symbol=SYMBOL, interval=INTERVAL, limit=limit)
     if "result" not in resp or "list" not in resp["result"]:
         raise Exception(f"Bad kline response: {resp}")
-    candles = [
-        {"time": int(x[0]), "o": float(x[1]), "h": float(x[2]), "l": float(x[3]), "c": float(x[4])}
-        for x in reversed(resp["result"]["list"])
-    ]
+    candles = []
+    for x in reversed(resp["result"]["list"]):
+        if None in x[1:5]:  # skip incomplete candles
+            continue
+        candles.append({"time": int(x[0]), "o": float(x[1]), "h": float(x[2]), "l": float(x[3]), "c": float(x[4])})
     return candles
 
 def build_initial_ha():
@@ -112,7 +113,8 @@ def process_new_candle_rolling():
     """Process just closed candle, compute signal, SL/TP, execute order, then update rolling HA list."""
     global ha_candles, ha_open_state, last_signal
 
-    raw_candle = fetch_candles(limit=2)[-1]  # last closed candle
+    raw_candles = fetch_candles(limit=2)
+    raw_candle = raw_candles[0]  # second-to-last = last fully closed
     ts, raw_o, raw_h, raw_l, raw_c = map(float, [raw_candle["time"], raw_candle["o"], raw_candle["h"], raw_candle["l"], raw_candle["c"]])
 
     ha_close = (raw_o + raw_h + raw_l + raw_c) / 4
