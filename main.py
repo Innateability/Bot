@@ -12,7 +12,7 @@ LEVERAGE = 75
 INTERVAL = "60"          # 1h candles
 CANDLE_SECONDS = 3600    # 1 hour
 WINDOW = 8              # rolling HA candle window
-INITIAL_HA_OPEN = 0.33795  # manually set
+INITIAL_HA_OPEN = 0.33697  # manually set
 ROUNDING = 5
 
 # ================== API KEYS ==================
