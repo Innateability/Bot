@@ -12,7 +12,7 @@ LEVERAGE = 75
 INTERVAL = "60"          # 1h candles
 CANDLE_SECONDS = 3600    # 1 hour
 WINDOW = 8              # rolling HA candle window
-INITIAL_HA_OPEN = 0.33822  # manually set
+INITIAL_HA_OPEN = 0.33795  # manually set
 ROUNDING = 5
 
 # ================== API KEYS ==================
@@ -84,11 +84,21 @@ def get_balance():
     return float(resp["result"]["list"][0]["coin"][0]["walletBalance"])
 
 def calc_qty(balance, entry, risk, risk_amount):
-    qty = (risk_amount * LEVERAGE) / (risk * entry)
-    max_qty = (balance * FALLBACK * LEVERAGE) / entry
-    if qty * entry / LEVERAGE > balance:
-        qty = max_qty
-    return max(0, int(qty) - 1)
+    """Calculate position size using min(risk-based, fallback-based)."""
+    if risk <= 0:
+        return 0
+
+    # Qty if risking 10% of balance
+    qty_risk = (risk_amount * LEVERAGE) / (risk * entry)
+
+    # Qty affordable with 95% of balance
+    qty_fallback = (balance * FALLBACK * LEVERAGE) / entry
+
+    # Pick the lower of the two
+    qty = min(qty_risk, qty_fallback)
+
+    # Convert to integer (truncate decimals)
+    return max(0, int(qty))
 
 def place_order(side, entry, sl, tp, qty):
     try:
