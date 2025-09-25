@@ -1,7 +1,7 @@
 import os
 import time
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from pybit.unified_trading import HTTP
 
 # ================== CONFIG ==================
@@ -11,7 +11,7 @@ FALLBACK = 0.95         # fallback % if qty unaffordable
 LEVERAGE = 75
 INTERVAL = "60"          # 1h candles
 CANDLE_SECONDS = 3600    # 1 hour
-WINDOW = 8               # rolling HA candle window
+WINDOW = 8              # rolling HA candle window
 INITIAL_HA_OPEN = 0.33822  # manually set
 ROUNDING = 5
 
@@ -29,30 +29,25 @@ last_signal = None
 initial_ha_open_time = None
 
 # ================== FUNCTIONS ==================
-def fetch_candles(limit=WINDOW+2):
-    """Fetch last N raw candles from Bybit, sorted oldest → newest."""
+def fetch_candles(limit=WINDOW+1):
+    """Fetch last N raw candles from Bybit."""
     resp = session.get_kline(category="linear", symbol=SYMBOL, interval=INTERVAL, limit=limit)
     if "result" not in resp or "list" not in resp["result"]:
         raise Exception(f"Bad kline response: {resp}")
     candles = []
     for x in reversed(resp["result"]["list"]):
-        if None in x[1:5]:
+        if None in x[1:5]:  # skip incomplete candles
             continue
-        candles.append({
-            "time": int(x[0]),
-            "o": float(x[1]),
-            "h": float(x[2]),
-            "l": float(x[3]),
-            "c": float(x[4])
-        })
+        candles.append({"time": int(x[0]), "o": float(x[1]), "h": float(x[2]), "l": float(x[3]), "c": float(x[4])})
     return candles
 
 def build_initial_ha():
     """Build initial 8 HA candles using pasted INITIAL_HA_OPEN for oldest candle."""
     global ha_candles, initial_ha_open_time
-    raw_candles = fetch_candles(limit=WINDOW)
-    ha_candles = []
+    raw_candles = fetch_candles(limit=WINDOW + 1)  # fetch one extra to drop open candle
+    raw_candles = raw_candles[:-1]  # drop most recent (still open)
 
+    ha_candles = []
     for i, c in enumerate(raw_candles):
         ha_close = (c["o"] + c["h"] + c["l"] + c["c"]) / 4
         if i == 0:
@@ -76,6 +71,7 @@ def build_initial_ha():
     logging.info(f"Initial HA Open set to {INITIAL_HA_OPEN} at {initial_ha_open_time}")
 
 def log_candle(candle):
+    """Log details of a HA candle."""
     logging.info(
         f"Candle Time={candle['time']} | "
         f"Raw=O:{candle['raw']['o']} H:{candle['raw']['h']} L:{candle['raw']['l']} C:{candle['raw']['c']} | "
@@ -118,8 +114,7 @@ def process_new_candle_rolling():
     global ha_candles, last_signal
 
     raw_candles = fetch_candles(limit=2)
-    raw_candle = raw_candles[-1]  # last fully closed candle
-
+    raw_candle = raw_candles[0]  # second-to-last = last fully closed
     ts, raw_o, raw_h, raw_l, raw_c = map(float, [raw_candle["time"], raw_candle["o"], raw_candle["h"], raw_candle["l"], raw_candle["c"]])
 
     ha_close = (raw_o + raw_h + raw_l + raw_c) / 4
@@ -158,16 +153,24 @@ def process_new_candle_rolling():
         entry = candle["ha"]["c"]
         prev = ha_candles[-1]
 
+        # BUY
         if signal == "buy":
-            sl = min(candle['ha']['l'], prev['ha']['l']) - 0.0001
+            if candle['ha']['l'] < min(candle['ha']['o'], candle['ha']['c']):
+                sl = prev['ha']['l'] - 0.0001
+            else:
+                sl = candle['ha']['l'] - 0.0001
             risk = entry - sl
             tp = entry + (2 * risk) + (entry * 0.001)
             qty = calc_qty(balance, entry, risk, risk_amount)
             if qty > 0:
                 place_order("Buy", entry, sl, tp, qty)
 
+        # SELL
         elif signal == "sell":
-            sl = max(candle['ha']['h'], prev['ha']['h']) + 0.0001
+            if candle['ha']['h'] > max(candle['ha']['o'], candle['ha']['c']):
+                sl = prev['ha']['h'] + 0.0001
+            else:
+                sl = candle['ha']['h'] + 0.0001
             risk = sl - entry
             tp = entry - (2 * risk) - (entry * 0.001)
             qty = calc_qty(balance, entry, risk, risk_amount)
@@ -179,14 +182,6 @@ def process_new_candle_rolling():
     if len(ha_candles) > WINDOW:
         ha_candles.pop(0)
 
-def wait_until_next_candle():
-    now = datetime.utcnow()
-    next_close = (now.replace(minute=0, second=0, microsecond=0) 
-                  + timedelta(hours=1))
-    wait_sec = (next_close - now).total_seconds()
-    logging.info(f"⏳ Waiting {int(wait_sec)}s until next 1h candle close...")
-    time.sleep(wait_sec + 1)
-
 # ================== MAIN LOOP ==================
 def main():
     logging.info("Building initial HA candles...")
@@ -196,7 +191,13 @@ def main():
 
     logging.info("Starting live loop...")
     while True:
-        wait_until_next_candle()
+        now = datetime.utcnow()
+        sec_into_cycle = (now.minute * 60 + now.second) % CANDLE_SECONDS
+        wait = CANDLE_SECONDS - sec_into_cycle
+        if wait <= 0:
+            wait += CANDLE_SECONDS
+        logging.info(f"⏳ Waiting {wait}s until next 1h candle close...")
+        time.sleep(wait)
         try:
             process_new_candle_rolling()
         except Exception as e:
