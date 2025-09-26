@@ -1,4 +1,4 @@
-#import os
+import os
 import time
 import logging
 from datetime import datetime
@@ -7,12 +7,11 @@ from pybit.unified_trading import HTTP
 # ================== CONFIG ==================
 SYMBOL = "TRXUSDT"
 RISK_PER_TRADE = 0.10   # 10% of balance
-FALLBACK = 0.95         # fallback % if qty unaffordable
 LEVERAGE = 75
 INTERVAL = "60"          # 1h candles
 CANDLE_SECONDS = 3600    # 1 hour
 WINDOW = 8              # rolling HA candle window
-INITIAL_HA_OPEN = 0.33697  # manually set
+INITIAL_HA_OPEN = 0.33281  # manually set
 ROUNDING = 5
 
 # ================== API KEYS ==================
@@ -83,22 +82,21 @@ def get_balance():
     resp = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
     return float(resp["result"]["list"][0]["coin"][0]["walletBalance"])
 
-def calc_qty(balance, entry, risk, risk_amount):
-    """Calculate position size using min(risk-based, fallback-based)."""
-    if risk <= 0:
+def calc_qty(balance, entry, sl, risk_amount):
+    """
+    Calculate position size:
+    Qty = (Expected Loss / SL Distance) * Leverage
+    Respect max affordable quantity based on balance.
+    """
+    sl_distance = abs(entry - sl)
+    if sl_distance <= 0:
         return 0
 
-    # Qty if risking 10% of balance
-    qty_risk = (risk_amount * LEVERAGE) / (risk * entry)
+    qty_by_risk = (risk_amount / sl_distance) * LEVERAGE
+    max_affordable_qty = (balance * LEVERAGE) / entry
 
-    # Qty affordable with 95% of balance
-    qty_fallback = (balance * FALLBACK * LEVERAGE) / entry
-
-    # Pick the lower of the two
-    qty = min(qty_risk, qty_fallback)
-
-    # Convert to integer (truncate decimals)
-    return max(0, int(qty))
+    qty = min(qty_by_risk, max_affordable_qty)
+    return max(0, int(qty))  # round down to nearest whole number
 
 def place_order(side, entry, sl, tp, qty):
     try:
@@ -165,25 +163,17 @@ def process_new_candle_rolling():
 
         # BUY
         if signal == "buy":
-            if candle['ha']['l'] < min(candle['ha']['o'], candle['ha']['c']):
-                sl = prev['ha']['l'] - 0.0001
-            else:
-                sl = candle['ha']['l'] - 0.0001
-            risk = entry - sl
-            tp = entry + (2 * risk) + (entry * 0.001)
-            qty = calc_qty(balance, entry, risk, risk_amount)
+            sl = prev['ha']['l'] - 0.0001 if candle['ha']['l'] < min(candle['ha']['o'], candle['ha']['c']) else candle['ha']['l'] - 0.0001
+            tp = entry + (2 * abs(entry - sl)) + (entry * 0.001)
+            qty = calc_qty(balance, entry, sl, risk_amount)
             if qty > 0:
                 place_order("Buy", entry, sl, tp, qty)
 
         # SELL
         elif signal == "sell":
-            if candle['ha']['h'] > max(candle['ha']['o'], candle['ha']['c']):
-                sl = prev['ha']['h'] + 0.0001
-            else:
-                sl = candle['ha']['h'] + 0.0001
-            risk = sl - entry
-            tp = entry - (2 * risk) - (entry * 0.001)
-            qty = calc_qty(balance, entry, risk, risk_amount)
+            sl = prev['ha']['h'] + 0.0001 if candle['ha']['h'] > max(candle['ha']['o'], candle['ha']['c']) else candle['ha']['h'] + 0.0001
+            tp = entry - (2 * abs(sl - entry)) - (entry * 0.001)
+            qty = calc_qty(balance, entry, sl, risk_amount)
             if qty > 0:
                 place_order("Sell", entry, sl, tp, qty)
 
