@@ -11,7 +11,7 @@ LEVERAGE = 75
 INTERVAL = "60"          # 1h candles
 CANDLE_SECONDS = 3600    # 1 hour
 WINDOW = 8              # rolling HA candle window
-INITIAL_HA_OPEN = 0.33281  # manually set
+INITIAL_HA_OPEN = 0.33299  # manually set
 ROUNDING = 5
 
 # ================== API KEYS ==================
@@ -93,7 +93,7 @@ def calc_qty(balance, entry, sl, risk_amount):
         return 0
 
     qty_by_risk = (risk_amount / sl_distance) * LEVERAGE
-    max_affordable_qty = (balance * LEVERAGE) / entry
+    max_affordable_qty = (balance * LEVERAGE) / entry * 0 .9
 
     qty = min(qty_by_risk, max_affordable_qty)
     return max(0, int(qty))  # round down to nearest whole number
