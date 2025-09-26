@@ -93,7 +93,7 @@ def calc_qty(balance, entry, sl, risk_amount):
         return 0
 
     qty_by_risk = (risk_amount / sl_distance) * LEVERAGE
-    max_affordable_qty = (balance * LEVERAGE) / entry * 0 .9
+    max_affordable_qty = (balance * LEVERAGE) / entry * 0.9
 
     qty = min(qty_by_risk, max_affordable_qty)
     return max(0, int(qty))  # round down to nearest whole number
