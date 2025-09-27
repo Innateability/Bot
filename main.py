@@ -26,6 +26,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 ha_candles = []
 last_signal = None
 initial_ha_open_time = None
+last_candle_time = None   # ✅ NEW
 
 # ================== FUNCTIONS ==================
 def fetch_candles(limit=WINDOW+1):
@@ -119,10 +120,10 @@ def place_order(side, entry, sl, tp, qty):
 
 def process_new_candle_rolling():
     """Process just closed candle, compute signal, SL/TP, execute order, then update rolling HA list."""
-    global ha_candles, last_signal
+    global ha_candles, last_signal, last_candle_time
 
     raw_candles = fetch_candles(limit=2)
-    raw_candle = raw_candles[0]  # second-to-last = last fully closed
+    raw_candle = raw_candles[-1]  # ✅ last fully closed candle
     ts, raw_o, raw_h, raw_l, raw_c = map(float, [raw_candle["time"], raw_candle["o"], raw_candle["h"], raw_candle["l"], raw_candle["c"]])
 
     ha_close = (raw_o + raw_h + raw_l + raw_c) / 4
@@ -138,6 +139,12 @@ def process_new_candle_rolling():
         "ha": {"o": ha_open, "h": ha_high, "l": ha_low, "c": ha_close},
         "color": color
     }
+
+    # ✅ Prevent duplicate trades
+    if last_candle_time == candle["time"]:
+        logging.info("⏭ Already processed this candle, skipping...")
+        return
+    last_candle_time = candle["time"]
 
     log_candle(candle)
 
@@ -205,3 +212,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
