@@ -10,8 +10,8 @@ RISK_PER_TRADE = 0.10   # 10% of balance
 LEVERAGE = 75
 INTERVAL = "60"          # 1h candles
 CANDLE_SECONDS = 3600    # 1 hour
-WINDOW = 8              # rolling HA candle window
-INITIAL_HA_OPEN = 0.33872  # manually set
+WINDOW = 8               # rolling HA candle window
+INITIAL_HA_OPEN = 0.33299  # manually set
 ROUNDING = 5
 
 # ================== API KEYS ==================
@@ -26,7 +26,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 ha_candles = []
 last_signal = None
 initial_ha_open_time = None
-last_candle_time = None   # ✅ NEW
 
 # ================== FUNCTIONS ==================
 def fetch_candles(limit=WINDOW+1):
@@ -44,10 +43,10 @@ def fetch_candles(limit=WINDOW+1):
 def build_initial_ha():
     """Build initial 8 HA candles using pasted INITIAL_HA_OPEN for oldest candle."""
     global ha_candles, initial_ha_open_time
-    raw_candles = fetch_candles(limit=WINDOW + 1)  # fetch one extra to drop open candle
+    raw_candles = fetch_candles(limit=WINDOW + 1)
     raw_candles = raw_candles[:-1]  # drop most recent (still open)
 
-    ha_candles = []
+    ha_candles.clear()
     for i, c in enumerate(raw_candles):
         ha_close = (c["o"] + c["h"] + c["l"] + c["c"]) / 4
         if i == 0:
@@ -84,11 +83,7 @@ def get_balance():
     return float(resp["result"]["list"][0]["coin"][0]["walletBalance"])
 
 def calc_qty(balance, entry, sl, risk_amount):
-    """
-    Calculate position size:
-    Qty = (Expected Loss / SL Distance) * Leverage
-    Respect max affordable quantity based on balance.
-    """
+    """Calculate position size with leverage and affordability check."""
     sl_distance = abs(entry - sl)
     if sl_distance <= 0:
         return 0
@@ -97,7 +92,7 @@ def calc_qty(balance, entry, sl, risk_amount):
     max_affordable_qty = (balance * LEVERAGE) / entry * 0.9
 
     qty = min(qty_by_risk, max_affordable_qty)
-    return max(0, int(qty))  # round down to nearest whole number
+    return max(0, int(qty))
 
 def place_order(side, entry, sl, tp, qty):
     try:
@@ -120,10 +115,10 @@ def place_order(side, entry, sl, tp, qty):
 
 def process_new_candle_rolling():
     """Process just closed candle, compute signal, SL/TP, execute order, then update rolling HA list."""
-    global ha_candles, last_signal, last_candle_time
+    global ha_candles, last_signal
 
     raw_candles = fetch_candles(limit=2)
-    raw_candle = raw_candles[-1]  # ✅ last fully closed candle
+    raw_candle = raw_candles[0]  # second-to-last = last fully closed
     ts, raw_o, raw_h, raw_l, raw_c = map(float, [raw_candle["time"], raw_candle["o"], raw_candle["h"], raw_candle["l"], raw_candle["c"]])
 
     ha_close = (raw_o + raw_h + raw_l + raw_c) / 4
@@ -140,12 +135,6 @@ def process_new_candle_rolling():
         "color": color
     }
 
-    # ✅ Prevent duplicate trades
-    if last_candle_time == candle["time"]:
-        logging.info("⏭ Already processed this candle, skipping...")
-        return
-    last_candle_time = candle["time"]
-
     log_candle(candle)
 
     # Determine signal
@@ -161,6 +150,7 @@ def process_new_candle_rolling():
 
     logging.info(f"Signal={signal} | Last Signal={last_signal}")
 
+    # Only place order on new signal
     if signal != last_signal:
         last_signal = signal
         balance = get_balance()
@@ -168,17 +158,15 @@ def process_new_candle_rolling():
         entry = candle["ha"]["c"]
         prev = ha_candles[-1]
 
-        # BUY
         if signal == "buy":
-            sl = prev['ha']['l'] - 0.0001 if candle['ha']['l'] < min(candle['ha']['o'], candle['ha']['c']) else candle['ha']['l'] - 0.0001
+            sl = candle['ha']['l'] - 0.0001
             tp = entry + (2 * abs(entry - sl)) + (entry * 0.001)
             qty = calc_qty(balance, entry, sl, risk_amount)
             if qty > 0:
                 place_order("Buy", entry, sl, tp, qty)
 
-        # SELL
         elif signal == "sell":
-            sl = prev['ha']['h'] + 0.0001 if candle['ha']['h'] > max(candle['ha']['o'], candle['ha']['c']) else candle['ha']['h'] + 0.0001
+            sl = candle['ha']['h'] + 0.0001
             tp = entry - (2 * abs(sl - entry)) - (entry * 0.001)
             qty = calc_qty(balance, entry, sl, risk_amount)
             if qty > 0:
