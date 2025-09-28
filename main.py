@@ -9,8 +9,8 @@ SYMBOL = "TRXUSDT"
 RISK_PER_TRADE = 0.50   # 50% of balance
 FALLBACK = 0.90         # fallback % if qty unaffordable
 LEVERAGE = 75
-INTERVAL = "240"        # 4h candles (can change to "60" or "3")
-CANDLE_SECONDS = 4 * 60 * 60  # 4h = 14400 sec
+INTERVAL = "4"        # 4h candles (can change to "60" or "3")
+CANDLE_SECONDS = 4 * 60 # 4h = 14400 sec
 ROUNDING = 5
 
 # Set manually before first run
