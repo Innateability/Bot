@@ -12,8 +12,8 @@ RISK_PER_TRADE = 0.10
 FALLBACK = 0.95
 
 # You provide these before deployment
-ha_open = 0.33648   # Example: persisted HA open of last closed candle
-colors = list("rgrgggrr")  # Last 8 HA candle colors manually entered
+ha_open = 0.33667  # Example: persisted HA open of last closed candle
+colors = list("gggggggg")  # Last 8 HA candle colors manually entered
 
 # ================== LOGGING ==================
 logging.basicConfig(
