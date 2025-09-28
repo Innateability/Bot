@@ -14,7 +14,7 @@ CANDLE_SECONDS = 3 * 60 # adjust with INTERVAL * 60
 ROUNDING = 5
 
 # Set manually before first run
-INITIAL_HA_OPEN = 0.33406
+INITIAL_HA_OPEN = 0.33423
 
 # ================== API KEYS ==================
 API_KEY = os.getenv("BYBIT_SUB_API_KEY")
@@ -62,7 +62,7 @@ def calc_ha(raw, prev_ha_open):
     return {"o": ha_open, "h": ha_high, "l": ha_low, "c": ha_close}
 
 def get_balance():
-    resp = session.get_wallet_balance(accountType="CONTRACT", coin="USDT")
+    resp = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
     return float(resp["result"]["list"][0]["coin"][0]["walletBalance"])
 
 def calc_qty(balance, entry, sl, risk_amount):
