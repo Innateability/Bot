@@ -14,7 +14,7 @@ CANDLE_SECONDS = 3 * 60 # adjust with INTERVAL * 60
 ROUNDING = 5
 
 # Set manually before first run
-INITIAL_HA_OPEN = 0.33549
+INITIAL_HA_OPEN = 0.33419
 
 # ================== API KEYS ==================
 API_KEY = os.getenv("BYBIT_SUB_API_KEY")
