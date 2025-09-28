@@ -9,8 +9,8 @@ SYMBOL = "TRXUSDT"
 RISK_PER_TRADE = 0.50   # 50% of balance
 FALLBACK = 0.90         # fallback % if qty unaffordable
 LEVERAGE = 75
-INTERVAL = "3"        # 4h candles (can change to "60" or "3")
-CANDLE_SECONDS = 3 * 60 # 4h = 14400 sec
+INTERVAL = "3"          # timeframe in minutes ("3" = 3m, "60" = 1h, "240" = 4h)
+CANDLE_SECONDS = 3 * 60 # adjust with INTERVAL * 60
 ROUNDING = 5
 
 # Set manually before first run
@@ -31,17 +31,27 @@ last_ha_open = INITIAL_HA_OPEN
 # ================== FUNCTIONS ==================
 def fetch_last_closed():
     """Fetch last fully closed raw candle from Bybit."""
-    resp = session.get_kline(category="linear", symbol=SYMBOL, interval=INTERVAL, limit=2)
+    resp = session.get_kline(category="linear", symbol=SYMBOL, interval=INTERVAL, limit=3)
+
+    # 🔍 Debugging: log the raw API response
+    logging.info(f"Raw kline response: {resp}")
+
     if "result" not in resp or "list" not in resp["result"]:
         raise Exception(f"Bad kline response: {resp}")
-    raw = resp["result"]["list"][-2]  # second-to-last = closed candle
-    return {
+
+    # The candles are ordered newest→oldest, so -2 = last fully closed
+    raw = resp["result"]["list"][-2]
+
+    parsed = {
         "time": int(raw[0]),
         "o": float(raw[1]),
         "h": float(raw[2]),
         "l": float(raw[3]),
         "c": float(raw[4])
     }
+
+    logging.info(f"Parsed candle → O:{parsed['o']} H:{parsed['h']} L:{parsed['l']} C:{parsed['c']}")
+    return parsed
 
 def calc_ha(raw, prev_ha_open):
     """Calculate HA values using persisted HA open."""
@@ -96,8 +106,8 @@ def process_new_candle():
     color_ha = "green" if ha["c"] >= ha["o"] else "red"
 
     logging.info(f"Candle {datetime.fromtimestamp(raw['time']/1000)} "
-                 f"| Raw O:{raw['o']} H:{raw['h']} L:{raw['l']} C:{raw['c']} ({color_raw}) "
-                 f"| HA O:{ha['o']} H:{ha['h']} L:{ha['l']} C:{ha['c']} ({color_ha})")
+                 f"| Raw ({color_raw}) O:{raw['o']} H:{raw['h']} L:{raw['l']} C:{raw['c']} "
+                 f"| HA ({color_ha}) O:{ha['o']} H:{ha['h']} L:{ha['l']} C:{ha['c']}")
 
     # Check for signal
     if color_raw == "red" and color_ha == "red":
