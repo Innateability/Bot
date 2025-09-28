@@ -14,7 +14,7 @@ CANDLE_SECONDS = 3 * 60 # adjust with INTERVAL * 60
 ROUNDING = 5
 
 # Set manually before first run
-INITIAL_HA_OPEN = 0.33423
+INITIAL_HA_OPEN = 0.33511
 
 # ================== API KEYS ==================
 API_KEY = os.getenv("BYBIT_SUB_API_KEY")
@@ -33,15 +33,12 @@ def fetch_last_closed():
     """Fetch last fully closed raw candle from Bybit."""
     resp = session.get_kline(category="linear", symbol=SYMBOL, interval=INTERVAL, limit=3)
 
-    # 🔍 Debugging: log the raw API response
     logging.info(f"Raw kline response: {resp}")
 
     if "result" not in resp or "list" not in resp["result"]:
         raise Exception(f"Bad kline response: {resp}")
 
-    # The candles are ordered newest→oldest, so -2 = last fully closed
-    raw = resp["result"]["list"][-2]
-
+    raw = resp["result"]["list"][-2]  # last fully closed
     parsed = {
         "time": int(raw[0]),
         "o": float(raw[1]),
@@ -49,7 +46,6 @@ def fetch_last_closed():
         "l": float(raw[3]),
         "c": float(raw[4])
     }
-
     logging.info(f"Parsed candle → O:{parsed['o']} H:{parsed['h']} L:{parsed['l']} C:{parsed['c']}")
     return parsed
 
@@ -63,7 +59,9 @@ def calc_ha(raw, prev_ha_open):
 
 def get_balance():
     resp = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
-    return float(resp["result"]["list"][0]["coin"][0]["walletBalance"])
+    balance = float(resp["result"]["list"][0]["coin"][0]["walletBalance"])
+    logging.info(f"💰 Wallet balance fetched: {balance:.4f} USDT")
+    return balance
 
 def calc_qty(balance, entry, sl, risk_amount):
     """Calculate position size with leverage, fallback if needed."""
@@ -73,11 +71,13 @@ def calc_qty(balance, entry, sl, risk_amount):
     qty_by_risk = (risk_amount / sl_dist) * LEVERAGE
     max_affordable = (balance * LEVERAGE) / entry * FALLBACK
     qty = min(qty_by_risk, max_affordable)
+    logging.info(f"📐 Qty calc → Risk={risk_amount:.4f}, SL Dist={sl_dist:.6f}, "
+                 f"QtyByRisk={qty_by_risk:.2f}, MaxAffordable={max_affordable:.2f}, Final={qty:.2f}")
     return max(0, int(qty))
 
 def place_order(side, entry, sl, tp, qty):
     try:
-        logging.info("🚀 %s order | Entry=%.5f SL=%.5f TP=%.5f Qty=%d",
+        logging.info("🚀 Placing %s order | Entry=%.5f SL=%.5f TP=%.5f Qty=%d",
                      side.upper(), entry, sl, tp, qty)
         resp = session.place_order(
             category="linear",
@@ -91,9 +91,9 @@ def place_order(side, entry, sl, tp, qty):
             stopLoss=str(round(sl, ROUNDING)),
             positionIdx=0  # one-way mode
         )
-        logging.info("Order response: %s", resp)
+        logging.info("✅ Order response: %s", resp)
     except Exception as e:
-        logging.error("Error placing order: %s", e)
+        logging.error("❌ Error placing order: %s", e)
 
 def process_new_candle():
     global last_signal, last_ha_open
@@ -109,7 +109,7 @@ def process_new_candle():
                  f"| Raw ({color_raw}) O:{raw['o']} H:{raw['h']} L:{raw['l']} C:{raw['c']} "
                  f"| HA ({color_ha}) O:{ha['o']} H:{ha['h']} L:{ha['l']} C:{ha['c']}")
 
-    # Check for signal
+    # Signal check
     if color_raw == "red" and color_ha == "red":
         signal = "sell"
     elif color_raw == "green" and color_ha == "green":
@@ -118,7 +118,7 @@ def process_new_candle():
         signal = None
 
     if signal and signal != last_signal:
-        last_signal = signal
+        logging.info(f"📊 New signal detected: {signal.upper()} (previous={last_signal})")
         balance = get_balance()
         risk_amount = balance * RISK_PER_TRADE
         entry = raw["c"]
@@ -127,19 +127,27 @@ def process_new_candle():
             sl = ha["l"]
             tp = entry * (1 + 0.0021)
             qty = calc_qty(balance, entry, sl, risk_amount)
+            logging.info(f"🟢 BUY setup → Entry={entry:.5f} SL={sl:.5f} TP={tp:.5f} Qty={qty}")
             if qty > 0:
                 place_order("Buy", entry, sl, tp, qty)
+                last_signal = "buy"
+            else:
+                logging.warning("⚠️ BUY ignored (qty=0)")
 
         elif signal == "sell":
             sl = ha["h"]
             tp = entry * (1 - 0.0021)
             qty = calc_qty(balance, entry, sl, risk_amount)
+            logging.info(f"🔴 SELL setup → Entry={entry:.5f} SL={sl:.5f} TP={tp:.5f} Qty={qty}")
             if qty > 0:
                 place_order("Sell", entry, sl, tp, qty)
+                last_signal = "sell"
+            else:
+                logging.warning("⚠️ SELL ignored (qty=0)")
 
 # ================== MAIN LOOP ==================
 def main():
-    logging.info(f"Bot started on {INTERVAL}m timeframe")
+    logging.info(f"🤖 Bot started on {INTERVAL}m timeframe")
     logging.info(f"Initial HA Open = {INITIAL_HA_OPEN}")
 
     while True:
