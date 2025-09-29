@@ -8,10 +8,10 @@ from pybit.unified_trading import HTTP
 SYMBOL = "TRXUSDT"
 RISK_PER_TRADE = 0.10   # 10% of balance
 LEVERAGE = 75
-INTERVAL = "3"          # 1h candles
+INTERVAL = "3"          # 3m candles
 CANDLE_SECONDS = 180
 WINDOW = 8              # rolling HA window
-INITIAL_HA_OPEN = 0.33350
+INITIAL_HA_OPEN = 0.33304  # only HA open is seeded
 ROUNDING = 5
 
 # ================== API KEYS ==================
@@ -25,7 +25,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 # ================== GLOBAL STATE ==================
 ha_candles = []
 last_signal = None
-last_ha_open = None  # will use INITIAL_HA_OPEN first time
+last_ha_open = None
 first_build = True   # flag for initial HA open usage
 
 # ================== FUNCTIONS ==================
@@ -57,8 +57,10 @@ def build_ha(raw, prev_ha_open):
 
 def log_candle(c):
     logging.info(
-        f"Candle {c['time']} | Raw O:{c['raw']['o']} H:{c['raw']['h']} L:{c['raw']['l']} C:{c['raw']['c']} "
-        f"| HA O:{c['ha']['o']} H:{c['ha']['h']} L:{c['ha']['l']} C:{c['ha']['c']} | Color={c['color']}"
+        f"Candle {c['time']} | Raw O:{c['raw']['o']} H:{c['raw']['h']} "
+        f"L:{c['raw']['l']} C:{c['raw']['c']} | "
+        f"HA O:{c['ha']['o']} H:{c['ha']['h']} "
+        f"L:{c['ha']['l']} C:{c['ha']['c']} | Color={c['color']}"
     )
 
 def get_balance():
@@ -95,6 +97,7 @@ def process_new_candle():
     global last_signal, last_ha_open, ha_candles, first_build
 
     raw = fetch_last_closed()
+
     if first_build:
         prev_ha_open = INITIAL_HA_OPEN
         first_build = False
@@ -147,7 +150,9 @@ def process_new_candle():
 
 # ================== MAIN LOOP ==================
 def main():
-    logging.info(f"🤖 Bot starting on {INTERVAL}m candles with Initial HA Open={INITIAL_HA_OPEN}")
+    logging.info(
+        f"🤖 Bot starting on {INTERVAL}m candles with Initial HA Open={INITIAL_HA_OPEN}"
+    )
     while True:
         now = datetime.now(timezone.utc)
         sec_into_cycle = (now.minute * 60 + now.second) % CANDLE_SECONDS
