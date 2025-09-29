@@ -11,7 +11,7 @@ LEVERAGE = 75
 INTERVAL = "3"          # 3m candles
 CANDLE_SECONDS = 180
 WINDOW = 8              # rolling HA window
-INITIAL_HA_OPEN = 0.33348
+INITIAL_HA_OPEN = 0.33282 # pasted value
 ROUNDING = 5
 
 # ================== API KEYS ==================
@@ -26,7 +26,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 ha_candles = []
 last_signal = None
 last_ha_open = None
-first_candle = True  # flag to handle first HA candle
+last_ha_close = None
+first_build = True   # first HA candle flag
 
 # ================== FUNCTIONS ==================
 def fetch_last_closed():
@@ -41,13 +42,14 @@ def fetch_last_closed():
         "c": float(raw[4])
     }
 
-def build_ha(raw, prev_ha_open, first=False):
-    """Build a new HA candle from raw candle and previous HA open."""
+def build_ha(raw, prev_ha_open, prev_ha_close):
+    """Build a new HA candle from raw candle and previous HA open/close."""
     ha_close = (raw["o"] + raw["h"] + raw["l"] + raw["c"]) / 4
-    if first:
-        ha_open = INITIAL_HA_OPEN  # use pasted value exactly
+    if prev_ha_open is None or prev_ha_close is None:
+        # first candle uses INITIAL_HA_OPEN
+        ha_open = (INITIAL_HA_OPEN + ha_close) / 2
     else:
-        ha_open = (prev_ha_open + ha_close) / 2
+        ha_open = (prev_ha_open + prev_ha_close) / 2
     ha_high = max(raw["h"], ha_open, ha_close)
     ha_low = min(raw["l"], ha_open, ha_close)
     color = "green" if ha_close >= ha_open else "red"
@@ -60,10 +62,8 @@ def build_ha(raw, prev_ha_open, first=False):
 
 def log_candle(c):
     logging.info(
-        f"Candle {c['time']} | Raw O:{c['raw']['o']} H:{c['raw']['h']} "
-        f"L:{c['raw']['l']} C:{c['raw']['c']} | "
-        f"HA O:{c['ha']['o']} H:{c['ha']['h']} "
-        f"L:{c['ha']['l']} C:{c['ha']['c']} | Color={c['color']}"
+        f"Candle {c['time']} | Raw O:{c['raw']['o']} H:{c['raw']['h']} L:{c['raw']['l']} C:{c['raw']['c']} "
+        f"| HA O:{c['ha']['o']} H:{c['ha']['h']} L:{c['ha']['l']} C:{c['ha']['c']} | Color={c['color']}"
     )
 
 def get_balance():
@@ -97,16 +97,15 @@ def place_order(side, entry, sl, tp, qty):
         logging.error(f"❌ Error placing order: {e}")
 
 def process_new_candle():
-    global last_signal, last_ha_open, ha_candles, first_candle
+    global last_signal, last_ha_open, last_ha_close, ha_candles, first_build
 
     raw = fetch_last_closed()
-    candle = build_ha(raw, last_ha_open, first=first_candle)
+    candle = build_ha(raw, last_ha_open, last_ha_close)
+
     last_ha_open = candle["ha"]["o"]
+    last_ha_close = candle["ha"]["c"]
 
     log_candle(candle)
-
-    if first_candle:
-        first_candle = False
 
     # Store into rolling window
     ha_candles.append(candle)
@@ -165,3 +164,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
