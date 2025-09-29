@@ -11,7 +11,7 @@ LEVERAGE = 75
 INTERVAL = "3"          # 3m candles
 CANDLE_SECONDS = 180
 WINDOW = 8              # rolling HA window
-INITIAL_HA_OPEN = 0.33246
+INITIAL_HA_OPEN = 0.33333
 ROUNDING = 5
 
 # ================== API KEYS ==================
@@ -25,9 +25,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 # ================== GLOBAL STATE ==================
 ha_candles = []
 last_signal = None
-last_ha_open = INITIAL_HA_OPEN
-first_build = True
-seed_candle_logged = False  # To log the initial raw candle only once
+last_ha_open = None
+first_candle = True
 
 # ================== FUNCTIONS ==================
 def fetch_last_closed():
@@ -56,10 +55,11 @@ def build_ha(raw, prev_ha_open):
         "color": color
     }
 
-def log_candle(c):
+def log_candle(c, first=False):
+    prefix = "🔑 FIRST HA Candle → " if first else ""
     logging.info(
-        f"Candle {c['time']} | Raw O:{c['raw']['o']} H:{c['raw']['h']} L:{c['raw']['l']} C:{c['raw']['c']} "
-        f"| HA O:{c['ha']['o']} H:{c['ha']['h']} L:{c['ha']['l']} C:{c['ha']['c']} | Color={c['color']}"
+        f"{prefix}Raw O:{c['raw']['o']} H:{c['raw']['h']} L:{c['raw']['l']} C:{c['raw']['c']} | "
+        f"HA O:{c['ha']['o']} H:{c['ha']['h']} L:{c['ha']['l']} C:{c['ha']['c']} | Color={c['color']}"
     )
 
 def get_balance():
@@ -93,29 +93,28 @@ def place_order(side, entry, sl, tp, qty):
         logging.error(f"❌ Error placing order: {e}")
 
 def process_new_candle():
-    global last_signal, last_ha_open, ha_candles, first_build, seed_candle_logged
+    global last_signal, last_ha_open, ha_candles, first_candle
 
     raw = fetch_last_closed()
 
-    # Log the raw candle used for INITIAL_HA_OPEN
-    if first_build and not seed_candle_logged:
-        logging.info(
-            f"🔑 Raw candle used to calculate INITIAL_HA_OPEN={INITIAL_HA_OPEN}: "
-            f"O={raw['o']}, H={raw['h']}, L={raw['l']}, C={raw['c']}"
-        )
-        seed_candle_logged = True
+    if first_candle:
+        # Use INITIAL_HA_OPEN for first HA candle
+        prev_ha_open = INITIAL_HA_OPEN
+        candle = build_ha(raw, prev_ha_open)
+        last_ha_open = candle["ha"]["o"]
+        log_candle(candle, first=True)
+        first_candle = False
+    else:
+        candle = build_ha(raw, last_ha_open)
+        last_ha_open = candle["ha"]["o"]
+        log_candle(candle)
 
-    candle = build_ha(raw, last_ha_open)
-    last_ha_open = candle["ha"]["o"]
-    first_build = False
-    log_candle(candle)
-
-    # Store into rolling window
+    # Rolling window
     ha_candles.append(candle)
     if len(ha_candles) > WINDOW:
         ha_candles.pop(0)
 
-    # Only start trading after first WINDOW candles
+    # Only trade after WINDOW candles
     if len(ha_candles) < WINDOW:
         logging.info(f"📉 Accumulating candles ({len(ha_candles)}/{WINDOW})... not trading yet.")
         return
@@ -151,7 +150,7 @@ def process_new_candle():
 
 # ================== MAIN LOOP ==================
 def main():
-    logging.info(f"🤖 Bot starting on {INTERVAL}m candles with Initial HA Open={INITIAL_HA_OPEN}")
+    logging.info(f"🤖 Bot starting on {INTERVAL}m candles with INITIAL_HA_OPEN={INITIAL_HA_OPEN}")
     while True:
         now = datetime.now(timezone.utc)
         sec_into_cycle = (now.minute * 60 + now.second) % CANDLE_SECONDS
