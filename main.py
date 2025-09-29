@@ -11,7 +11,7 @@ LEVERAGE = 75
 INTERVAL = "3"          # 1h candles
 CANDLE_SECONDS = 180
 WINDOW = 8              # rolling HA window
-INITIAL_HA_OPEN = 0.33431
+INITIAL_HA_OPEN = 0.33385
 ROUNDING = 5
 
 # ================== API KEYS ==================
@@ -25,7 +25,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 # ================== GLOBAL STATE ==================
 ha_candles = []
 last_signal = None
-last_ha_open = INITIAL_HA_OPEN
+last_ha_open = None  # will use INITIAL_HA_OPEN first time
+first_build = True   # flag for initial HA open usage
 
 # ================== FUNCTIONS ==================
 def fetch_last_closed():
@@ -91,10 +92,17 @@ def place_order(side, entry, sl, tp, qty):
         logging.error(f"❌ Error placing order: {e}")
 
 def process_new_candle():
-    global last_signal, last_ha_open, ha_candles
+    global last_signal, last_ha_open, ha_candles, first_build
 
     raw = fetch_last_closed()
-    candle = build_ha(raw, last_ha_open)
+    if first_build:
+        prev_ha_open = INITIAL_HA_OPEN
+        first_build = False
+        logging.info(f"🔑 Using INITIAL_HA_OPEN={INITIAL_HA_OPEN} for first HA candle...")
+    else:
+        prev_ha_open = last_ha_open
+
+    candle = build_ha(raw, prev_ha_open)
     last_ha_open = candle["ha"]["o"]
     log_candle(candle)
 
@@ -146,7 +154,7 @@ def main():
         wait = CANDLE_SECONDS - sec_into_cycle
         if wait <= 0:
             wait += CANDLE_SECONDS
-        logging.info(f"⏳ Waiting {wait}s until next 1h candle close...")
+        logging.info(f"⏳ Waiting {wait}s until next candle close...")
         time.sleep(wait + 2)
         try:
             process_new_candle()
