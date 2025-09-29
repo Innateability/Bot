@@ -8,10 +8,10 @@ from pybit.unified_trading import HTTP
 SYMBOL = "TRXUSDT"
 RISK_PER_TRADE = 0.10   # 10% of balance
 LEVERAGE = 75
-INTERVAL = "60"          # 3m candles
+INTERVAL = "60"          # 1h candles
 CANDLE_SECONDS = 3600
 WINDOW = 8              # rolling HA window
-INITIAL_HA_OPEN = 0.33347 # pasted value
+INITIAL_HA_OPEN = 0.33411 # pasted value
 ROUNDING = 5
 
 # ================== API KEYS ==================
@@ -42,17 +42,20 @@ def fetch_last_closed():
         "c": float(raw[4])
     }
 
-def build_ha(raw, prev_ha_open, prev_ha_close):
-    """Build a new HA candle from raw candle and previous HA open/close."""
+def build_ha(raw, prev_ha_open, prev_ha_close, first=False):
+    """Build a new HA candle from raw candle and previous HA values."""
     ha_close = (raw["o"] + raw["h"] + raw["l"] + raw["c"]) / 4
-    if prev_ha_open is None or prev_ha_close is None:
-        # first candle uses INITIAL_HA_OPEN
-        ha_open = (INITIAL_HA_OPEN + ha_close) / 2
+
+    if first:
+        # First candle: use INITIAL_HA_OPEN directly
+        ha_open = INITIAL_HA_OPEN
     else:
         ha_open = (prev_ha_open + prev_ha_close) / 2
+
     ha_high = max(raw["h"], ha_open, ha_close)
     ha_low = min(raw["l"], ha_open, ha_close)
     color = "green" if ha_close >= ha_open else "red"
+
     return {
         "time": datetime.fromtimestamp(raw["time"]/1000),
         "raw": raw,
@@ -60,9 +63,10 @@ def build_ha(raw, prev_ha_open, prev_ha_close):
         "color": color
     }
 
-def log_candle(c):
+def log_candle(c, first=False):
+    prefix = "FIRST" if first else "Candle"
     logging.info(
-        f"Candle {c['time']} | Raw O:{c['raw']['o']} H:{c['raw']['h']} L:{c['raw']['l']} C:{c['raw']['c']} "
+        f"{prefix} {c['time']} | Raw O:{c['raw']['o']} H:{c['raw']['h']} L:{c['raw']['l']} C:{c['raw']['c']} "
         f"| HA O:{c['ha']['o']} H:{c['ha']['h']} L:{c['ha']['l']} C:{c['ha']['c']} | Color={c['color']}"
     )
 
@@ -100,12 +104,13 @@ def process_new_candle():
     global last_signal, last_ha_open, last_ha_close, ha_candles, first_build
 
     raw = fetch_last_closed()
-    candle = build_ha(raw, last_ha_open, last_ha_close)
+    candle = build_ha(raw, last_ha_open, last_ha_close, first=first_build)
 
     last_ha_open = candle["ha"]["o"]
     last_ha_close = candle["ha"]["c"]
 
-    log_candle(candle)
+    log_candle(candle, first=first_build)
+    first_build = False
 
     # Store into rolling window
     ha_candles.append(candle)
@@ -164,3 +169,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
