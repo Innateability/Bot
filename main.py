@@ -8,10 +8,10 @@ from pybit.unified_trading import HTTP
 SYMBOL = "TRXUSDT"
 RISK_PER_TRADE = 0.10   # 10% of balance
 LEVERAGE = 75
-INTERVAL = "3"          # 3m candles
-CANDLE_SECONDS = 180
-WINDOW = 8              # rolling HA window
-INITIAL_HA_OPEN = 0.33282 # pasted value
+INTERVAL = "60"          # 1-hour candles
+CANDLE_SECONDS = 3600
+WINDOW = 8               # rolling HA window
+INITIAL_HA_OPEN = 0.3332 # pasted value
 ROUNDING = 5
 
 # ================== API KEYS ==================
@@ -27,7 +27,6 @@ ha_candles = []
 last_signal = None
 last_ha_open = None
 last_ha_close = None
-first_build = True   # first HA candle flag
 
 # ================== FUNCTIONS ==================
 def fetch_last_closed():
@@ -46,7 +45,6 @@ def build_ha(raw, prev_ha_open, prev_ha_close):
     """Build a new HA candle from raw candle and previous HA open/close."""
     ha_close = (raw["o"] + raw["h"] + raw["l"] + raw["c"]) / 4
     if prev_ha_open is None or prev_ha_close is None:
-        # first candle uses INITIAL_HA_OPEN
         ha_open = (INITIAL_HA_OPEN + ha_close) / 2
     else:
         ha_open = (prev_ha_open + prev_ha_close) / 2
@@ -97,7 +95,7 @@ def place_order(side, entry, sl, tp, qty):
         logging.error(f"❌ Error placing order: {e}")
 
 def process_new_candle():
-    global last_signal, last_ha_open, last_ha_close, ha_candles, first_build
+    global last_signal, last_ha_open, last_ha_close, ha_candles
 
     raw = fetch_last_closed()
     candle = build_ha(raw, last_ha_open, last_ha_close)
@@ -112,7 +110,6 @@ def process_new_candle():
     if len(ha_candles) > WINDOW:
         ha_candles.pop(0)
 
-    # Only start trading after first WINDOW candles
     if len(ha_candles) < WINDOW:
         logging.info(f"📉 Accumulating candles ({len(ha_candles)}/{WINDOW})... not trading yet.")
         return
@@ -128,7 +125,7 @@ def process_new_candle():
         last_signal = signal
         balance = get_balance()
         risk_amount = balance * RISK_PER_TRADE
-        entry = candle["ha"]["c"]
+        entry = candle["raw"]["c"]  # Use raw close as entry
 
         if signal == "buy":
             sl = candle["ha"]["l"]
@@ -164,4 +161,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
