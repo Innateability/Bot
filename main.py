@@ -8,10 +8,10 @@ from pybit.unified_trading import HTTP
 SYMBOL = "TRXUSDT"
 RISK_PER_TRADE = 0.10   # 10% of balance
 LEVERAGE = 75
-INTERVAL = "60"          # 1h candles
-CANDLE_SECONDS = 3600
+INTERVAL = "3"          # 1h candles
+CANDLE_SECONDS = 180
 WINDOW = 8              # rolling HA window
-INITIAL_HA_OPEN = 0.33509
+INITIAL_HA_OPEN = 0.33431
 ROUNDING = 5
 
 # ================== API KEYS ==================
