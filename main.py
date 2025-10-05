@@ -10,7 +10,7 @@ RISK_PER_TRADE = 0.20   # 20% of balance
 FALLBACK = 0.90         # fallback % if qty unaffordable
 LEVERAGE = 75
 INTERVAL = "240"         # timeframe in minutes (can be changed)
-CANDLE_SECONDS = 4 * 60 * 60
+CANDLE_SECONDS = 3 * 60
 ROUNDING = 5
 
 # ================== API KEYS ==================
