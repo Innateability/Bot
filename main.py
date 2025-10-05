@@ -6,12 +6,11 @@ from pybit.unified_trading import HTTP
 
 # ================== CONFIG ==================
 SYMBOL = "TRXUSDT"
-RISK_PER_TRADE = 0.10   # 10% of balance
+RISK_PER_TRADE = 0.20   # 20% of balance
+FALLBACK = 0.90         # fallback % if qty unaffordable
 LEVERAGE = 75
-INTERVAL = "60"          # 1h candles
-CANDLE_SECONDS = 3600
-WINDOW = 8              # rolling HA window
-INITIAL_HA_OPEN = 0.33411 # pasted value
+INTERVAL = "3"        # timeframe (in minutes, default 4h)
+CANDLE_SECONDS = 3 * 60
 ROUNDING = 5
 
 # ================== API KEYS ==================
@@ -23,150 +22,161 @@ session = HTTP(testnet=False, api_key=API_KEY, api_secret=API_SECRET)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 
 # ================== GLOBAL STATE ==================
-ha_candles = []
 last_signal = None
-last_ha_open = None
-last_ha_close = None
-first_build = True   # first HA candle flag
+last_trade_result = "win"
+last_order_id = None
 
 # ================== FUNCTIONS ==================
 def fetch_last_closed():
-    """Fetch the last fully closed raw candle."""
+    """Fetch last fully closed raw candle."""
     resp = session.get_kline(category="linear", symbol=SYMBOL, interval=INTERVAL, limit=3)
-    raw = resp["result"]["list"][-2]  # last closed
-    return {
+    raw = resp["result"]["list"][-2]  # last fully closed
+    parsed = {
         "time": int(raw[0]),
         "o": float(raw[1]),
         "h": float(raw[2]),
         "l": float(raw[3]),
         "c": float(raw[4])
     }
-
-def build_ha(raw, prev_ha_open, prev_ha_close, first=False):
-    """Build a new HA candle from raw candle and previous HA values."""
-    ha_close = (raw["o"] + raw["h"] + raw["l"] + raw["c"]) / 4
-
-    if first:
-        # First candle: use INITIAL_HA_OPEN directly
-        ha_open = INITIAL_HA_OPEN
-    else:
-        ha_open = (prev_ha_open + prev_ha_close) / 2
-
-    ha_high = max(raw["h"], ha_open, ha_close)
-    ha_low = min(raw["l"], ha_open, ha_close)
-    color = "green" if ha_close >= ha_open else "red"
-
-    return {
-        "time": datetime.fromtimestamp(raw["time"]/1000),
-        "raw": raw,
-        "ha": {"o": ha_open, "h": ha_high, "l": ha_low, "c": ha_close},
-        "color": color
-    }
-
-def log_candle(c, first=False):
-    prefix = "FIRST" if first else "Candle"
-    logging.info(
-        f"{prefix} {c['time']} | Raw O:{c['raw']['o']} H:{c['raw']['h']} L:{c['raw']['l']} C:{c['raw']['c']} "
-        f"| HA O:{c['ha']['o']} H:{c['ha']['h']} L:{c['ha']['l']} C:{c['ha']['c']} | Color={c['color']}"
-    )
+    logging.info(f"🕯️ Closed candle → O:{parsed['o']} H:{parsed['h']} L:{parsed['l']} C:{parsed['c']}")
+    return parsed
 
 def get_balance():
     resp = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
-    return float(resp["result"]["list"][0]["coin"][0]["walletBalance"])
+    balance = float(resp["result"]["list"][0]["coin"][0]["walletBalance"])
+    logging.info(f"💰 Wallet balance fetched: {balance:.4f} USDT")
+    return balance
 
-def calc_qty(balance, entry, sl, risk_amount):
+def calc_qty(balance, entry, sl):
     sl_dist = abs(entry - sl)
     if sl_dist <= 0:
-        return 0
-    qty_by_risk = (risk_amount / sl_dist) * LEVERAGE
-    max_affordable = (balance * LEVERAGE) / entry * 0.9
-    return max(0, int(min(qty_by_risk, max_affordable)))
+        return 0, 0
+    qty_by_risk = (balance * RISK_PER_TRADE) / sl_dist
+    max_affordable = (balance * LEVERAGE * FALLBACK) / entry
+    return qty_by_risk, max_affordable
 
-def place_order(side, entry, sl, tp, qty):
-    logging.info(f"🚀 {side.upper()} ORDER | Entry={entry:.5f} SL={sl:.5f} TP={tp:.5f} Qty={qty}")
+def close_open_positions():
+    """Close any open position and check PnL result."""
+    global last_trade_result, last_order_id
     try:
+        pos = session.get_positions(category="linear", symbol=SYMBOL)
+        if pos["result"]["list"]:
+            size = float(pos["result"]["list"][0]["size"])
+            side = pos["result"]["list"][0]["side"]
+            if size > 0:
+                logging.info(f"🔻 Closing open {side} position of size {size}")
+                session.place_order(
+                    category="linear",
+                    symbol=SYMBOL,
+                    side="Sell" if side == "Buy" else "Buy",
+                    orderType="Market",
+                    qty=str(size),
+                    reduceOnly=True,
+                    timeInForce="IOC"
+                )
+                time.sleep(2)
+
+        # check last closed trade
+        resp = session.get_closed_pnl(category="linear", symbol=SYMBOL, limit=1)
+        if resp["result"]["list"]:
+            last = resp["result"]["list"][0]
+            pnl = float(last["closedPnl"])
+            last_order_id = last["orderId"]
+            if pnl < 0:
+                last_trade_result = "loss"
+                logging.info(f"📉 Last trade LOSS (PnL={pnl})")
+            else:
+                last_trade_result = "win"
+                logging.info(f"📈 Last trade WIN (PnL={pnl})")
+    except Exception as e:
+        logging.error(f"❌ Error closing position or fetching pnl: {e}")
+
+def place_order(side, entry, sl, tp, qty, mode):
+    try:
+        logging.info(f"🚀 Placing {mode.upper()} {side.upper()} order | Entry={entry:.5f} SL={sl:.5f} TP={tp:.5f} Qty={qty:.2f}")
         resp = session.place_order(
             category="linear",
             symbol=SYMBOL,
             side=side.capitalize(),
             orderType="Market",
-            qty=str(qty),
+            qty=str(round(qty, 3)),
             timeInForce="IOC",
             reduceOnly=False,
+            takeProfit=str(round(tp, ROUNDING)),
             stopLoss=str(round(sl, ROUNDING)),
-            takeProfit=str(round(tp, ROUNDING))
+            positionIdx=0  # One-way mode
         )
-        logging.info(f"Order response: {resp}")
+        logging.info(f"✅ Order response: {resp}")
     except Exception as e:
         logging.error(f"❌ Error placing order: {e}")
 
 def process_new_candle():
-    global last_signal, last_ha_open, last_ha_close, ha_candles, first_build
+    global last_signal, last_trade_result
 
     raw = fetch_last_closed()
-    candle = build_ha(raw, last_ha_open, last_ha_close, first=first_build)
+    color = "green" if raw["c"] > raw["o"] else "red"
+    logging.info(f"📊 Candle color → {color.upper()} | O:{raw['o']} H:{raw['h']} L:{raw['l']} C:{raw['c']}")
 
-    last_ha_open = candle["ha"]["o"]
-    last_ha_close = candle["ha"]["c"]
+    signal = "buy" if color == "green" else "sell"
 
-    log_candle(candle, first=first_build)
-    first_build = False
-
-    # Store into rolling window
-    ha_candles.append(candle)
-    if len(ha_candles) > WINDOW:
-        ha_candles.pop(0)
-
-    # Only start trading after first WINDOW candles
-    if len(ha_candles) < WINDOW:
-        logging.info(f"📉 Accumulating candles ({len(ha_candles)}/{WINDOW})... not trading yet.")
+    if last_signal is None:
+        last_signal = signal
+        logging.info(f"📍 First signal: {signal.upper()} (waiting for color change)")
         return
 
-    # Signal logic: majority color in last WINDOW
-    greens = sum(1 for c in ha_candles if c["color"] == "green")
-    reds = WINDOW - greens
-    signal = "buy" if greens > reds else "sell"
-
-    logging.info(f"Signal={signal.upper()} | Last Signal={last_signal}")
-
     if signal != last_signal:
-        last_signal = signal
+        logging.info(f"📊 New signal detected ({signal.upper()}), previous={last_signal.upper()}")
+        # Close current trade and fetch last PnL
+        close_open_positions()
+
+        # Determine if recovery trade
+        recovery_mode = (last_trade_result == "loss")
+
         balance = get_balance()
-        risk_amount = balance * RISK_PER_TRADE
-        entry = candle["raw"]["c"]
+        entry = raw["c"]
+        sl = raw["l"] if signal == "buy" else raw["h"]
 
-        if signal == "buy":
-            sl = candle["ha"]["l"]
-            tp = entry + (2 * (entry - sl)) + (entry * 0.001)
-            qty = calc_qty(balance, entry, sl, risk_amount)
-            logging.info(f"🟢 BUY setup → Entry={entry:.5f} SL={sl:.5f} TP={tp:.5f} Qty={qty}")
-            if qty > 0:
-                place_order("Buy", entry, sl, tp, qty)
+        qty_by_risk, max_affordable = calc_qty(balance, entry, sl)
+        tp_normal = entry * (1 + 0.0021) if signal == "buy" else entry * (1 - 0.0021)
 
-        elif signal == "sell":
-            sl = candle["ha"]["h"]
-            tp = entry - (2 * (sl - entry)) - (entry * 0.001)
-            qty = calc_qty(balance, entry, sl, risk_amount)
-            logging.info(f"🔴 SELL setup → Entry={entry:.5f} SL={sl:.5f} TP={tp:.5f} Qty={qty}")
-            if qty > 0:
-                place_order("Sell", entry, sl, tp, qty)
+        if recovery_mode:
+            # Compute recovery TP using both qty-based and max-affordable recovery targets
+            tp_risk = entry + (entry - sl) * 2 if signal == "buy" else entry - (sl - entry) * 2
+            tp_affordable = entry + (entry - sl) * (max_affordable / qty_by_risk) if signal == "buy" else entry - (sl - entry) * (max_affordable / qty_by_risk)
+
+            # For BUY, take lower TP; for SELL, take higher TP
+            if signal == "buy":
+                tp = min(tp_risk, tp_affordable)
+            else:
+                tp = max(tp_risk, tp_affordable)
+
+            logging.info(f"⚡ Recovery trade mode (based on last loss) → TP Risk={tp_risk:.5f}, TP Affordable={tp_affordable:.5f}, Chosen={tp:.5f}")
+        else:
+            tp = tp_normal
+            logging.info(f"✅ Normal trade mode → TP={tp:.5f} (+/-0.21%)")
+
+        qty_final = min(qty_by_risk, max_affordable)
+        place_order(signal, entry, sl, tp, qty_final, "recovery" if recovery_mode else "normal")
+
+        last_signal = signal
+    else:
+        logging.info("⏸️ No color change, no trade triggered.")
 
 # ================== MAIN LOOP ==================
 def main():
-    logging.info(f"🤖 Bot starting on {INTERVAL}m candles with Initial HA Open={INITIAL_HA_OPEN}")
+    logging.info(f"🤖 Bot started | Symbol={SYMBOL} | TF={INTERVAL}m | Leverage={LEVERAGE}x | Cross Margin | One-way mode")
     while True:
         now = datetime.now(timezone.utc)
-        sec_into_cycle = (now.minute * 60 + now.second) % CANDLE_SECONDS
+        sec_into_cycle = (now.hour * 3600 + now.minute * 60 + now.second) % CANDLE_SECONDS
         wait = CANDLE_SECONDS - sec_into_cycle
         if wait <= 0:
             wait += CANDLE_SECONDS
-        logging.info(f"⏳ Waiting {wait}s until next candle close...")
-        time.sleep(wait + 2)
+        logging.info(f"⏳ Waiting {wait}s for next candle close...")
+        time.sleep(wait + 3)
         try:
             process_new_candle()
         except Exception as e:
-            logging.error(f"❌ Error: {e}")
+            logging.error(f"Error in main loop: {e}")
 
 if __name__ == "__main__":
     main()
-    
