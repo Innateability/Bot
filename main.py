@@ -9,7 +9,7 @@ SYMBOL = "TRXUSDT"
 RISK_PER_TRADE = 0.20   # 20% of balance
 FALLBACK = 0.90         # fallback % if qty unaffordable
 LEVERAGE = 75
-INTERVAL = "240"       # default 4h, can be set to any TF (e.g., "60", "15", etc.)
+INTERVAL = "3"       # default 4h, can be set to any TF (e.g., "60", "15", etc.)
 ROUNDING = 5
 
 # ================== API KEYS ==================
