@@ -149,7 +149,7 @@ def process_new_candle():
             return
 
         if recovery_mode:
-            pnl_adj = last_pnl / qty_final * (-1)
+            pnl_adj = abs(last_pnl) / qty_final 
             if signal == "buy":
                 tp = entry + pnl_adj + (entry * 0.0011)
             else:
