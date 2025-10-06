@@ -21,7 +21,6 @@ session = HTTP(testnet=False, api_key=API_KEY, api_secret=API_SECRET)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 
 # ================== GLOBAL STATE ==================
-last_signal = None
 last_trade_result = "win"
 last_order_id = None
 last_pnl = 0.0
@@ -84,7 +83,7 @@ def close_open_positions():
         if resp["result"]["list"]:
             last = resp["result"]["list"][0]
             pnl = float(last["closedPnl"])
-            last_pnl = pnl 
+            last_pnl = pnl
             last_order_id = last["orderId"]
             if pnl < 0:
                 last_trade_result = "loss"
@@ -118,54 +117,43 @@ def place_order(side, entry, sl, tp, qty, mode):
 
 
 def process_new_candle():
-    global last_signal, last_trade_result, last_pnl
+    global last_trade_result, last_pnl
 
     raw = fetch_last_closed()
     color = "green" if raw["c"] > raw["o"] else "red"
-    logging.info(f"📊 Candle color → {color.upper()} | O:{raw['o']} H:{raw['h']} L:{raw['l']} C:{raw['c']}")
-
     signal = "buy" if color == "green" else "sell"
+    logging.info(f"📊 Candle color → {color.upper()} | Signal → {signal.upper()}")
 
-    if last_signal is None:
-        last_signal = signal
-        logging.info(f"📍 First signal: {signal.upper()} (waiting for color change)")
+    # Always close open trade before new one
+    close_open_positions()
+
+    recovery_mode = (last_trade_result == "loss")
+
+    balance = get_balance()
+    entry = raw["c"]
+    sl = raw["l"] if signal == "buy" else raw["h"]
+
+    qty_by_risk, max_affordable = calc_qty(balance, entry, sl)
+    qty_final = min(qty_by_risk, max_affordable)
+    if qty_final <= 0:
+        logging.warning("⚠️ Quantity is zero or less, skipping trade.")
         return
 
-    if signal != last_signal:
-        logging.info(f"📊 New signal detected ({signal.upper()}), previous={last_signal.upper()}")
-        # Close current trade and fetch last PnL
-        close_open_positions()
-
-        recovery_mode = (last_trade_result == "loss")
-
-        balance = get_balance()
-        entry = raw["c"]
-        sl = raw["l"] if signal == "buy" else raw["h"]
-
-        qty_by_risk, max_affordable = calc_qty(balance, entry, sl)
-        qty_final = min(qty_by_risk, max_affordable)
-        if qty_final <= 0:
-            logging.warning("⚠️ Quantity is zero or less, skipping trade.")
-            return
-
-        if recovery_mode:
-            pnl_adj = abs(last_pnl) / qty_final 
-            if signal == "buy":
-                tp = entry + pnl_adj + (entry * 0.0011)
-            else:
-                tp = entry - pnl_adj - (entry * 0.0011)
-            logging.info(f"⚡ Recovery trade mode → PnL={last_pnl:.5f}, Qty={qty_final:.2f}, TP={tp:.5f}")
+    if recovery_mode:
+        pnl_adj = abs(last_pnl) / qty_final  # ensure positive PnL for recovery
+        if signal == "buy":
+            tp = entry + pnl_adj + (entry * 0.0011)
         else:
-            if signal == "buy":
-                tp = entry * (1 + 0.0021)
-            else:
-                tp = entry * (1 - 0.0021)
-            logging.info(f"✅ Normal trade mode → TP={tp:.5f} (+/-0.21%)")
-
-        place_order(signal, entry, sl, tp, qty_final, "recovery" if recovery_mode else "normal")
-        last_signal = signal
+            tp = entry - pnl_adj - (entry * 0.0011)
+        logging.info(f"⚡ Recovery trade mode → PnL={last_pnl:.5f}, Qty={qty_final:.2f}, TP={tp:.5f}")
     else:
-        logging.info("⏸️ No color change, no trade triggered.")
+        if signal == "buy":
+            tp = entry * (1 + 0.0021)
+        else:
+            tp = entry * (1 - 0.0021)
+        logging.info(f"✅ Normal trade mode → TP={tp:.5f} (+/-0.21%)")
+
+    place_order(signal, entry, sl, tp, qty_final, "recovery" if recovery_mode else "normal")
 
 
 # ================== MAIN LOOP ==================
