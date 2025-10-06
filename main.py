@@ -84,7 +84,7 @@ def close_open_positions():
         if resp["result"]["list"]:
             last = resp["result"]["list"][0]
             pnl = float(last["closedPnl"])
-            last_pnl = pnl
+            last_pnl = pnl 
             last_order_id = last["orderId"]
             if pnl < 0:
                 last_trade_result = "loss"
@@ -149,7 +149,7 @@ def process_new_candle():
             return
 
         if recovery_mode:
-            pnl_adj = last_pnl / qty_final
+            pnl_adj = last_pnl / qty_final * (-1)
             if signal == "buy":
                 tp = entry + pnl_adj + (entry * 0.0011)
             else:
