@@ -9,8 +9,7 @@ SYMBOL = "TRXUSDT"
 RISK_PER_TRADE = 0.20   # 20% of balance
 FALLBACK = 0.90         # fallback % if qty unaffordable
 LEVERAGE = 75
-INTERVAL = "3"          # timeframe (in minutes, default 4h)
-CANDLE_SECONDS = 3 * 60
+INTERVAL = "3"        # default 4h, can be set to any TF (e.g., "60", "15", etc.)
 ROUNDING = 5
 
 # ================== API KEYS ==================
@@ -25,6 +24,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 last_signal = None
 last_trade_result = "win"
 last_order_id = None
+last_pnl = 0.0
 
 # ================== FUNCTIONS ==================
 def fetch_last_closed():
@@ -53,14 +53,14 @@ def calc_qty(balance, entry, sl):
     sl_dist = abs(entry - sl)
     if sl_dist <= 0:
         return 0, 0
-    qty_by_risk = (balance * RISK_PER_TRADE) / sl_dist
+    qty_by_risk = (balance / 5) / sl_dist
     max_affordable = (balance * LEVERAGE * FALLBACK) / entry
     return qty_by_risk, max_affordable
 
 
 def close_open_positions():
     """Close any open position and check PnL result."""
-    global last_trade_result, last_order_id
+    global last_trade_result, last_order_id, last_pnl
     try:
         pos = session.get_positions(category="linear", symbol=SYMBOL)
         if pos["result"]["list"]:
@@ -84,6 +84,7 @@ def close_open_positions():
         if resp["result"]["list"]:
             last = resp["result"]["list"][0]
             pnl = float(last["closedPnl"])
+            last_pnl = pnl
             last_order_id = last["orderId"]
             if pnl < 0:
                 last_trade_result = "loss"
@@ -97,13 +98,14 @@ def close_open_positions():
 
 def place_order(side, entry, sl, tp, qty, mode):
     try:
+        qty = int(qty)
         logging.info(f"🚀 Placing {mode.upper()} {side.upper()} order | Entry={entry:.5f} SL={sl:.5f} TP={tp:.5f} Qty={qty}")
         resp = session.place_order(
             category="linear",
             symbol=SYMBOL,
             side=side.capitalize(),
             orderType="Market",
-            qty=str(int(qty)),
+            qty=str(qty),
             timeInForce="IOC",
             reduceOnly=False,
             takeProfit=str(round(tp, ROUNDING)),
@@ -116,7 +118,7 @@ def place_order(side, entry, sl, tp, qty, mode):
 
 
 def process_new_candle():
-    global last_signal, last_trade_result
+    global last_signal, last_trade_result, last_pnl
 
     raw = fetch_last_closed()
     color = "green" if raw["c"] > raw["o"] else "red"
@@ -134,7 +136,6 @@ def process_new_candle():
         # Close current trade and fetch last PnL
         close_open_positions()
 
-        # Determine if recovery trade
         recovery_mode = (last_trade_result == "loss")
 
         balance = get_balance()
@@ -142,28 +143,24 @@ def process_new_candle():
         sl = raw["l"] if signal == "buy" else raw["h"]
 
         qty_by_risk, max_affordable = calc_qty(balance, entry, sl)
-        tp_normal = entry * (1 + 0.0021) if signal == "buy" else entry * (1 - 0.0021)
-
-        if recovery_mode:
-            # Compute recovery TP using both qty-based and max-affordable recovery targets
-            tp_risk = entry + (entry - sl) * 2 if signal == "buy" else entry - (sl - entry) * 2
-            tp_affordable = entry + (entry - sl) * (max_affordable / qty_by_risk) if signal == "buy" else entry - (sl - entry) * (max_affordable / qty_by_risk)
-
-            # For BUY, take lower TP; for SELL, take higher TP
-            if signal == "buy":
-                tp = min(tp_risk, tp_affordable)
-            else:
-                tp = max(tp_risk, tp_affordable)
-
-            logging.info(f"⚡ Recovery trade mode (based on last loss) → TP Risk={tp_risk:.5f}, TP Affordable={tp_affordable:.5f}, Chosen={tp:.5f}")
-        else:
-            tp = tp_normal
-            logging.info(f"✅ Normal trade mode → TP={tp:.5f} (+/-0.21%)")
-
-        qty_final = int(min(qty_by_risk, max_affordable))
+        qty_final = min(qty_by_risk, max_affordable)
         if qty_final <= 0:
             logging.warning("⚠️ Quantity is zero or less, skipping trade.")
             return
+
+        if recovery_mode:
+            pnl_adj = last_pnl / qty_final
+            if signal == "buy":
+                tp = entry + pnl_adj + (entry * 0.0011)
+            else:
+                tp = entry - pnl_adj - (entry * 0.0011)
+            logging.info(f"⚡ Recovery trade mode → PnL={last_pnl:.5f}, Qty={qty_final:.2f}, TP={tp:.5f}")
+        else:
+            if signal == "buy":
+                tp = entry * (1 + 0.0021)
+            else:
+                tp = entry * (1 - 0.0021)
+            logging.info(f"✅ Normal trade mode → TP={tp:.5f} (+/-0.21%)")
 
         place_order(signal, entry, sl, tp, qty_final, "recovery" if recovery_mode else "normal")
         last_signal = signal
@@ -173,13 +170,14 @@ def process_new_candle():
 
 # ================== MAIN LOOP ==================
 def main():
-    logging.info(f"🤖 Bot started | Symbol={SYMBOL} | TF={INTERVAL}m | Leverage={LEVERAGE}x | Cross Margin | One-way mode")
+    logging.info(f"🤖 Bot started | Symbol={SYMBOL} | TF={INTERVAL}m | Leverage={LEVERAGE}x | One-way mode")
+    candle_seconds = int(INTERVAL) * 60
     while True:
         now = datetime.now(timezone.utc)
-        sec_into_cycle = (now.hour * 3600 + now.minute * 60 + now.second) % CANDLE_SECONDS
-        wait = CANDLE_SECONDS - sec_into_cycle
+        sec_into_cycle = (now.hour * 3600 + now.minute * 60 + now.second) % candle_seconds
+        wait = candle_seconds - sec_into_cycle
         if wait <= 0:
-            wait += CANDLE_SECONDS
+            wait += candle_seconds
         logging.info(f"⏳ Waiting {wait}s for next candle close...")
         time.sleep(wait + 3)
         try:
@@ -190,3 +188,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
