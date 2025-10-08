@@ -16,7 +16,7 @@ ROUNDING = 5               # decimal places for TP/SL
 CANDLE_POLL_GRANULARITY = 3  # seconds to wait between retries fetching candles
 
 # Set manually before first run (initial Heikin-Ashi open)
-INITIAL_HA_OPEN = 0.33644
+INITIAL_HA_OPEN = 0.33694
 
 # API keys from environment
 API_KEY = os.getenv("BYBIT_API_KEY")
@@ -132,38 +132,40 @@ def close_all_positions_and_get_last_pnl():
         pos_resp = session.get_positions(category="linear", symbol=SYMBOL)
         if "result" in pos_resp and "list" in pos_resp["result"] and pos_resp["result"]["list"]:
             for p in pos_resp["result"]["list"]:
-                try:
-                    size = float(p.get("size", 0) or 0)
-                    side = p.get("side", "")
-                    if size > 0:
-                        close_side = "Sell" if side.lower() == "buy" else "Buy"
-                        logging.info(f"🔻 Closing existing {side} pos size={size}")
-                        session.place_order(
-                            category="linear",
-                            symbol=SYMBOL,
-                            side=close_side,
-                            orderType="Market",
-                            qty=str(size),
-                            reduceOnly=True,
-                            timeInForce="IOC"
-                        )
-                        time.sleep(1)
-                except Exception:
-                    continue
+                size = float(p.get("size", 0) or 0)
+                side = p.get("side", "")
+                if size > 0:
+                    close_side = "Sell" if side.lower() == "buy" else "Buy"
+                    logging.info(f"🔻 Closing existing {side} pos size={size}")
+                    session.place_order(
+                        category="linear",
+                        symbol=SYMBOL,
+                        side=close_side,
+                        orderType="Market",
+                        qty=str(size),
+                        reduceOnly=True,
+                        timeInForce="IOC"
+                    )
+                    time.sleep(2)  # allow Bybit to register closure
 
-        # get the most recent closed pnl for symbol
-        resp = session.get_closed_pnl(category="linear", symbol=SYMBOL, limit=1)
+        # fetch latest closed pnl entries
+        resp = session.get_closed_pnl(category="linear", symbol=SYMBOL, limit=3)
         pnl = 0.0
         if "result" in resp and "list" in resp["result"] and resp["result"]["list"]:
-            last = resp["result"]["list"][0]
-            pnl_val = last.get("closedPnl") or last.get("realisedPnl") or last.get("pnl")
-            if pnl_val is None:
-                pnl = 0.0
-            else:
+            last_trade = resp["result"]["list"][0]
+            pnl_val = last_trade.get("closedPnl") or last_trade.get("realisedPnl") or last_trade.get("pnl")
+            order_id = last_trade.get("orderId")
+
+            if pnl_val is not None:
                 pnl = float(pnl_val)
-                last_order_id = last.get("orderId", last_order_id)
-        last_pnl = pnl
-        logging.info(f"📉 Last closed trade PnL fetched: {last_pnl:.8f} USDT (orderId={last_order_id})")
+                last_order_id = order_id
+                last_pnl = pnl
+                logging.info(f"📉 Latest closed trade → orderId={order_id} | PnL={pnl:.8f} USDT")
+            else:
+                logging.info("⚠️ No closedPnl found for recent trade.")
+        else:
+            logging.info("⚠️ No closed trades yet.")
+
         return last_pnl
     except Exception as e:
         logging.error(f"Error closing positions or fetching pnl: {e}")
