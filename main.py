@@ -16,7 +16,7 @@ ROUNDING = 5               # decimal places for TP/SL
 CANDLE_POLL_GRANULARITY = 3  # seconds to wait between retries fetching candles
 
 # Set manually before first run (initial Heikin-Ashi open)
-INITIAL_HA_OPEN = 0.33694
+INITIAL_HA_OPEN = 0.3366
 
 # API keys from environment
 API_KEY = os.getenv("BYBIT_API_KEY")
@@ -234,7 +234,6 @@ def handle_closed_candle():
             logging.info(f"🔁 Range signal changed → {raw_color.upper()} (raw & HA matched). Resetting range.")
             range_signal = raw_color
             # close open positions when range flips (per spec)
-            close_all_positions_and_get_last_pnl()
             # after closing, fetch last pnl stored in last_pnl
     # If raw and HA don't match, we do nothing to the range (keep previous)
     else:
