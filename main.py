@@ -1,18 +1,24 @@
+#!/usr/bin/env python3
 import os
 import time
+import math
 import logging
 from datetime import datetime, timezone
 from pybit.unified_trading import HTTP
 
-# ================== CONFIG ==================
+# ================== CONFIG (edit as needed) ==================
 SYMBOL = "TRXUSDT"
-RISK_PER_TRADE = 0.20   # 20% of balance
-FALLBACK = 0.90         # fallback % if qty unaffordable
+INTERVAL = "3"           # timeframe in minutes as string (default 4h). e.g. "3","60","240"
+RISK_PER_TRADE = 0.20      # 20% of balance
+FALLBACK = 0.90            # fallback % if qty unaffordable
 LEVERAGE = 75
-INTERVAL = "240"      # default 4h, can be set to any TF (e.g., "60", "15", etc.)
-ROUNDING = 5
+ROUNDING = 5               # decimal places for TP/SL
+CANDLE_POLL_GRANULARITY = 3  # seconds to wait between retries fetching candles
 
-# ================== API KEYS ==================
+# Set manually before first run (initial Heikin-Ashi open)
+INITIAL_HA_OPEN = 0.33644
+
+# API keys from environment
 API_KEY = os.getenv("BYBIT_API_KEY")
 API_SECRET = os.getenv("BYBIT_API_SECRET")
 session = HTTP(testnet=False, api_key=API_KEY, api_secret=API_SECRET)
@@ -21,158 +27,308 @@ session = HTTP(testnet=False, api_key=API_KEY, api_secret=API_SECRET)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 
 # ================== GLOBAL STATE ==================
-last_trade_result = "win"
-last_order_id = None
+range_signal = None            # "buy" or "sell" when raw & HA match
+ha_open_prev = INITIAL_HA_OPEN
+ha_close_prev = INITIAL_HA_OPEN
 last_pnl = 0.0
+last_order_id = None
 
-# ================== FUNCTIONS ==================
-def fetch_last_closed():
-    """Fetch last fully closed raw candle."""
-    resp = session.get_kline(category="linear", symbol=SYMBOL, interval=INTERVAL, limit=3)
-    raw = resp["result"]["list"][-2]  # last fully closed
-    parsed = {
-        "time": int(raw[0]),
-        "o": float(raw[1]),
-        "h": float(raw[2]),
-        "l": float(raw[3]),
-        "c": float(raw[4])
-    }
-    logging.info(f"🕯️ Closed candle → O:{parsed['o']} H:{parsed['h']} L:{parsed['l']} C:{parsed['c']}")
-    return parsed
+# ================== HELPERS ==================
+def now_ts():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
+def fetch_last_closed_raw():
+    """
+    Fetch the last fully closed raw candle (we use limit=3 and take [-2] as last fully closed).
+    Returns dict {time, o, h, l, c}.
+    """
+    try:
+        resp = session.get_kline(category="linear", symbol=SYMBOL, interval=INTERVAL, limit=3)
+        if "result" not in resp or "list" not in resp["result"]:
+            raise RuntimeError(f"Bad kline response: {resp}")
+        raw = resp["result"]["list"][-2]
+        parsed = {
+            "time": int(raw[0]),
+            "o": float(raw[1]),
+            "h": float(raw[2]),
+            "l": float(raw[3]),
+            "c": float(raw[4])
+        }
+        logging.info(f"Parsed candle → O:{parsed['o']:.8f} H:{parsed['h']:.8f} L:{parsed['l']:.8f} C:{parsed['c']:.8f}")
+        return parsed
+    except Exception as e:
+        logging.error(f"Error fetching kline: {e}")
+        raise
 
-def get_balance():
-    resp = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
-    balance = float(resp["result"]["list"][0]["coin"][0]["walletBalance"])
-    logging.info(f"💰 Wallet balance fetched: {balance:.4f} USDT")
-    return balance
+def calc_heikin_ashi(raw, first_candle=False):
+    """
+    Calculate HA using previous HA open & previous HA close for HA open
+    (ha_open = (prev_ha_open + prev_ha_close) / 2)
+    HA close computed from current raw OHLC.
+    """
+    global ha_open_prev, ha_close_prev
+    ha_close = (raw["o"] + raw["h"] + raw["l"] + raw["c"]) / 4.0
+    if first_candle:
+        ha_open = INITIAL_HA_OPEN
+    else:
+        # use previous ha open and previous ha close as requested
+        ha_open = (ha_open_prev + ha_close_prev) / 2.0
+    ha_high = max(raw["h"], ha_open, ha_close)
+    ha_low = min(raw["l"], ha_open, ha_close)
 
+    # update previous HA values for the next iteration
+    ha_open_prev = ha_open
+    ha_close_prev = ha_close
 
-def calc_qty(balance, entry, sl):
+    return {"o": ha_open, "h": ha_high, "l": ha_low, "c": ha_close}
+
+def get_balance_usdt():
+    """Return unified wallet USDT balance (total equity)"""
+    try:
+        resp = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+        # response structure may vary; try a couple of places
+        balance = 0.0
+        if "result" in resp and "list" in resp["result"] and resp["result"]["list"]:
+            # find the walletBalance in nested result
+            try:
+                balance = float(resp["result"]["list"][0]["coin"][0]["walletBalance"])
+            except Exception:
+                # fallback to totalEquity if available
+                try:
+                    balance = float(resp["result"]["list"][0]["totalEquity"])
+                except Exception:
+                    balance = 0.0
+        logging.info(f"💰 Wallet balance fetched: {balance:.8f} USDT")
+        return balance
+    except Exception as e:
+        logging.error(f"Error fetching balance: {e}")
+        return 0.0
+
+def calc_qtys(balance, entry, sl):
+    """
+    Calculate qty_by_risk and max_affordable:
+      - qty_by_risk: how many base units position by risk (uses leverage)
+      - max_affordable: maximum base units affordable given leverage & fallback
+    Returns (qty_by_risk, max_affordable).
+    """
     sl_dist = abs(entry - sl)
     if sl_dist <= 0:
-        return 0, 0
-    qty_by_risk = (balance / 5) / sl_dist
-    max_affordable = (balance * LEVERAGE * FALLBACK) / entry
+        return 0.0, 0.0
+    risk_amount = balance * RISK_PER_TRADE
+    # qty_by_risk in base asset units (approx)
+    qty_by_risk = (risk_amount / sl_dist) * LEVERAGE
+    max_affordable = (balance * LEVERAGE) / entry * FALLBACK
+    logging.info(f"📐 Qty calc → RiskAmt={risk_amount:.8f}, SL Dist={sl_dist:.8f}, QtyByRisk={qty_by_risk:.4f}, MaxAffordable={max_affordable:.4f}")
     return qty_by_risk, max_affordable
 
-
-def close_open_positions():
-    """Close any open position and check PnL result."""
-    global last_trade_result, last_order_id, last_pnl
+def close_all_positions_and_get_last_pnl():
+    """
+    Close any open position (one-way mode) and fetch most recent closedPnl for the symbol.
+    Updates global last_pnl and returns it.
+    """
+    global last_pnl, last_order_id
     try:
-        pos = session.get_positions(category="linear", symbol=SYMBOL)
-        if pos["result"]["list"]:
-            size = float(pos["result"]["list"][0]["size"])
-            side = pos["result"]["list"][0]["side"]
-            if size > 0:
-                logging.info(f"🔻 Closing open {side} position of size {size}")
-                session.place_order(
-                    category="linear",
-                    symbol=SYMBOL,
-                    side="Sell" if side == "Buy" else "Buy",
-                    orderType="Market",
-                    qty=str(size),
-                    reduceOnly=True,
-                    timeInForce="IOC"
-                )
-                time.sleep(2)
+        # close any open positions for the symbol
+        pos_resp = session.get_positions(category="linear", symbol=SYMBOL)
+        if "result" in pos_resp and "list" in pos_resp["result"] and pos_resp["result"]["list"]:
+            for p in pos_resp["result"]["list"]:
+                try:
+                    size = float(p.get("size", 0) or 0)
+                    side = p.get("side", "")
+                    if size > 0:
+                        close_side = "Sell" if side.lower() == "buy" else "Buy"
+                        logging.info(f"🔻 Closing existing {side} pos size={size}")
+                        session.place_order(
+                            category="linear",
+                            symbol=SYMBOL,
+                            side=close_side,
+                            orderType="Market",
+                            qty=str(size),
+                            reduceOnly=True,
+                            timeInForce="IOC"
+                        )
+                        time.sleep(1)
+                except Exception:
+                    continue
 
-        # check last closed trade
+        # get the most recent closed pnl for symbol
         resp = session.get_closed_pnl(category="linear", symbol=SYMBOL, limit=1)
-        if resp["result"]["list"]:
+        pnl = 0.0
+        if "result" in resp and "list" in resp["result"] and resp["result"]["list"]:
             last = resp["result"]["list"][0]
-            pnl = float(last["closedPnl"])
-            last_pnl = pnl
-            last_order_id = last["orderId"]
-            if pnl < 0:
-                last_trade_result = "loss"
-                logging.info(f"📉 Last trade LOSS (PnL={pnl})")
+            pnl_val = last.get("closedPnl") or last.get("realisedPnl") or last.get("pnl")
+            if pnl_val is None:
+                pnl = 0.0
             else:
-                last_trade_result = "win"
-                logging.info(f"📈 Last trade WIN (PnL={pnl})")
+                pnl = float(pnl_val)
+                last_order_id = last.get("orderId", last_order_id)
+        last_pnl = pnl
+        logging.info(f"📉 Last closed trade PnL fetched: {last_pnl:.8f} USDT (orderId={last_order_id})")
+        return last_pnl
     except Exception as e:
-        logging.error(f"❌ Error closing position or fetching pnl: {e}")
+        logging.error(f"Error closing positions or fetching pnl: {e}")
+        return last_pnl
 
-
-def place_order(side, entry, sl, tp, qty, mode):
+def place_order_market(signal, entry, sl, tp, qty_int):
+    """
+    Place a market order (one-way mode). qty_int must be integer (contracts/units).
+    We round TP/SL to ROUNDING decimals for submission.
+    """
+    global last_order_id
     try:
-        qty = int(qty)
-        logging.info(f"🚀 Placing {mode.upper()} {side.upper()} order | Entry={entry:.5f} SL={sl:.5f} TP={tp:.5f} Qty={qty}")
+        sl_str = f"{round(sl, ROUNDING)}"
+        tp_str = f"{round(tp, ROUNDING)}"
+        logging.info(f"🚀 Placing {signal.upper()} market order → Entry={entry:.8f} SL={sl_str} TP={tp_str} Qty={qty_int}")
         resp = session.place_order(
             category="linear",
             symbol=SYMBOL,
-            side=side.capitalize(),
+            side=signal.capitalize(),
             orderType="Market",
-            qty=str(qty),
+            qty=str(int(qty_int)),
             timeInForce="IOC",
             reduceOnly=False,
-            takeProfit=str(round(tp, ROUNDING)),
-            stopLoss=str(round(sl, ROUNDING)),
-            positionIdx=0  # One-way mode
+            takeProfit=tp_str,
+            stopLoss=sl_str,
+            positionIdx=0
         )
         logging.info(f"✅ Order response: {resp}")
+        # try to capture orderId
+        try:
+            if "result" in resp and "orderId" in resp["result"]:
+                last_order_id = resp["result"]["orderId"]
+        except Exception:
+            pass
+        return resp
     except Exception as e:
-        logging.error(f"❌ Error placing order: {e}")
+        logging.error(f"Error placing order: {e}")
+        return None
 
+# ================== CORE LOGIC ==================
+def handle_closed_candle():
+    global range_signal, ha_open_prev, ha_close_prev, last_pnl
 
-def process_new_candle():
-    global last_trade_result, last_pnl
+    # 1) Fetch last closed raw candle
+    raw = fetch_last_closed_raw()
 
-    raw = fetch_last_closed()
-    color = "green" if raw["c"] > raw["o"] else "red"
-    signal = "buy" if color == "green" else "sell"
-    logging.info(f"📊 Candle color → {color.upper()} | Signal → {signal.upper()}")
+    # 2) Determine first-candle usage for HA open
+    first_candle = (ha_open_prev == INITIAL_HA_OPEN and ha_close_prev == INITIAL_HA_OPEN and range_signal is None)
 
-    # Always close open trade before new one
-    close_open_positions()
+    # 3) Calculate Heikin-Ashi using prev ha_open & prev ha_close
+    ha = calc_heikin_ashi(raw, first_candle)
 
-    recovery_mode = (last_trade_result == "loss")
+    # 4) Determine colors
+    raw_color = "buy" if raw["c"] > raw["o"] else "sell"
+    ha_color = "buy" if ha["c"] > ha["o"] else "sell"
 
-    balance = get_balance()
-    entry = raw["c"]
-    sl = raw["l"] if signal == "buy" else raw["h"]
+    logging.info(
+        f"Candle {datetime.fromtimestamp(raw['time']/1000)} | Raw({raw_color}) O:{raw['o']:.8f} H:{raw['h']:.8f} L:{raw['l']:.8f} C:{raw['c']:.8f} "
+        f"| HA({ha_color}) O:{ha['o']:.8f} H:{ha['h']:.8f} L:{ha['l']:.8f} C:{ha['c']:.8f}"
+    )
 
-    qty_by_risk, max_affordable = calc_qty(balance, entry, sl)
-    qty_final = min(qty_by_risk, max_affordable)
-    if qty_final <= 0:
-        logging.warning("⚠️ Quantity is zero or less, skipping trade.")
+    # 5) Range detection: if raw and HA close same color, set/reset range_signal
+    if raw_color == ha_color:
+        # if it's a new range (different from current), reset and log
+        if range_signal != raw_color:
+            logging.info(f"🔁 Range signal changed → {raw_color.upper()} (raw & HA matched). Resetting range.")
+            range_signal = raw_color
+            # close open positions when range flips (per spec)
+            close_all_positions_and_get_last_pnl()
+            # after closing, fetch last pnl stored in last_pnl
+    # If raw and HA don't match, we do nothing to the range (keep previous)
+    else:
+        logging.info("↔ Raw and HA color do not match — range unchanged.")
+
+    # 6) If there's an active range_signal, open a trade every closed candle in that direction
+    if range_signal is None:
+        logging.info("No active range_signal yet — waiting for a matching raw & HA close.")
         return
 
-    if recovery_mode:
-        pnl_adj = abs(last_pnl) / qty_final  # ensure positive PnL for recovery
-        if signal == "buy":
-            tp = entry + pnl_adj + (entry * 0.0011)
+    # If the raw candle's direction matches the active range, we enter a trade for this candle
+    if raw_color == range_signal:
+        logging.info(f"➡ Raw matches active range ({range_signal.upper()}) — preparing trade for this candle.")
+
+        # Always close open positions before opening (per spec) and get most recent pnl
+        last_pnl_local = close_all_positions_and_get_last_pnl()
+
+        # Decide recovery or normal
+        recovery_flag = (last_pnl_local < 0)
+
+        # Build trade parameters
+        entry = raw["c"]
+        sl = raw["l"] if range_signal == "buy" else raw["h"]
+        balance = get_balance_usdt()
+        risk_amount = balance * RISK_PER_TRADE
+
+        # calc qtys
+        qty_by_risk, max_affordable = calc_qtys(balance, entry, sl)
+        if qty_by_risk <= 0 or max_affordable <= 0:
+            logging.warning("⚠️ qty_by_risk or max_affordable <= 0, skipping trade.")
+            return
+
+        # choose lower qty (safer)
+        qty_chosen = min(qty_by_risk, max_affordable)
+        qty_int = int(qty_chosen)  # integer qty (per your request)
+        if qty_int <= 0:
+            logging.warning("⚠️ Final integer qty <= 0, skipping trade.")
+            return
+
+        # determine TP
+        if recovery_flag:
+            # Recovery mode: use last closed pnl (abs) distributed across qty to find price move
+            pnl_abs = abs(last_pnl_local)
+            # price move required = pnl_abs / qty_int  (USDT divided by base units)
+            price_move = pnl_abs / qty_int
+            if range_signal == "buy":
+                tp = entry + price_move + (entry * 0.0011)
+            else:
+                tp = entry - price_move - (entry * 0.0011)
+            logging.info(f"⚡ Recovery trade → last_pnl={last_pnl_local:.8f}, qty={qty_int}, price_move={price_move:.8f}, TP={tp:.8f}")
         else:
-            tp = entry - pnl_adj - (entry * 0.0011)
-        logging.info(f"⚡ Recovery trade mode → PnL={last_pnl:.5f}, Qty={qty_final:.2f}, TP={tp:.5f}")
+            # Normal TP = entry +/-0.21%
+            if range_signal == "buy":
+                tp = entry * (1 + 0.0021)
+            else:
+                tp = entry * (1 - 0.0021)
+            logging.info(f"✅ Normal trade → TP={tp:.8f} (±0.21%)")
+
+        # Round/clip SL/TP to allowed precision and place trade (close positions already done)
+        place_order_market(range_signal, entry, sl, tp, qty_int)
+        # After placing, leave range_signal intact and continue placing in same direction every candle
     else:
-        if signal == "buy":
-            tp = entry * (1 + 0.0021)
-        else:
-            tp = entry * (1 - 0.0021)
-        logging.info(f"✅ Normal trade mode → TP={tp:.5f} (+/-0.21%)")
-
-    place_order(signal, entry, sl, tp, qty_final, "recovery" if recovery_mode else "normal")
-
+        logging.info(f"Raw color {raw_color.upper()} does not match active range {range_signal.upper()} — skipping trade this candle.")
 
 # ================== MAIN LOOP ==================
 def main():
-    logging.info(f"🤖 Bot started | Symbol={SYMBOL} | TF={INTERVAL}m | Leverage={LEVERAGE}x | One-way mode")
+    logging.info(f"🤖 Bot started | Symbol={SYMBOL} | TF={INTERVAL}m | Leverage={LEVERAGE}x | One-way mode | Risk={RISK_PER_TRADE*100:.0f}%")
     candle_seconds = int(INTERVAL) * 60
     while True:
-        now = datetime.now(timezone.utc)
-        sec_into_cycle = (now.hour * 3600 + now.minute * 60 + now.second) % candle_seconds
-        wait = candle_seconds - sec_into_cycle
-        if wait <= 0:
-            wait += candle_seconds
-        logging.info(f"⏳ Waiting {wait}s for next candle close...")
-        time.sleep(wait + 3)
         try:
-            process_new_candle()
-        except Exception as e:
-            logging.error(f"Error in main loop: {e}")
+            # Wait for next candle close (simple mod approach)
+            now = datetime.now(timezone.utc)
+            seconds_into_cycle = (now.hour * 3600 + now.minute * 60 + now.second) % candle_seconds
+            wait = candle_seconds - seconds_into_cycle
+            if wait <= 0:
+                wait += candle_seconds
+            logging.info(f"⏳ Waiting {wait}s for next candle close...")
+            # wait for the candle to close plus a small buffer
+            time.sleep(wait + 2)
 
+            # Poll/attempt to handle closed candle
+            # If API is slow, we retry a few times with small sleep
+            attempts = 3
+            for i in range(attempts):
+                try:
+                    handle_closed_candle()
+                    break
+                except Exception as e:
+                    logging.warning(f"Attempt {i+1}/{attempts} failed processing candle: {e}")
+                    time.sleep(CANDLE_POLL_GRANULARITY)
+        except KeyboardInterrupt:
+            logging.info("Interrupted by user, exiting.")
+            break
+        except Exception as e:
+            logging.error(f"Unhandled error in main loop: {e}")
+            time.sleep(5)
 
 if __name__ == "__main__":
     main()
