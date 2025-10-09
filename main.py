@@ -8,15 +8,15 @@ from pybit.unified_trading import HTTP
 
 # ================== CONFIG (edit as needed) ==================
 SYMBOL = "TRXUSDT"
-INTERVAL = "3"           # timeframe in minutes as string (default 4h). e.g. "3","60","240"
-RISK_PER_TRADE = 0.20      # 20% of balance
-FALLBACK = 0.90            # fallback % if qty unaffordable
+INTERVAL = "240"                  # timeframe in minutes as string (e.g. "3","60","240")
+RISK_PER_TRADE = 0.20           # 20% of balance
+FALLBACK = 0.90                 # fallback % if qty unaffordable
 LEVERAGE = 75
-ROUNDING = 5               # decimal places for TP/SL
-CANDLE_POLL_GRANULARITY = 3  # seconds to wait between retries fetching candles
+ROUNDING = 5                    # decimal places for TP/SL
+CANDLE_POLL_GRANULARITY = 3     # seconds between retries fetching candles
 
 # Set manually before first run (initial Heikin-Ashi open)
-INITIAL_HA_OPEN = 0.34033
+INITIAL_HA_OPEN = 0.33982
 
 # API keys from environment
 API_KEY = os.getenv("BYBIT_API_KEY")
@@ -33,15 +33,18 @@ ha_close_prev = INITIAL_HA_OPEN
 last_pnl = 0.0
 last_order_id = None
 
+
 # ================== HELPERS ==================
 def now_ts():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
 
 def fetch_last_closed_raw():
     try:
         resp = session.get_kline(category="linear", symbol=SYMBOL, interval=INTERVAL, limit=3)
         if "result" not in resp or "list" not in resp["result"]:
             raise RuntimeError(f"Bad kline response: {resp}")
+
         raw = resp["result"]["list"][-2]
         parsed = {
             "time": int(raw[0]),
@@ -50,29 +53,36 @@ def fetch_last_closed_raw():
             "l": float(raw[3]),
             "c": float(raw[4])
         }
-        logging.info(f"Parsed candle → O:{parsed['o']:.8f} H:{parsed['h']:.8f} L:{parsed['l']:.8f} C:{parsed['c']:.8f}")
+        logging.info(f"Parsed candle → O:{parsed['o']:.8f} H:{parsed['h']:.8f} "
+                     f"L:{parsed['l']:.8f} C:{parsed['c']:.8f}")
         return parsed
     except Exception as e:
         logging.error(f"Error fetching kline: {e}")
         raise
 
+
 def calc_heikin_ashi(raw, first_candle=False):
     global ha_open_prev, ha_close_prev
     ha_close = (raw["o"] + raw["h"] + raw["l"] + raw["c"]) / 4.0
+
     if first_candle:
         ha_open = INITIAL_HA_OPEN
     else:
         ha_open = (ha_open_prev + ha_close_prev) / 2.0
+
     ha_high = max(raw["h"], ha_open, ha_close)
     ha_low = min(raw["l"], ha_open, ha_close)
+
     ha_open_prev = ha_open
     ha_close_prev = ha_close
     return {"o": ha_open, "h": ha_high, "l": ha_low, "c": ha_close}
+
 
 def get_balance_usdt():
     try:
         resp = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
         balance = 0.0
+
         if "result" in resp and "list" in resp["result"] and resp["result"]["list"]:
             try:
                 balance = float(resp["result"]["list"][0]["coin"][0]["walletBalance"])
@@ -81,21 +91,27 @@ def get_balance_usdt():
                     balance = float(resp["result"]["list"][0]["totalEquity"])
                 except Exception:
                     balance = 0.0
+
         logging.info(f"💰 Wallet balance fetched: {balance:.8f} USDT")
         return balance
     except Exception as e:
         logging.error(f"Error fetching balance: {e}")
         return 0.0
 
+
 def calc_qtys(balance, entry, sl):
     sl_dist = abs(entry - sl)
     if sl_dist <= 0:
         return 0.0, 0.0
+
     risk_amount = balance * RISK_PER_TRADE
     qty_by_risk = (risk_amount / sl_dist) * LEVERAGE
     max_affordable = (balance * LEVERAGE) / entry * FALLBACK
-    logging.info(f"📐 Qty calc → RiskAmt={risk_amount:.8f}, SL Dist={sl_dist:.8f}, QtyByRisk={qty_by_risk:.4f}, MaxAffordable={max_affordable:.4f}")
+
+    logging.info(f"📐 Qty calc → RiskAmt={risk_amount:.8f}, SL Dist={sl_dist:.8f}, "
+                 f"QtyByRisk={qty_by_risk:.4f}, MaxAffordable={max_affordable:.4f}")
     return qty_by_risk, max_affordable
+
 
 def close_all_positions_and_get_last_pnl():
     global last_pnl, last_order_id
@@ -141,12 +157,15 @@ def close_all_positions_and_get_last_pnl():
         logging.error(f"Error closing positions or fetching pnl: {e}")
         return last_pnl
 
+
 def place_order_market(signal, entry, sl, tp, qty_int):
     global last_order_id
     try:
         sl_str = f"{round(sl, ROUNDING)}"
         tp_str = f"{round(tp, ROUNDING)}"
-        logging.info(f"🚀 Placing {signal.upper()} market order → Entry={entry:.8f} SL={sl_str} TP={tp_str} Qty={qty_int}")
+        logging.info(f"🚀 Placing {signal.upper()} market order → Entry={entry:.8f} SL={sl_str} "
+                     f"TP={tp_str} Qty={qty_int}")
+
         resp = session.place_order(
             category="linear",
             symbol=SYMBOL,
@@ -160,21 +179,45 @@ def place_order_market(signal, entry, sl, tp, qty_int):
             positionIdx=0
         )
         logging.info(f"✅ Order response: {resp}")
+
         try:
             if "result" in resp and "orderId" in resp["result"]:
                 last_order_id = resp["result"]["orderId"]
         except Exception:
             pass
+
         return resp
     except Exception as e:
         logging.error(f"Error placing order: {e}")
         return None
+
 
 # 🧩 NEW: Fetch PnL for last saved order
 def get_pnl_from_last_order():
     global last_order_id, last_pnl
     if not last_order_id:
         logging.info("⚠️ No last_order_id saved yet — skipping PnL fetch.")
+        return last_pnl
+
+    try:
+        resp = session.get_closed_pnl(category="linear", symbol=SYMBOL, limit=10)
+        if "result" in resp and "list" in resp["result"] and resp["result"]["list"]:
+            for trade in resp["result"]["list"]:
+                if trade.get("orderId") == last_order_id:
+                    pnl_val = trade.get("closedPnl") or trade.get("realisedPnl") or trade.get("pnl")
+                    if pnl_val is not None:
+                        pnl = float(pnl_val)
+                        last_pnl = pnl
+                        logging.info(f"📊 Fetched PnL from last_order_id={last_order_id}: {pnl:.8f} USDT")
+                        return pnl
+            logging.info("⚠️ Last orderId not found in recent closed PnL list.")
+        return last_pnl
+    except Exception as e:
+        logging.error(f"Error fetching pnl for last_order_id: {e}")
+        return last_pnl
+
+
+# ================== CORE LOGIC ==================
 def handle_closed_candle():
     global range_signal, ha_open_prev, ha_close_prev, last_pnl
 
@@ -198,20 +241,15 @@ def handle_closed_candle():
     else:
         logging.info("↔ Raw and HA color do not match — range unchanged.")
 
-    # 🔹 Wait for first valid signal
     if range_signal is None:
         logging.info("No active range_signal yet — waiting for a matching raw & HA close.")
         return
 
-    # 🔹 If current raw color matches range, prepare trade
     if raw_color == range_signal:
         logging.info(f"➡ Raw matches active range ({range_signal.upper()}) — preparing trade for this candle.")
 
         # 🧩 New rule: skip trade if open-high/low distance < 0.5%
-        if range_signal == "buy":
-            e = abs(raw["h"] - raw["o"])
-        else:
-            e = abs(raw["o"] - raw["l"])
+        e = abs(raw["h"] - raw["o"]) if range_signal == "buy" else abs(raw["o"] - raw["l"])
         threshold = raw["o"] * 0.005
 
         if e <= threshold:
@@ -219,16 +257,14 @@ def handle_closed_candle():
                          f"(distance={e:.8f}, threshold={threshold:.8f}) — keeping current positions open.")
             return
 
-        # ✅ Only close existing trades if the candle passes the 0.5% rule
+        # ✅ Close existing trades if candle passes the 0.5% rule
         close_all_positions_and_get_last_pnl()
         last_pnl_local = get_pnl_from_last_order()
 
-        # 🔹 Determine recovery mode
         recovery_flag = (last_pnl_local < 0)
         entry = raw["c"]
         sl = raw["l"] if range_signal == "buy" else raw["h"]
 
-        # 🔹 Calculate quantity based on risk
         balance = get_balance_usdt()
         qty_by_risk, max_affordable = calc_qtys(balance, entry, sl)
 
@@ -236,14 +272,11 @@ def handle_closed_candle():
             logging.warning("⚠️ qty_by_risk or max_affordable <= 0, skipping trade.")
             return
 
-        qty_chosen = min(qty_by_risk, max_affordable)
-        qty_int = int(qty_chosen)
-
+        qty_int = int(min(qty_by_risk, max_affordable))
         if qty_int <= 0:
             logging.warning("⚠️ Final integer qty <= 0, skipping trade.")
             return
 
-        # 🔹 Handle recovery or normal trade
         if recovery_flag:
             pnl_abs = abs(last_pnl_local)
             price_move = pnl_abs / qty_int
@@ -254,40 +287,22 @@ def handle_closed_candle():
             logging.info(f"⚡ Recovery trade → last_pnl={last_pnl_local:.8f}, qty={qty_int}, "
                          f"price_move={price_move:.8f}, TP={tp:.8f}")
         else:
-            if range_signal == "buy":
-                tp = entry * (1 + 0.0021)
-            else:
-                tp = entry * (1 - 0.0021)
+            tp = entry * (1 + 0.0021) if range_signal == "buy" else entry * (1 - 0.0021)
             logging.info(f"✅ Normal trade → TP={tp:.8f} (±0.21%)")
 
-        # 🔹 Place final order
         place_order_market(range_signal, entry, sl, tp, qty_int)
-
     else:
-        logging.info(f"Raw color {raw_color.upper()} does not match active range {range_signal.upper()} — skipping trade this candle.")     return last_pnl
-    try:
-        resp = session.get_closed_pnl(category="linear", symbol=SYMBOL, limit=10)
-        if "result" in resp and "list" in resp["result"] and resp["result"]["list"]:
-            for trade in resp["result"]["list"]:
-                if trade.get("orderId") == last_order_id:
-                    pnl_val = trade.get("closedPnl") or trade.get("realisedPnl") or trade.get("pnl")
-                    if pnl_val is not None:
-                        pnl = float(pnl_val)
-                        last_pnl = pnl
-                        logging.info(f"📊 Fetched PnL from last_order_id={last_order_id}: {pnl:.8f} USDT")
-                        return pnl
-            logging.info("⚠️ Last orderId not found in recent closed PnL list.")
-        return last_pnl
-    except Exception as e:
-        logging.error(f"Error fetching pnl for last_order_id: {e}")
+        logging.info(f"Raw color {raw_color.upper()} does not match active range {range_signal.upper()} — skipping trade this candle.")
         return last_pnl
 
-# ================== CORE LOGIC ==================
 
 # ================== MAIN LOOP ==================
 def main():
-    logging.info(f"🤖 Bot started | Symbol={SYMBOL} | TF={INTERVAL}m | Leverage={LEVERAGE}x | One-way mode | Risk={RISK_PER_TRADE*100:.0f}%")
+    logging.info(f"🤖 Bot started | Symbol={SYMBOL} | TF={INTERVAL}m | "
+                 f"Leverage={LEVERAGE}x | Risk={RISK_PER_TRADE*100:.0f}%")
+
     candle_seconds = int(INTERVAL) * 60
+
     while True:
         try:
             now = datetime.now(timezone.utc)
@@ -295,22 +310,25 @@ def main():
             wait = candle_seconds - seconds_into_cycle
             if wait <= 0:
                 wait += candle_seconds
+
             logging.info(f"⏳ Waiting {wait}s for next candle close...")
             time.sleep(wait + 2)
-            attempts = 3
-            for i in range(attempts):
+
+            for i in range(3):
                 try:
                     handle_closed_candle()
                     break
                 except Exception as e:
-                    logging.warning(f"Attempt {i+1}/{attempts} failed processing candle: {e}")
+                    logging.warning(f"Attempt {i+1}/3 failed processing candle: {e}")
                     time.sleep(CANDLE_POLL_GRANULARITY)
+
         except KeyboardInterrupt:
             logging.info("Interrupted by user, exiting.")
             break
         except Exception as e:
             logging.error(f"Unhandled error in main loop: {e}")
             time.sleep(5)
+
 
 if __name__ == "__main__":
     main()
