@@ -8,7 +8,7 @@ from pybit.unified_trading import HTTP
 
 # ================== CONFIG (edit as needed) ==================
 SYMBOL = "TRXUSDT"
-INTERVAL = "240"           # timeframe in minutes as string (default 4h). e.g. "3","60","240"
+INTERVAL = "3"           # timeframe in minutes as string (default 4h). e.g. "3","60","240"
 RISK_PER_TRADE = 0.20      # 20% of balance
 FALLBACK = 0.90            # fallback % if qty unaffordable
 LEVERAGE = 75
@@ -16,7 +16,7 @@ ROUNDING = 5               # decimal places for TP/SL
 CANDLE_POLL_GRANULARITY = 3  # seconds to wait between retries fetching candles
 
 # Set manually before first run (initial Heikin-Ashi open)
-INITIAL_HA_OPEN = 0.33817
+INITIAL_HA_OPEN = 0.34013
 
 # API keys from environment
 API_KEY = os.getenv("BYBIT_API_KEY")
@@ -175,7 +175,96 @@ def get_pnl_from_last_order():
     global last_order_id, last_pnl
     if not last_order_id:
         logging.info("⚠️ No last_order_id saved yet — skipping PnL fetch.")
-        return last_pnl
+   def handle_closed_candle():
+    global range_signal, ha_open_prev, ha_close_prev, last_pnl
+
+    raw = fetch_last_closed_raw()
+    first_candle = (ha_open_prev == INITIAL_HA_OPEN and ha_close_prev == INITIAL_HA_OPEN and range_signal is None)
+    ha = calc_heikin_ashi(raw, first_candle)
+    raw_color = "buy" if raw["c"] > raw["o"] else "sell"
+    ha_color = "buy" if ha["c"] > ha["o"] else "sell"
+
+    logging.info(
+        f"Candle {datetime.fromtimestamp(raw['time']/1000)} | Raw({raw_color}) "
+        f"O:{raw['o']:.8f} H:{raw['h']:.8f} L:{raw['l']:.8f} C:{raw['c']:.8f} "
+        f"| HA({ha_color}) O:{ha['o']:.8f} H:{ha['h']:.8f} L:{ha['l']:.8f} C:{ha['c']:.8f}"
+    )
+
+    # 🔹 Detect new range when raw & HA match
+    if raw_color == ha_color:
+        if range_signal != raw_color:
+            logging.info(f"🔁 Range signal changed → {raw_color.upper()} (raw & HA matched). Resetting range.")
+            range_signal = raw_color
+    else:
+        logging.info("↔ Raw and HA color do not match — range unchanged.")
+
+    # 🔹 Wait for first valid signal
+    if range_signal is None:
+        logging.info("No active range_signal yet — waiting for a matching raw & HA close.")
+        return
+
+    # 🔹 If current raw color matches range, prepare trade
+    if raw_color == range_signal:
+        logging.info(f"➡ Raw matches active range ({range_signal.upper()}) — preparing trade for this candle.")
+
+        # 🧩 New rule: skip trade if open-high/low distance < 0.5%
+        if range_signal == "buy":
+            e = abs(raw["h"] - raw["o"])
+        else:
+            e = abs(raw["o"] - raw["l"])
+        threshold = raw["o"] * 0.005
+
+        if e <= threshold:
+            logging.info(f"❌ Skipping trade: candle range below 0.5% "
+                         f"(distance={e:.8f}, threshold={threshold:.8f}) — keeping current positions open.")
+            return
+
+        # ✅ Only close existing trades if the candle passes the 0.5% rule
+        close_all_positions_and_get_last_pnl()
+        last_pnl_local = get_pnl_from_last_order()
+
+        # 🔹 Determine recovery mode
+        recovery_flag = (last_pnl_local < 0)
+        entry = raw["c"]
+        sl = raw["l"] if range_signal == "buy" else raw["h"]
+
+        # 🔹 Calculate quantity based on risk
+        balance = get_balance_usdt()
+        qty_by_risk, max_affordable = calc_qtys(balance, entry, sl)
+
+        if qty_by_risk <= 0 or max_affordable <= 0:
+            logging.warning("⚠️ qty_by_risk or max_affordable <= 0, skipping trade.")
+            return
+
+        qty_chosen = min(qty_by_risk, max_affordable)
+        qty_int = int(qty_chosen)
+
+        if qty_int <= 0:
+            logging.warning("⚠️ Final integer qty <= 0, skipping trade.")
+            return
+
+        # 🔹 Handle recovery or normal trade
+        if recovery_flag:
+            pnl_abs = abs(last_pnl_local)
+            price_move = pnl_abs / qty_int
+            if range_signal == "buy":
+                tp = entry + price_move + (entry * 0.0011)
+            else:
+                tp = entry - price_move - (entry * 0.0011)
+            logging.info(f"⚡ Recovery trade → last_pnl={last_pnl_local:.8f}, qty={qty_int}, "
+                         f"price_move={price_move:.8f}, TP={tp:.8f}")
+        else:
+            if range_signal == "buy":
+                tp = entry * (1 + 0.0021)
+            else:
+                tp = entry * (1 - 0.0021)
+            logging.info(f"✅ Normal trade → TP={tp:.8f} (±0.21%)")
+
+        # 🔹 Place final order
+        place_order_market(range_signal, entry, sl, tp, qty_int)
+
+    else:
+        logging.info(f"Raw color {raw_color.upper()} does not match active range {range_signal.upper()} — skipping trade this candle.")     return last_pnl
     try:
         resp = session.get_closed_pnl(category="linear", symbol=SYMBOL, limit=10)
         if "result" in resp and "list" in resp["result"] and resp["result"]["list"]:
@@ -194,63 +283,6 @@ def get_pnl_from_last_order():
         return last_pnl
 
 # ================== CORE LOGIC ==================
-def handle_closed_candle():
-    global range_signal, ha_open_prev, ha_close_prev, last_pnl
-    raw = fetch_last_closed_raw()
-    first_candle = (ha_open_prev == INITIAL_HA_OPEN and ha_close_prev == INITIAL_HA_OPEN and range_signal is None)
-    ha = calc_heikin_ashi(raw, first_candle)
-    raw_color = "buy" if raw["c"] > raw["o"] else "sell"
-    ha_color = "buy" if ha["c"] > ha["o"] else "sell"
-    logging.info(
-        f"Candle {datetime.fromtimestamp(raw['time']/1000)} | Raw({raw_color}) O:{raw['o']:.8f} H:{raw['h']:.8f} L:{raw['l']:.8f} C:{raw['c']:.8f} "
-        f"| HA({ha_color}) O:{ha['o']:.8f} H:{ha['h']:.8f} L:{ha['l']:.8f} C:{ha['c']:.8f}"
-    )
-
-    if raw_color == ha_color:
-        if range_signal != raw_color:
-            logging.info(f"🔁 Range signal changed → {raw_color.upper()} (raw & HA matched). Resetting range.")
-            range_signal = raw_color
-    else:
-        logging.info("↔ Raw and HA color do not match — range unchanged.")
-
-    if range_signal is None:
-        logging.info("No active range_signal yet — waiting for a matching raw & HA close.")
-        return
-
-    if raw_color == range_signal:
-        logging.info(f"➡ Raw matches active range ({range_signal.upper()}) — preparing trade for this candle.")
-        close_all_positions_and_get_last_pnl()
-        last_pnl_local = get_pnl_from_last_order()
-        recovery_flag = (last_pnl_local < 0)
-        entry = raw["c"]
-        sl = raw["l"] if range_signal == "buy" else raw["h"]
-        balance = get_balance_usdt()
-        qty_by_risk, max_affordable = calc_qtys(balance, entry, sl)
-        if qty_by_risk <= 0 or max_affordable <= 0:
-            logging.warning("⚠️ qty_by_risk or max_affordable <= 0, skipping trade.")
-            return
-        qty_chosen = min(qty_by_risk, max_affordable)
-        qty_int = int(qty_chosen)
-        if qty_int <= 0:
-            logging.warning("⚠️ Final integer qty <= 0, skipping trade.")
-            return
-        if recovery_flag:
-            pnl_abs = abs(last_pnl_local)
-            price_move = pnl_abs / qty_int
-            if range_signal == "buy":
-                tp = entry + price_move + (entry * 0.0011)
-            else:
-                tp = entry - price_move - (entry * 0.0011)
-            logging.info(f"⚡ Recovery trade → last_pnl={last_pnl_local:.8f}, qty={qty_int}, price_move={price_move:.8f}, TP={tp:.8f}")
-        else:
-            if range_signal == "buy":
-                tp = entry * (1 + 0.0021)
-            else:
-                tp = entry * (1 - 0.0021)
-            logging.info(f"✅ Normal trade → TP={tp:.8f} (±0.21%)")
-        place_order_market(range_signal, entry, sl, tp, qty_int)
-    else:
-        logging.info(f"Raw color {raw_color.upper()} does not match active range {range_signal.upper()} — skipping trade this candle.")
 
 # ================== MAIN LOOP ==================
 def main():
