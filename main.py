@@ -16,7 +16,7 @@ ROUNDING = 5               # decimal places for TP/SL
 CANDLE_POLL_GRANULARITY = 3  # seconds to wait between retries fetching candles
 
 # Set manually before first run (initial Heikin-Ashi open)
-INITIAL_HA_OPEN = 0.34013
+INITIAL_HA_OPEN = 0.34036
 
 # API keys from environment
 API_KEY = os.getenv("BYBIT_API_KEY")
@@ -175,7 +175,7 @@ def get_pnl_from_last_order():
     global last_order_id, last_pnl
     if not last_order_id:
         logging.info("⚠️ No last_order_id saved yet — skipping PnL fetch.")
-   def handle_closed_candle():
+def handle_closed_candle():
     global range_signal, ha_open_prev, ha_close_prev, last_pnl
 
     raw = fetch_last_closed_raw()
