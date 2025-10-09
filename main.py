@@ -16,7 +16,7 @@ ROUNDING = 5               # decimal places for TP/SL
 CANDLE_POLL_GRANULARITY = 3  # seconds to wait between retries fetching candles
 
 # Set manually before first run (initial Heikin-Ashi open)
-INITIAL_HA_OPEN = 0.34036
+INITIAL_HA_OPEN = 0.34033
 
 # API keys from environment
 API_KEY = os.getenv("BYBIT_API_KEY")
