@@ -16,7 +16,7 @@ ROUNDING = 5                    # decimal places for TP/SL
 CANDLE_POLL_GRANULARITY = 3     # seconds between retries fetching candles
 
 # Set manually before first run (initial Heikin-Ashi open)
-INITIAL_HA_OPEN = 0.33982
+INITIAL_HA_OPEN = 0.33646
 
 # API keys from environment
 API_KEY = os.getenv("BYBIT_API_KEY")
@@ -263,7 +263,7 @@ def handle_closed_candle():
 
         recovery_flag = (last_pnl_local < 0)
         entry = raw["c"]
-        sl = raw["l"] if range_signal == "buy" else raw["h"]
+        sl = (entry * 0.99) if range_signal == "buy" else (entry * 1.01)
 
         balance = get_balance_usdt()
         qty_by_risk, max_affordable = calc_qtys(balance, entry, sl)
