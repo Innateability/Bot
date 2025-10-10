@@ -16,7 +16,7 @@ ROUNDING = 5                    # decimal places for TP/SL
 CANDLE_POLL_GRANULARITY = 3     # seconds between retries fetching candles
 
 # Set manually before first run (initial Heikin-Ashi open)
-INITIAL_HA_OPEN = 0.33646
+INITIAL_HA_OPEN = 0.33381
 
 # API keys from environment
 API_KEY = os.getenv("BYBIT_API_KEY")
@@ -105,7 +105,7 @@ def calc_qtys(balance, entry, sl):
         return 0.0, 0.0
 
     risk_amount = balance * RISK_PER_TRADE
-    qty_by_risk = (risk_amount / sl_dist) * LEVERAGE
+    qty_by_risk = (risk_amount / sl_dist) 
     max_affordable = (balance * LEVERAGE) / entry * FALLBACK
 
     logging.info(f"📐 Qty calc → RiskAmt={risk_amount:.8f}, SL Dist={sl_dist:.8f}, "
