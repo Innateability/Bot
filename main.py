@@ -9,14 +9,14 @@ from pybit.unified_trading import HTTP
 # ================== CONFIG (edit as needed) ==================
 SYMBOL = "TRXUSDT"
 INTERVAL = "240"                  # timeframe in minutes as string (e.g. "3","60","240")
-RISK_PER_TRADE = 0.20           # 20% of balance
+RISK_PER_TRADE = 0.50           # 50% of balance
 FALLBACK = 0.90                 # fallback % if qty unaffordable
 LEVERAGE = 75
 ROUNDING = 5                    # decimal places for TP/SL
 CANDLE_POLL_GRANULARITY = 3     # seconds between retries fetching candles
 
 # Set manually before first run (initial Heikin-Ashi open)
-INITIAL_HA_OPEN = 0.33381
+INITIAL_HA_OPEN = 0.31878
 
 # API keys from environment
 API_KEY = os.getenv("BYBIT_API_KEY")
@@ -105,7 +105,7 @@ def calc_qtys(balance, entry, sl):
         return 0.0, 0.0
 
     risk_amount = balance * RISK_PER_TRADE
-    qty_by_risk = (risk_amount / sl_dist) 
+    qty_by_risk = (risk_amount / sl_dist)
     max_affordable = (balance * LEVERAGE) / entry * FALLBACK
 
     logging.info(f"📐 Qty calc → RiskAmt={risk_amount:.8f}, SL Dist={sl_dist:.8f}, "
@@ -192,7 +192,6 @@ def place_order_market(signal, entry, sl, tp, qty_int):
         return None
 
 
-# 🧩 NEW: Fetch PnL for last saved order
 def get_pnl_from_last_order():
     global last_order_id, last_pnl
     if not last_order_id:
@@ -233,7 +232,6 @@ def handle_closed_candle():
         f"| HA({ha_color}) O:{ha['o']:.8f} H:{ha['h']:.8f} L:{ha['l']:.8f} C:{ha['c']:.8f}"
     )
 
-    # 🔹 Detect new range when raw & HA match
     if raw_color == ha_color:
         if range_signal != raw_color:
             logging.info(f"🔁 Range signal changed → {raw_color.upper()} (raw & HA matched). Resetting range.")
@@ -248,16 +246,7 @@ def handle_closed_candle():
     if raw_color == range_signal:
         logging.info(f"➡ Raw matches active range ({range_signal.upper()}) — preparing trade for this candle.")
 
-        # 🧩 New rule: skip trade if open-high/low distance < 0.5%
-        e = abs(raw["h"] - raw["o"]) if range_signal == "buy" else abs(raw["o"] - raw["l"])
-        threshold = raw["o"] * 0.005
-
-        if e <= threshold:
-            logging.info(f"❌ Skipping trade: candle range below 0.5% "
-                         f"(distance={e:.8f}, threshold={threshold:.8f}) — keeping current positions open.")
-            return
-
-        # ✅ Close existing trades if candle passes the 0.5% rule
+        # ✅ Close existing trades directly
         close_all_positions_and_get_last_pnl()
         last_pnl_local = get_pnl_from_last_order()
 
@@ -287,8 +276,8 @@ def handle_closed_candle():
             logging.info(f"⚡ Recovery trade → last_pnl={last_pnl_local:.8f}, qty={qty_int}, "
                          f"price_move={price_move:.8f}, TP={tp:.8f}")
         else:
-            tp = entry * (1 + 0.0021) if range_signal == "buy" else entry * (1 - 0.0021)
-            logging.info(f"✅ Normal trade → TP={tp:.8f} (±0.21%)")
+            tp = entry * (1 + 0.0031) if range_signal == "buy" else entry * (1 - 0.0031)
+            logging.info(f"✅ Normal trade → TP={tp:.8f} (±0.31%)")
 
         place_order_market(range_signal, entry, sl, tp, qty_int)
     else:
