@@ -110,7 +110,7 @@ def calc_qtys(balance, entry, sl):
         return 0.0, 0.0
 
     risk_amount = balance * RISK_PER_TRADE
-    qty_by_risk = (risk_amount / sl_dist) * LEVERAGE
+    qty_by_risk = (risk_amount / sl_dist) 
     max_affordable = (balance * LEVERAGE) / entry * FALLBACK
 
     logging.info(f"📐 Qty calc → RiskAmt={risk_amount:.8f}, SL Dist={sl_dist:.8f}, "
