@@ -8,7 +8,7 @@ from pybit.unified_trading import HTTP
 
 # ================== CONFIG (edit as needed) ==================
 SYMBOL = "TRXUSDT"
-INTERVAL = "3"                  # timeframe in minutes as string (e.g. "3","60","240")
+INTERVAL = "240"                  # timeframe in minutes as string (e.g. "3","60","240")
 RISK_PER_TRADE = 0.25            # 25% of balance
 FALLBACK = 0.90                   # fallback % if qty unaffordable
 LEVERAGE = 75
@@ -16,11 +16,11 @@ ROUNDING = 5                      # decimal places for TP/SL
 CANDLE_POLL_GRANULARITY = 3       # seconds between retries fetching candles
 
 # Set manually before first run (initial Heikin-Ashi open)
-INITIAL_HA_OPEN = 0.32080
+INITIAL_HA_OPEN = 0.31848
 
 # Recovery configuration
-RECOVERY_TP_PCT = 0.0005           # 0.5% take profit during recovery
-SL_PCT = 0.0005                    # 0.5% stop loss
+RECOVERY_TP_PCT = 0.005           # 0.5% take profit during recovery
+SL_PCT = 0.005                    # 0.5% stop loss
 RECOVERY_DECR_Q = 1               # how much to decrement loss count per gain
 
 # API keys from environment
