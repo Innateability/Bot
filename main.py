@@ -94,19 +94,25 @@ def close_all_positions_and_get_last_pnl(symbol):
     return last_pnl
 
 def place_order(symbol, signal, entry, sl, tp, qty):
-    logging.info(f"🚀 {symbol} | {signal.upper()} | Entry={entry:.6f} SL={sl:.6f} TP={tp:.6f} Qty={qty:.4f}")
-    session.place_order(
-        category="linear",
-        symbol=symbol,
-        side=signal.capitalize(),
-        orderType="Market",
-        qty=str(round(qty, 2)),
-        reduceOnly=False,
-        timeInForce="IOC",
-        takeProfit=f"{round(tp, ROUNDING)}",
-        stopLoss=f"{round(sl, ROUNDING)}",
-        positionIdx=0
-    )
+    try:
+        logging.info(f"🚀 {symbol} | {signal.upper()} | Entry={entry:.6f} SL={sl:.6f} TP={tp:.6f} Qty={qty:.4f}")
+        resp = session.place_order(
+            category="linear",
+            symbol=symbol,
+            side=signal.capitalize(),
+            orderType="Market",
+            qty=str(round(qty, 2)),
+            reduceOnly=False,
+            timeInForce="IOC",
+            takeProfit=f"{round(tp, ROUNDING)}",
+            stopLoss=f"{round(sl, ROUNDING)}",
+            positionIdx=0
+        )
+        logging.info(f"✅ {symbol} Order response: {resp}")
+        return resp
+    except Exception as e:
+        logging.error(f"Error placing order on {symbol}: {e}")
+        raise
 
 # ================== CORE LOGIC ==================
 def handle_symbol(symbol, threshold, leverage):
@@ -160,19 +166,29 @@ def handle_symbol(symbol, threshold, leverage):
 
     balance = get_balance_usdt()
     qty = calc_qty(balance, entry, leverage, risk_pct)
-    place_order(symbol, signal, entry, sl, tp, qty)
 
-    has_opened[symbol] = True
-    logging.info(f"📊 {symbol} | losses_count={losses_count} | mode={'RECOVERY' if recovery_mode else 'NORMAL'}")
-    return True
+    try:
+        resp = place_order(symbol, signal, entry, sl, tp, qty)
+        if "retMsg" in resp and "insufficient" in resp["retMsg"].lower():
+            logging.warning(f"⚠️ Insufficient balance for {symbol}")
+            return "INSUFFICIENT"
+        has_opened[symbol] = True
+        logging.info(f"📊 {symbol} | losses_count={losses_count} | mode={'RECOVERY' if recovery_mode else 'NORMAL'}")
+        return True
+    except Exception as e:
+        if "insufficient" in str(e).lower():
+            logging.warning(f"⚠️ Insufficient balance for {symbol}")
+            return "INSUFFICIENT"
+        logging.error(f"❌ Order failed for {symbol}: {e}")
+        return False
 
 # ================== MAIN LOOP ==================
 def main():
-    logging.info("🤖 Bot started — BTC priority, TRX secondary")
+    logging.info("🤖 Bot started — BTC priority, TRX fallback if insufficient funds")
     while True:
         try:
-            found = handle_symbol("BTCUSDT", 0.009, 100)
-            if not found:
+            btc_result = handle_symbol("BTCUSDT", 0.009, 100)
+            if btc_result == "INSUFFICIENT" or not btc_result:
                 handle_symbol("TRXUSDT", 0.008, 75)
             time.sleep(60)
         except KeyboardInterrupt:
