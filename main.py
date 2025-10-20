@@ -187,9 +187,13 @@ def main():
     logging.info("🤖 Bot started — BTC priority, TRX fallback if insufficient funds")
     while True:
         try:
-            btc_result = handle_symbol("BTCUSDT", 0.009, 100)
+            btc_pair = next(p for p in PAIRS if p["symbol"] == "BTCUSDT")
+            trx_pair = next(p for p in PAIRS if p["symbol"] == "TRXUSDT")
+
+            btc_result = handle_symbol(btc_pair["symbol"], btc_pair["threshold"], btc_pair["leverage"])
             if btc_result == "INSUFFICIENT" or not btc_result:
-                handle_symbol("TRXUSDT", 0.008, 75)
+                handle_symbol(trx_pair["symbol"], trx_pair["threshold"], trx_pair["leverage"])
+
             time.sleep(60)
         except KeyboardInterrupt:
             logging.info("🛑 Stopped manually.")
