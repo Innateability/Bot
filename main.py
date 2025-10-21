@@ -8,11 +8,11 @@ from pybit.unified_trading import HTTP
 
 # ================== CONFIG ==================
 PAIRS = [
-    {"symbol": "BTCUSDT", "threshold": 0.00009, "leverage": 100},
-    {"symbol": "TRXUSDT", "threshold": 0.00008, "leverage": 75}
+    {"symbol": "BTCUSDT", "threshold": 0.009, "leverage": 100},
+    {"symbol": "TRXUSDT", "threshold": 0.008, "leverage": 75}
 ]
 
-INTERVAL = "3"  # 4H
+INTERVAL = "240"  # 4H
 ROUNDING = 5
 FALLBACK = 0.90
 RISK_NORMAL = 0.33
