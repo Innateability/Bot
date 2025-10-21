@@ -56,12 +56,19 @@ def get_balance_usdt():
             return float(resp["result"]["list"][0]["totalEquity"])
     return 0.0
 
-def calc_qty(balance, entry, leverage, risk_percentage):
+def calc_qty(balance, entry, leverage, risk_percentage, symbol):
     sl_dist = entry * 0.01
     risk_amount = balance * risk_percentage
     qty_by_risk = risk_amount / sl_dist
     max_affordable = (balance * leverage) / entry * FALLBACK
     qty = min(qty_by_risk, max_affordable)
+
+    # ---- Quantity rounding per pair ----
+    if "BTC" in symbol:
+        qty = math.floor(qty * 1000) / 1000.0  # round down to nearest 0.001
+    elif "TRX" in symbol:
+        qty = round(qty)  # nearest whole number
+
     return qty
 
 def close_all_positions_and_get_last_pnl(symbol):
@@ -95,13 +102,13 @@ def close_all_positions_and_get_last_pnl(symbol):
 
 def place_order(symbol, signal, entry, sl, tp, qty):
     try:
-        logging.info(f"🚀 {symbol} | {signal.upper()} | Entry={entry:.6f} SL={sl:.6f} TP={tp:.6f} Qty={qty:.4f}")
+        logging.info(f"🚀 {symbol} | {signal.upper()} | Entry={entry:.6f} SL={sl:.6f} TP={tp:.6f} Qty={qty}")
         resp = session.place_order(
             category="linear",
             symbol=symbol,
             side=signal.capitalize(),
             orderType="Market",
-            qty=str(round(qty, 2)),
+            qty=str(qty),
             reduceOnly=False,
             timeInForce="IOC",
             takeProfit=f"{round(tp, ROUNDING)}",
@@ -165,7 +172,7 @@ def handle_symbol(symbol, threshold, leverage):
         tp = entry * (1 - tp_pct)
 
     balance = get_balance_usdt()
-    qty = calc_qty(balance, entry, leverage, risk_pct)
+    qty = calc_qty(balance, entry, leverage, risk_pct, symbol)
 
     try:
         resp = place_order(symbol, signal, entry, sl, tp, qty)
