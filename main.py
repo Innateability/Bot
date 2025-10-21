@@ -8,7 +8,7 @@ from pybit.unified_trading import HTTP
 
 # ================== CONFIG ==================
 PAIRS = [
-    {"symbol": "BTCUSDT", "threshold": 0.00009, "leverage": 100},
+    {"symbol": "BTCUSDT", "threshold": 0.009, "leverage": 100},
     {"symbol": "TRXUSDT", "threshold": 0.00008, "leverage": 75}
 ]
 
