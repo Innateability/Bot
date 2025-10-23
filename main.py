@@ -8,11 +8,11 @@ from pybit.unified_trading import HTTP
 
 # ================== CONFIG ==================
 PAIRS = [
-    {"symbol": "BTCUSDT", "threshold": 0.0006, "leverage": 100},
-    {"symbol": "TRXUSDT", "threshold": 0.0006, "leverage": 75}
+    {"symbol": "BTCUSDT", "threshold": 0.006, "leverage": 100},
+    {"symbol": "TRXUSDT", "threshold": 0.006, "leverage": 75}
 ]
 
-INTERVAL = "3"  # 4H
+INTERVAL = "240"  # 4H
 ROUNDING = 5
 FALLBACK = 0.90
 RISK_NORMAL = 0.33
@@ -34,8 +34,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 # ================== GLOBAL STATE ==================
 losses_count = 0
 last_pnl = 0.0
-last_order_id = {p["symbol"]: None for p in PAIRS}   # store last order id per symbol
-last_checked_time = {p["symbol"]: 0 for p in PAIRS}  # avoid reprocessing a closed candle
+last_checked_time = {p["symbol"]: 0 for p in PAIRS}
 
 # ================== HELPERS ==================
 def now_ts():
@@ -69,17 +68,6 @@ def get_balance_usdt():
     return 0.0
 
 def calc_qty(balance, entry, leverage, risk_percentage, symbol):
-    """
-    Calculate qty using:
-      sl_dist = entry * 1%   (for quantity calculation)
-      risk_amount = balance * risk_percentage
-      qty_by_risk = risk_amount / sl_dist
-      max_affordable = (balance * leverage) / entry * FALLBACK
-      qty = min(qty_by_risk, max_affordable)
-    Rounding:
-      BTC -> floor to 0.001
-      TRX -> round to nearest whole
-    """
     sl_dist = entry * QTY_SL_DIST_PCT
     if sl_dist <= 0:
         return 0.0
@@ -87,13 +75,10 @@ def calc_qty(balance, entry, leverage, risk_percentage, symbol):
     qty_by_risk = risk_amount / sl_dist
     max_affordable = (balance * leverage) / entry * FALLBACK
     qty = min(qty_by_risk, max_affordable)
-
-    # rounding
     if "BTC" in symbol:
         qty = math.floor(qty * 1000) / 1000.0
     elif "TRX" in symbol:
         qty = round(qty)
-
     return qty
 
 def close_all_positions(symbol):
@@ -120,46 +105,47 @@ def close_all_positions(symbol):
     except Exception as e:
         logging.error(f"Error closing positions for {symbol}: {e}")
 
-# ================== UPDATED PNL + HANDLE LOGIC ==================
-def get_last_closed_pnl(symbol):
+# ================== UPDATED PNL LOGIC ==================
+def get_most_recent_pnl():
     """
-    Fetch the most recent closed PnL entry for a given symbol.
-    Returns the PnL (float) or None if not available.
+    Fetch the most recent closed PnL entry among both BTC and TRX.
+    Returns tuple: (symbol, pnl) or (None, None) if nothing found.
     """
     global last_pnl
-    try:
-        resp = session.get_closed_pnl(category="linear", symbol=symbol, limit=1)
-        if "result" in resp and "list" in resp["result"] and resp["result"]["list"]:
-            trade = resp["result"]["list"][0]
-            pnl_val = trade.get("closedPnl") or trade.get("realisedPnl") or trade.get("pnl")
-            if pnl_val is not None:
-                pnl = float(pnl_val)
-                last_pnl = pnl
-                logging.info(f"📊 Last closed PnL for {symbol}: {pnl:.8f} USDT")
-                return pnl
-        logging.info(f"🔎 No closed PnL found for {symbol}")
-        return None
-    except Exception as e:
-        logging.error(f"Error fetching last closed pnl for {symbol}: {e}")
-        return None
+    latest_trade = None
+    latest_time = 0
+    latest_symbol = None
 
+    for pair in PAIRS:
+        symbol = pair["symbol"]
+        try:
+            resp = session.get_closed_pnl(category="linear", symbol=symbol, limit=1)
+            if "result" in resp and "list" in resp["result"] and resp["result"]["list"]:
+                trade = resp["result"]["list"][0]
+                pnl_val = trade.get("closedPnl") or trade.get("realisedPnl") or trade.get("pnl")
+                time_val = int(trade.get("updatedTime") or trade.get("createdTime") or 0)
+                if pnl_val is not None and time_val > latest_time:
+                    latest_time = time_val
+                    latest_trade = float(pnl_val)
+                    latest_symbol = symbol
+        except Exception as e:
+            logging.error(f"Error fetching closed pnl for {symbol}: {e}")
 
+    if latest_symbol:
+        last_pnl = latest_trade
+        logging.info(f"📊 Most recent closed PnL: {latest_symbol} = {latest_trade:.8f} USDT")
+        return latest_symbol, latest_trade
+
+    logging.info("🔎 No closed PnL found for BTC or TRX.")
+    return None, None
+
+# ================== UPDATED HANDLE SYMBOL ==================
 def handle_symbol(symbol, threshold, leverage):
-    """
-    Process one closed candle for a symbol.
-    Steps:
-      1. Get last closed candle
-      2. Determine signal
-      3. If signal → close open positions
-      4. Check last closed trade PnL and update losses_count
-      5. Compute qty and place new order
-    """
     global losses_count
 
     raw = fetch_last_closed_raw(symbol)
     c_time = raw["time"]
 
-    # Avoid reprocessing the same candle
     if c_time == last_checked_time[symbol]:
         return False
     last_checked_time[symbol] = c_time
@@ -167,7 +153,7 @@ def handle_symbol(symbol, threshold, leverage):
     o, h, l, c = raw["o"], raw["h"], raw["l"], raw["c"]
     logging.info(f"🕒 {symbol} | O:{o:.6f} H:{h:.6f} L:{l:.6f} C:{c:.6f}")
 
-    # --- Step 1: determine if there's a signal ---
+    # Step 1: determine if there's a signal
     is_green = c > o
     is_red = c < o
     signal = None
@@ -180,23 +166,23 @@ def handle_symbol(symbol, threshold, leverage):
         logging.info(f"❌ {symbol}: No signal this candle.")
         return False
 
-    # --- Step 2: close existing open positions first ---
+    # Step 2: close existing positions
     close_all_positions(symbol)
 
-    # --- Step 3: now that positions are closed, check the most recent closed PnL ---
-    pnl = get_last_closed_pnl(symbol)
+    # Step 3: check most recent closed PnL (BTC or TRX whichever is latest)
+    latest_symbol, pnl = get_most_recent_pnl()
     if pnl is not None:
         if pnl < 0:
             losses_count += 1
-            logging.info(f"➕ Increased losses_count to {losses_count} (PnL {pnl:.8f})")
+            logging.info(f"➕ Increased losses_count to {losses_count} (PnL {pnl:.8f} from {latest_symbol})")
         elif pnl > 0:
             old = losses_count
             losses_count = max(0, losses_count - 1)
-            logging.info(f"➖ Decremented losses_count {old} → {losses_count} (PnL {pnl:.8f})")
+            logging.info(f"➖ Decremented losses_count {old} → {losses_count} (PnL {pnl:.8f} from {latest_symbol})")
     else:
-        logging.info(f"ℹ️ No closed PnL available for {symbol} (may be first run or open trade still active).")
+        logging.info("ℹ️ No closed PnL available (may be first run or no closed trades yet).")
 
-    # --- Step 4: risk and TP logic ---
+    # Step 4: risk and TP logic
     recovery_mode = losses_count > 0
     risk_pct = RISK_RECOVERY if recovery_mode else RISK_NORMAL
     tp_pct = TP_RECOVERY if recovery_mode else TP_NORMAL
@@ -209,7 +195,7 @@ def handle_symbol(symbol, threshold, leverage):
         sl = entry * (1 + SL_PCT)
         tp = entry * (1 - tp_pct)
 
-    # --- Step 5: quantity calculation ---
+    # Step 5: quantity calculation
     balance = get_balance_usdt()
     qty = calc_qty(balance, entry, leverage, risk_pct, symbol)
     logging.info(f"📐 Qty calc → balance={balance:.8f}, risk_pct={risk_pct}, qty={qty}")
@@ -218,7 +204,7 @@ def handle_symbol(symbol, threshold, leverage):
         logging.warning(f"⚠️ {symbol} computed qty <= 0, skipping order.")
         return "INSUFFICIENT" if "BTC" in symbol else False
 
-    # --- Step 6: place new market order ---
+    # Step 6: place order
     try:
         resp = place_order(symbol, signal, entry, sl, tp, qty)
         logging.info(f"📊 {symbol} | losses_count={losses_count} | mode={'RECOVERY' if recovery_mode else 'NORMAL'}")
@@ -232,10 +218,6 @@ def handle_symbol(symbol, threshold, leverage):
 
 # ================== ORDER FUNCTION ==================
 def place_order(symbol, signal, entry, sl, tp, qty):
-    """
-    Place a market order with TP/SL in single call (Bybit v5 supports takeProfit/stopLoss params).
-    Returns the API response dict or raises.
-    """
     if qty is None or qty <= 0:
         raise ValueError("qty must be > 0")
     try:
@@ -259,7 +241,6 @@ def place_order(symbol, signal, entry, sl, tp, qty):
 
 # ================== MAIN LOOP ==================
 def seconds_until_next_candle(interval_minutes):
-    """Return seconds until next candle close aligned to UTC 00:00 multiples."""
     now = datetime.now(timezone.utc)
     candle_seconds = int(interval_minutes) * 60
     seconds_into_cycle = (now.hour * 3600 + now.minute * 60 + now.second) % candle_seconds
@@ -294,4 +275,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-            
+        
