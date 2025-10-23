@@ -146,6 +146,7 @@ def handle_symbol(symbol, threshold, leverage):
     raw = fetch_last_closed_raw(symbol)
     c_time = raw["time"]
 
+    # Skip already processed candle
     if c_time == last_checked_time[symbol]:
         return False
     last_checked_time[symbol] = c_time
@@ -153,7 +154,7 @@ def handle_symbol(symbol, threshold, leverage):
     o, h, l, c = raw["o"], raw["h"], raw["l"], raw["c"]
     logging.info(f"🕒 {symbol} | O:{o:.6f} H:{h:.6f} L:{l:.6f} C:{c:.6f}")
 
-    # Step 1: determine if there's a signal
+    # Step 1: Determine if there's a valid signal
     is_green = c > o
     is_red = c < o
     signal = None
@@ -166,10 +167,11 @@ def handle_symbol(symbol, threshold, leverage):
         logging.info(f"❌ {symbol}: No signal this candle.")
         return False
 
-    # Step 2: close existing positions
-    close_all_positions(symbol)
+    # ✅ Step 2: Close all open positions (for both BTC and TRX)
+    for pair in PAIRS:
+        close_all_positions(pair["symbol"])
 
-    # Step 3: check most recent closed PnL (BTC or TRX whichever is latest)
+    # ✅ Step 3: Check most recent closed PnL (after closing all)
     latest_symbol, pnl = get_most_recent_pnl()
     if pnl is not None:
         if pnl < 0:
@@ -182,11 +184,12 @@ def handle_symbol(symbol, threshold, leverage):
     else:
         logging.info("ℹ️ No closed PnL available (may be first run or no closed trades yet).")
 
-    # Step 4: risk and TP logic
+    # Step 4: Determine mode (normal/recovery)
     recovery_mode = losses_count > 0
     risk_pct = RISK_RECOVERY if recovery_mode else RISK_NORMAL
     tp_pct = TP_RECOVERY if recovery_mode else TP_NORMAL
 
+    # Step 5: SL and TP
     entry = c
     if signal == "buy":
         sl = entry * (1 - SL_PCT)
@@ -195,7 +198,7 @@ def handle_symbol(symbol, threshold, leverage):
         sl = entry * (1 + SL_PCT)
         tp = entry * (1 - tp_pct)
 
-    # Step 5: quantity calculation
+    # Step 6: Quantity calculation
     balance = get_balance_usdt()
     qty = calc_qty(balance, entry, leverage, risk_pct, symbol)
     logging.info(f"📐 Qty calc → balance={balance:.8f}, risk_pct={risk_pct}, qty={qty}")
@@ -204,7 +207,7 @@ def handle_symbol(symbol, threshold, leverage):
         logging.warning(f"⚠️ {symbol} computed qty <= 0, skipping order.")
         return "INSUFFICIENT" if "BTC" in symbol else False
 
-    # Step 6: place order
+    # Step 7: Place order
     try:
         resp = place_order(symbol, signal, entry, sl, tp, qty)
         logging.info(f"📊 {symbol} | losses_count={losses_count} | mode={'RECOVERY' if recovery_mode else 'NORMAL'}")
@@ -215,6 +218,7 @@ def handle_symbol(symbol, threshold, leverage):
         if any(err in msg for err in ["insufficient", "not enough", "ab not enough", "not enough for new order"]):
             return "INSUFFICIENT"
         return False
+
 
 # ================== ORDER FUNCTION ==================
 def place_order(symbol, signal, entry, sl, tp, qty):
