@@ -8,19 +8,19 @@ from pybit.unified_trading import HTTP
 
 # ================== CONFIG ==================
 PAIRS = [
-    {"symbol": "BTCUSDT", "threshold": 0.009, "leverage": 100},
-    {"symbol": "TRXUSDT", "threshold": 0.008, "leverage": 75}
+    {"symbol": "BTCUSDT", "threshold": 0.006, "leverage": 100},
+    {"symbol": "TRXUSDT", "threshold": 0.006, "leverage": 75}
 ]
 
 INTERVAL = "240"  # 4H
 ROUNDING = 5
 FALLBACK = 0.90
 RISK_NORMAL = 0.33
-RISK_RECOVERY = 0.50
+RISK_RECOVERY = 0.33
 TP_NORMAL = 0.003
-TP_RECOVERY = 0.01
-SL_PCT = 0.009  # 0.9% used for trade SL
-QTY_SL_DIST_PCT = 0.01  # 1% used for qty calculation
+TP_RECOVERY = 0.007
+SL_PCT = 0.005 # 0.9% used for trade SL
+QTY_SL_DIST_PCT = 0.005 # 1% used for qty calculation
 
 API_KEY = os.getenv("BYBIT_API_KEY")
 API_SECRET = os.getenv("BYBIT_API_SECRET")
@@ -56,6 +56,7 @@ def fetch_last_closed_raw(symbol):
     }
 
 def get_balance_usdt():
+    
     """Return USDT wallet balance (or total equity fallback)."""
     resp = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
     if "result" in resp and "list" in resp["result"] and resp["result"]["list"]:
