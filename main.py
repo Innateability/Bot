@@ -8,11 +8,11 @@ from pybit.unified_trading import HTTP
 
 # ================== CONFIG ==================
 PAIRS = [
-    {"symbol": "BTCUSDT", "threshold": 0.006, "leverage": 100},
-    {"symbol": "TRXUSDT", "threshold": 0.006, "leverage": 75}
+    {"symbol": "BTCUSDT", "threshold": 0.00006, "leverage": 100},
+    {"symbol": "TRXUSDT", "threshold": 0.00006, "leverage": 75}
 ]
 
-INTERVAL = "240"  # 4H
+INTERVAL = "3"  # 4H
 ROUNDING = 5
 FALLBACK = 0.90
 RISK_NORMAL = 0.33
@@ -34,6 +34,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 # ================== GLOBAL STATE ==================
 losses_count = 0
 last_pnl = 0.0
+last_pnl_order_id = None  # 🆕 Added
 last_checked_time = {p["symbol"]: 0 for p in PAIRS}
 
 # ================== HELPERS ==================
@@ -109,12 +110,13 @@ def close_all_positions(symbol):
 def get_most_recent_pnl():
     """
     Fetch the most recent closed PnL entry among both BTC and TRX.
-    Returns tuple: (symbol, pnl) or (None, None) if nothing found.
+    Returns tuple: (symbol, pnl, order_id) or (None, None, None) if nothing found.
     """
     global last_pnl
     latest_trade = None
     latest_time = 0
     latest_symbol = None
+    latest_order_id = None
 
     for pair in PAIRS:
         symbol = pair["symbol"]
@@ -124,24 +126,26 @@ def get_most_recent_pnl():
                 trade = resp["result"]["list"][0]
                 pnl_val = trade.get("closedPnl") or trade.get("realisedPnl") or trade.get("pnl")
                 time_val = int(trade.get("updatedTime") or trade.get("createdTime") or 0)
+                order_id = trade.get("orderId")
                 if pnl_val is not None and time_val > latest_time:
                     latest_time = time_val
                     latest_trade = float(pnl_val)
                     latest_symbol = symbol
+                    latest_order_id = order_id
         except Exception as e:
             logging.error(f"Error fetching closed pnl for {symbol}: {e}")
 
     if latest_symbol:
         last_pnl = latest_trade
-        logging.info(f"📊 Most recent closed PnL: {latest_symbol} = {latest_trade:.8f} USDT")
-        return latest_symbol, latest_trade
+        logging.info(f"📊 Most recent closed PnL: {latest_symbol} = {latest_trade:.8f} USDT (orderId={latest_order_id})")
+        return latest_symbol, latest_trade, latest_order_id
 
     logging.info("🔎 No closed PnL found for BTC or TRX.")
-    return None, None
+    return None, None, None
 
 # ================== UPDATED HANDLE SYMBOL ==================
 def handle_symbol(symbol, threshold, leverage):
-    global losses_count
+    global losses_count, last_pnl_order_id
 
     raw = fetch_last_closed_raw(symbol)
     c_time = raw["time"]
@@ -172,15 +176,20 @@ def handle_symbol(symbol, threshold, leverage):
         close_all_positions(pair["symbol"])
 
     # ✅ Step 3: Check most recent closed PnL (after closing all)
-    latest_symbol, pnl = get_most_recent_pnl()
-    if pnl is not None:
-        if pnl < 0:
-            losses_count += 1
-            logging.info(f"➕ Increased losses_count to {losses_count} (PnL {pnl:.8f} from {latest_symbol})")
-        elif pnl > 0:
-            old = losses_count
-            losses_count = max(0, losses_count - 1)
-            logging.info(f"➖ Decremented losses_count {old} → {losses_count} (PnL {pnl:.8f} from {latest_symbol})")
+    latest_symbol, pnl, order_id = get_most_recent_pnl()
+
+    if pnl is not None and order_id is not None:
+        if order_id == last_pnl_order_id:
+            logging.info(f"⏩ Skipping PnL update — already processed order {order_id}")
+        else:
+            last_pnl_order_id = order_id  # 🆕 Remember this one
+            if pnl < 0:
+                losses_count += 1
+                logging.info(f"➕ Increased losses_count to {losses_count} (PnL {pnl:.8f} from {latest_symbol})")
+            elif pnl > 0:
+                old = losses_count
+                losses_count = max(0, losses_count - 1)
+                logging.info(f"➖ Decremented losses_count {old} → {losses_count} (PnL {pnl:.8f} from {latest_symbol})")
     else:
         logging.info("ℹ️ No closed PnL available (may be first run or no closed trades yet).")
 
@@ -279,4 +288,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-        
+                    
