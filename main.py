@@ -17,10 +17,10 @@ ROUNDING = 5
 FALLBACK = 0.90
 RISK_NORMAL = 0.33
 RISK_RECOVERY = 0.33
-TP_NORMAL = 0.003
+TP_NORMAL = 0.004
 TP_RECOVERY = 0.007
-SL_PCT = 0.005  # 0.9% used for trade SL
-QTY_SL_DIST_PCT = 0.005  # 1% used for qty calculation
+SL_PCT = 0.009  # 0.9% used for trade SL
+QTY_SL_DIST_PCT = 0.01 # 1% used for qty calculation
 
 API_KEY = os.getenv("BYBIT_API_KEY")
 API_SECRET = os.getenv("BYBIT_API_SECRET")
@@ -178,20 +178,6 @@ def handle_symbol(symbol, threshold, leverage):
     # ✅ Step 3: Check most recent closed PnL (after closing all)
     latest_symbol, pnl, order_id = get_most_recent_pnl()
 
-    if pnl is not None and order_id is not None:
-        if order_id == last_pnl_order_id:
-            logging.info(f"⏩ Skipping PnL update — already processed order {order_id}")
-        else:
-            last_pnl_order_id = order_id  # 🆕 Remember this one
-            if pnl < 0:
-                losses_count += 1
-                logging.info(f"➕ Increased losses_count to {losses_count} (PnL {pnl:.8f} from {latest_symbol})")
-            elif pnl > 0:
-                old = losses_count
-                losses_count = max(0, losses_count - 1)
-                logging.info(f"➖ Decremented losses_count {old} → {losses_count} (PnL {pnl:.8f} from {latest_symbol})")
-    else:
-        logging.info("ℹ️ No closed PnL available (may be first run or no closed trades yet).")
 
     # Step 4: Determine mode (normal/recovery)
     recovery_mode = losses_count > 0
