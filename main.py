@@ -19,8 +19,8 @@ RISK_NORMAL = 0.33
 RISK_RECOVERY = 0.33
 TP_NORMAL = 0.004
 TP_RECOVERY = 0.007
-SL_PCT = 0.009  # 0.9% used for trade SL
-QTY_SL_DIST_PCT = 0.01 # 1% used for qty calculation
+SL_PCT = 0.005  # 0.9% used for trade SL
+QTY_SL_DIST_PCT = 0.006 # 1% used for qty calculation
 
 API_KEY = os.getenv("BYBIT_API_KEY")
 API_SECRET = os.getenv("BYBIT_API_SECRET")
