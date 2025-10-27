@@ -158,7 +158,7 @@ def handle_symbol(symbol, threshold, leverage):
     o, h, l, c = raw["o"], raw["h"], raw["l"], raw["c"]
     logging.info(f"🕒 {symbol} | O:{o:.6f} H:{h:.6f} L:{l:.6f} C:{c:.6f}")
 
-    # Step 1: Determine if there's a valid signal
+    # Step 1: Detect confirmed signal
     is_green = c > o
     is_red = c < o
     signal = None
@@ -168,16 +168,16 @@ def handle_symbol(symbol, threshold, leverage):
         signal = "sell"
 
     if not signal:
-        logging.info(f"❌ {symbol}: No signal this candle.")
+        logging.info(f"❌ {symbol}: No confirmed signal this candle — skipping close.")
         return False
 
-    # ✅ Step 2: Close all open positions (for both BTC and TRX)
+    # ✅ Step 2: Close all open positions only when confirmed signal appears
+    logging.info(f"📉 Confirmed signal detected ({signal}) → closing all positions before entering new trade.")
     for pair in PAIRS:
         close_all_positions(pair["symbol"])
 
-    # ✅ Step 3: Check most recent closed PnL (after closing all)
+    # ✅ Step 3: Fetch most recent closed PnL after closing all
     latest_symbol, pnl, order_id = get_most_recent_pnl()
-
 
     # Step 4: Determine mode (normal/recovery)
     recovery_mode = losses_count > 0
@@ -196,11 +196,16 @@ def handle_symbol(symbol, threshold, leverage):
     # Step 6: Quantity calculation
     balance = get_balance_usdt()
     qty = calc_qty(balance, entry, leverage, risk_pct, symbol)
-    logging.info(f"📐 Qty calc → balance={balance:.8f}, risk_pct={risk_pct}, qty={qty}")
 
-    if qty <= 0:
-        logging.warning(f"⚠️ {symbol} computed qty <= 0, skipping order.")
-        return "INSUFFICIENT" if "BTC" in symbol else False
+    # ✅ Enforce minimum quantity rule
+    if "BTC" in symbol and qty < 0.001:
+        logging.warning(f"⚠️ {symbol}: qty {qty:.6f} < 0.001 → skipping trade.")
+        return False
+    if "TRX" in symbol and qty < 16:
+        logging.warning(f"⚠️ {symbol}: qty {qty:.6f} < 16 → skipping trade.")
+        return False
+
+    logging.info(f"📐 Qty calc → balance={balance:.8f}, risk_pct={risk_pct}, qty={qty}")
 
     # Step 7: Place order
     try:
