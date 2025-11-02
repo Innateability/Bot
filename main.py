@@ -3,6 +3,7 @@ import os
 import time
 import math
 import logging
+import pandas as pd
 from datetime import datetime, timezone
 from pybit.unified_trading import HTTP
 
@@ -12,20 +13,19 @@ PAIRS = [
     {"symbol": "TRXUSDT", "threshold": 0.006, "leverage": 75}
 ]
 
-INTERVAL = "240"  # 4H
+INTERVAL = "3"  # 4H
 ROUNDING = 5
 FALLBACK = 0.90
-RISK_NORMAL = 0.33
-RISK_RECOVERY = 0.33
+RISK_NORMAL = 0.1
+RISK_RECOVERY = 0.2
 TP_NORMAL = 0.004
-TP_RECOVERY = 0.007
-SL_PCT = 0.005  # 0.9% used for trade SL
-QTY_SL_DIST_PCT = 0.006 # 1% used for qty calculation
+TP_RECOVERY = 0.004
+SL_PCT = 0.005
+QTY_SL_DIST_PCT = 0.006
 
 API_KEY = os.getenv("BYBIT_API_KEY")
 API_SECRET = os.getenv("BYBIT_API_SECRET")
 
-# no testnet as requested
 session = HTTP(testnet=False, api_key=API_KEY, api_secret=API_SECRET)
 
 # ================== LOGGING ==================
@@ -34,7 +34,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 # ================== GLOBAL STATE ==================
 losses_count = 0
 last_pnl = 0.0
-last_pnl_order_id = None  # 🆕 Added
+last_pnl_order_id = None
 last_checked_time = {p["symbol"]: 0 for p in PAIRS}
 
 # ================== HELPERS ==================
@@ -42,21 +42,26 @@ def now_ts():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 def fetch_last_closed_raw(symbol):
-    """Fetch the last closed 4H candle (the second-to-last returned by API)."""
-    resp = session.get_kline(category="linear", symbol=symbol, interval=INTERVAL, limit=3)
+    """Fetch recent candles and return dataframe for EMA calculation + last closed candle."""
+    resp = session.get_kline(category="linear", symbol=symbol, interval=INTERVAL, limit=50)
     if "result" not in resp or "list" not in resp["result"]:
         raise RuntimeError(f"Bad kline response: {resp}")
-    raw = resp["result"]["list"][-2]  # second-to-last is last closed
-    return {
-        "time": int(raw[0]),
-        "o": float(raw[1]),
-        "h": float(raw[2]),
-        "l": float(raw[3]),
-        "c": float(raw[4]),
-    }
+
+    candles = resp["result"]["list"]
+    data = []
+    for c in candles:
+        data.append({
+            "time": int(c[0]),
+            "open": float(c[1]),
+            "high": float(c[2]),
+            "low": float(c[3]),
+            "close": float(c[4])
+        })
+    df = pd.DataFrame(data)
+    return df
 
 def get_balance_usdt():
-    """Return USDT wallet balance (or total equity fallback)."""
+    """Return USDT wallet balance."""
     resp = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
     if "result" in resp and "list" in resp["result"] and resp["result"]["list"]:
         try:
@@ -83,7 +88,7 @@ def calc_qty(balance, entry, leverage, risk_percentage, symbol):
     return qty
 
 def close_all_positions(symbol):
-    """Market close any open positions for symbol (non-blocking)."""
+    """Close open positions."""
     try:
         pos_resp = session.get_positions(category="linear", symbol=symbol)
         if "result" in pos_resp and "list" in pos_resp["result"]:
@@ -106,12 +111,8 @@ def close_all_positions(symbol):
     except Exception as e:
         logging.error(f"Error closing positions for {symbol}: {e}")
 
-# ================== UPDATED PNL LOGIC ==================
+# ================== PNL ==================
 def get_most_recent_pnl():
-    """
-    Fetch the most recent closed PnL entry among both BTC and TRX.
-    Returns tuple: (symbol, pnl, order_id) or (None, None, None) if nothing found.
-    """
     global last_pnl
     latest_trade = None
     latest_time = 0
@@ -143,48 +144,47 @@ def get_most_recent_pnl():
     logging.info("🔎 No closed PnL found for BTC or TRX.")
     return None, None, None
 
-# ================== UPDATED HANDLE SYMBOL ==================
+# ================== HANDLE SYMBOL ==================
 def handle_symbol(symbol, threshold, leverage):
     global losses_count, last_pnl_order_id
 
-    raw = fetch_last_closed_raw(symbol)
-    c_time = raw["time"]
+    df = fetch_last_closed_raw(symbol)
+    df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
 
-    # Skip already processed candle
+    raw = df.iloc[-2]  # last closed candle
+    c_time = raw["time"]
+    o, h, l, c = raw["open"], raw["high"], raw["low"], raw["close"]
+    ema9 = df["ema9"].iloc[-2]
+
+    logging.info(f"🕒 {symbol} | O:{o:.6f} H:{h:.6f} L:{l:.6f} C:{c:.6f} | EMA9={ema9:.6f}")
+
     if c_time == last_checked_time[symbol]:
         return False
     last_checked_time[symbol] = c_time
 
-    o, h, l, c = raw["o"], raw["h"], raw["l"], raw["c"]
-    logging.info(f"🕒 {symbol} | O:{o:.6f} H:{h:.6f} L:{l:.6f} C:{c:.6f}")
-
-    # Step 1: Detect confirmed signal
+    # Step 1: Detect signal
     is_green = c > o
     is_red = c < o
     signal = None
-    if is_green and (h - o) / o > threshold:
+    if is_green and (h - o) / o > threshold and (o > ema9 and h > ema9):
         signal = "buy"
-    elif is_red and (o - l) / o > threshold:
+    elif is_red and (o - l) / o > threshold and (o < ema9 and l < ema9):
         signal = "sell"
 
     if not signal:
-        logging.info(f"❌ {symbol}: No confirmed signal this candle — skipping close.")
+        logging.info(f"❌ {symbol}: No confirmed EMA-filtered signal — skipping.")
         return False
 
-    # ✅ Step 2: Close all open positions only when confirmed signal appears
-    logging.info(f"📉 Confirmed signal detected ({signal}) → closing all positions before entering new trade.")
+    logging.info(f"📉 Confirmed {signal.upper()} signal detected — closing all positions.")
     for pair in PAIRS:
         close_all_positions(pair["symbol"])
 
-    # ✅ Step 3: Fetch most recent closed PnL after closing all
     latest_symbol, pnl, order_id = get_most_recent_pnl()
 
-    # Step 4: Determine mode (normal/recovery)
     recovery_mode = losses_count > 0
     risk_pct = RISK_RECOVERY if recovery_mode else RISK_NORMAL
     tp_pct = TP_RECOVERY if recovery_mode else TP_NORMAL
 
-    # Step 5: SL and TP
     entry = c
     if signal == "buy":
         sl = entry * (1 - SL_PCT)
@@ -193,11 +193,9 @@ def handle_symbol(symbol, threshold, leverage):
         sl = entry * (1 + SL_PCT)
         tp = entry * (1 - tp_pct)
 
-    # Step 6: Quantity calculation
     balance = get_balance_usdt()
     qty = calc_qty(balance, entry, leverage, risk_pct, symbol)
 
-    # ✅ Enforce minimum quantity rule
     if "BTC" in symbol and qty < 0.001:
         logging.warning(f"⚠️ {symbol}: qty {qty:.6f} < 0.001 → skipping trade.")
         return False
@@ -207,7 +205,6 @@ def handle_symbol(symbol, threshold, leverage):
 
     logging.info(f"📐 Qty calc → balance={balance:.8f}, risk_pct={risk_pct}, qty={qty}")
 
-    # Step 7: Place order
     try:
         resp = place_order(symbol, signal, entry, sl, tp, qty)
         logging.info(f"📊 {symbol} | losses_count={losses_count} | mode={'RECOVERY' if recovery_mode else 'NORMAL'}")
@@ -215,33 +212,29 @@ def handle_symbol(symbol, threshold, leverage):
     except Exception as e:
         msg = str(e).lower()
         logging.error(f"❌ {symbol} order failed: {e}")
-        if any(err in msg for err in ["insufficient", "not enough", "ab not enough", "not enough for new order"]):
+        if any(err in msg for err in ["insufficient", "not enough"]):
             return "INSUFFICIENT"
         return False
 
-
-# ================== ORDER FUNCTION ==================
+# ================== ORDER ==================
 def place_order(symbol, signal, entry, sl, tp, qty):
-    if qty is None or qty <= 0:
+    if qty <= 0:
         raise ValueError("qty must be > 0")
-    try:
-        logging.info(f"🚀 {symbol} | {signal.upper()} | Entry={entry:.6f} SL={sl:.6f} TP={tp:.6f} Qty={qty}")
-        resp = session.place_order(
-            category="linear",
-            symbol=symbol,
-            side=signal.capitalize(),
-            orderType="Market",
-            qty=str(qty),
-            reduceOnly=False,
-            timeInForce="IOC",
-            takeProfit=f"{round(tp, ROUNDING)}",
-            stopLoss=f"{round(sl, ROUNDING)}",
-            positionIdx=0
-        )
-        logging.info(f"✅ {symbol} Order response: {resp}")
-        return resp
-    except Exception as e:
-        raise
+    logging.info(f"🚀 {symbol} | {signal.upper()} | Entry={entry:.6f} SL={sl:.6f} TP={tp:.6f} Qty={qty}")
+    resp = session.place_order(
+        category="linear",
+        symbol=symbol,
+        side=signal.capitalize(),
+        orderType="Market",
+        qty=str(qty),
+        reduceOnly=False,
+        timeInForce="IOC",
+        takeProfit=f"{round(tp, ROUNDING)}",
+        stopLoss=f"{round(sl, ROUNDING)}",
+        positionIdx=0
+    )
+    logging.info(f"✅ {symbol} Order response: {resp}")
+    return resp
 
 # ================== MAIN LOOP ==================
 def seconds_until_next_candle(interval_minutes):
@@ -249,9 +242,7 @@ def seconds_until_next_candle(interval_minutes):
     candle_seconds = int(interval_minutes) * 60
     seconds_into_cycle = (now.hour * 3600 + now.minute * 60 + now.second) % candle_seconds
     wait = candle_seconds - seconds_into_cycle
-    if wait <= 0:
-        wait += candle_seconds
-    return wait
+    return candle_seconds if wait <= 0 else wait
 
 def main():
     logging.info("🤖 Bot started — BTC priority, TRX fallback if insufficient funds")
@@ -269,14 +260,14 @@ def main():
                 logging.info("⚠️ BTC trade not placed or insufficient — trying TRX fallback.")
                 trx_result = handle_symbol(trx_pair["symbol"], trx_pair["threshold"], trx_pair["leverage"])
                 if trx_result == "INSUFFICIENT":
-                    logging.warning("⚠️ TRX fallback also insufficient to open a trade.")
+                    logging.warning("⚠️ TRX fallback also insufficient.")
         except KeyboardInterrupt:
-            logging.info("🛑 Stopped manually by user.")
+            logging.info("🛑 Stopped manually.")
             break
         except Exception as e:
-            logging.error(f"Unhandled error in main loop: {e}")
+            logging.error(f"Unhandled error: {e}")
             time.sleep(10)
 
 if __name__ == "__main__":
     main()
-                    
+    
