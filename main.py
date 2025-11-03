@@ -13,7 +13,7 @@ PAIRS = [
     {"symbol": "TRXUSDT", "threshold": 0.0006, "leverage": 75}
 ]
 
-INTERVAL = "3"  # 4H
+INTERVAL = "3"  # 3-minute candles
 ROUNDING = 5
 FALLBACK = 0.90
 RISK_NORMAL = 0.1
@@ -42,35 +42,37 @@ def now_ts():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 def fetch_last_closed_raw(symbol):
-    """Fetch recent candles and return dataframe for EMA calculation + last closed candle."""
-    resp = session.get_kline(category="linear", symbol=symbol, interval=INTERVAL, limit=50)
+    """Fetch recent candles, compute EMA, and return dataframe."""
+    resp = session.get_kline(category="linear", symbol=symbol, interval=INTERVAL, limit=200)
     if "result" not in resp or "list" not in resp["result"]:
         raise RuntimeError(f"Bad kline response: {resp}")
 
     candles = resp["result"]["list"]
-    data = []
-    for c in candles:
-        data.append({
-            "time": int(c[0]),
-            "open": float(c[1]),
-            "high": float(c[2]),
-            "low": float(c[3]),
-            "close": float(c[4])
-        })
-    df = pd.DataFrame(data)
+    data = [
+        {"time": int(c[0]), "open": float(c[1]), "high": float(c[2]), "low": float(c[3]), "close": float(c[4])}
+        for c in candles
+    ]
+    df = pd.DataFrame(data).sort_values("time")
+    df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
+
+    # Log every EMA for debugging
+    for _, row in df.iterrows():
+        ts = datetime.utcfromtimestamp(row["time"]/1000).strftime("%Y-%m-%d %H:%M")
+        logging.info(f"{symbol} | {ts} | Close={row['close']:.6f} | EMA9={row['ema9']:.6f}")
+
     return df
 
 def get_balance_usdt():
     """Return USDT wallet balance."""
     resp = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
-    if "result" in resp and "list" in resp["result"] and resp["result"]["list"]:
-        try:
+    try:
+        if "result" in resp and "list" in resp["result"] and resp["result"]["list"]:
             return float(resp["result"]["list"][0]["coin"][0]["walletBalance"])
+    except Exception:
+        try:
+            return float(resp["result"]["list"][0]["totalEquity"])
         except Exception:
-            try:
-                return float(resp["result"]["list"][0]["totalEquity"])
-            except Exception:
-                return 0.0
+            pass
     return 0.0
 
 def calc_qty(balance, entry, leverage, risk_percentage, symbol):
@@ -97,7 +99,7 @@ def close_all_positions(symbol):
                 side = p.get("side", "")
                 if size > 0:
                     close_side = "Sell" if side.lower() == "buy" else "Buy"
-                    logging.info(f"🔻 Closing existing {side} position on {symbol} size={size}")
+                    logging.info(f"🔻 Closing {side} position on {symbol}, size={size}")
                     session.place_order(
                         category="linear",
                         symbol=symbol,
@@ -109,7 +111,7 @@ def close_all_positions(symbol):
                     )
                     time.sleep(1)
     except Exception as e:
-        logging.error(f"Error closing positions for {symbol}: {e}")
+        logging.error(f"Error closing {symbol} positions: {e}")
 
 # ================== PNL ==================
 def get_most_recent_pnl():
@@ -134,14 +136,14 @@ def get_most_recent_pnl():
                     latest_symbol = symbol
                     latest_order_id = order_id
         except Exception as e:
-            logging.error(f"Error fetching closed pnl for {symbol}: {e}")
+            logging.error(f"Error fetching PnL for {symbol}: {e}")
 
     if latest_symbol:
         last_pnl = latest_trade
-        logging.info(f"📊 Most recent closed PnL: {latest_symbol} = {latest_trade:.8f} USDT (orderId={latest_order_id})")
+        logging.info(f"📊 Latest PnL: {latest_symbol} = {latest_trade:.8f} (orderId={latest_order_id})")
         return latest_symbol, latest_trade, latest_order_id
 
-    logging.info("🔎 No closed PnL found for BTC or TRX.")
+    logging.info("🔎 No closed PnL found.")
     return None, None, None
 
 # ================== HANDLE SYMBOL ==================
@@ -149,9 +151,7 @@ def handle_symbol(symbol, threshold, leverage):
     global losses_count, last_pnl_order_id
 
     df = fetch_last_closed_raw(symbol)
-    df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
-
-    raw = df.iloc[-2]  # last closed candle
+    raw = df.iloc[-2]
     c_time = raw["time"]
     o, h, l, c = raw["open"], raw["high"], raw["low"], raw["close"]
     ema9 = df["ema9"].iloc[-2]
@@ -162,25 +162,22 @@ def handle_symbol(symbol, threshold, leverage):
         return False
     last_checked_time[symbol] = c_time
 
-    # Step 1: Detect signal
-    is_green = c > o
-    is_red = c < o
+    # Signal detection
     signal = None
-    if is_green and (h - o) / o > threshold and (o > ema9 and h > ema9):
+    if c > o and (h - o) / o >= threshold and o > ema9 and h > ema9:
         signal = "buy"
-    elif is_red and (o - l) / o > threshold and (o < ema9 and l < ema9):
+    elif c < o and (o - l) / o >= threshold and o < ema9 and l < ema9:
         signal = "sell"
 
     if not signal:
-        logging.info(f"❌ {symbol}: No confirmed EMA-filtered signal — skipping.")
+        logging.info(f"❌ {symbol}: No EMA-filtered signal — skipping.")
         return False
 
-    logging.info(f"📉 Confirmed {signal.upper()} signal detected — closing all positions.")
+    logging.info(f"📉 {symbol}: Confirmed {signal.upper()} — closing all positions.")
     for pair in PAIRS:
         close_all_positions(pair["symbol"])
 
-    latest_symbol, pnl, order_id = get_most_recent_pnl()
-
+    _, pnl, _ = get_most_recent_pnl()
     recovery_mode = losses_count > 0
     risk_pct = RISK_RECOVERY if recovery_mode else RISK_NORMAL
     tp_pct = TP_RECOVERY if recovery_mode else TP_NORMAL
@@ -196,25 +193,13 @@ def handle_symbol(symbol, threshold, leverage):
     balance = get_balance_usdt()
     qty = calc_qty(balance, entry, leverage, risk_pct, symbol)
 
-    if "BTC" in symbol and qty < 0.001:
-        logging.warning(f"⚠️ {symbol}: qty {qty:.6f} < 0.001 → skipping trade.")
-        return False
-    if "TRX" in symbol and qty < 16:
-        logging.warning(f"⚠️ {symbol}: qty {qty:.6f} < 16 → skipping trade.")
+    if ("BTC" in symbol and qty < 0.001) or ("TRX" in symbol and qty < 16):
+        logging.warning(f"⚠️ {symbol}: qty too low → skipping trade.")
         return False
 
-    logging.info(f"📐 Qty calc → balance={balance:.8f}, risk_pct={risk_pct}, qty={qty}")
-
-    try:
-        resp = place_order(symbol, signal, entry, sl, tp, qty)
-        logging.info(f"📊 {symbol} | losses_count={losses_count} | mode={'RECOVERY' if recovery_mode else 'NORMAL'}")
-        return True
-    except Exception as e:
-        msg = str(e).lower()
-        logging.error(f"❌ {symbol} order failed: {e}")
-        if any(err in msg for err in ["insufficient", "not enough"]):
-            return "INSUFFICIENT"
-        return False
+    logging.info(f"📐 Qty calc → balance={balance:.4f}, risk={risk_pct}, qty={qty}")
+    place_order(symbol, signal, entry, sl, tp, qty)
+    return True
 
 # ================== ORDER ==================
 def place_order(symbol, signal, entry, sl, tp, qty):
@@ -233,7 +218,7 @@ def place_order(symbol, signal, entry, sl, tp, qty):
         stopLoss=f"{round(sl, ROUNDING)}",
         positionIdx=0
     )
-    logging.info(f"✅ {symbol} Order response: {resp}")
+    logging.info(f"✅ Order placed: {resp}")
     return resp
 
 # ================== MAIN LOOP ==================
@@ -257,12 +242,12 @@ def main():
 
             btc_result = handle_symbol(btc_pair["symbol"], btc_pair["threshold"], btc_pair["leverage"])
             if btc_result == "INSUFFICIENT" or btc_result is False:
-                logging.info("⚠️ BTC trade not placed or insufficient — trying TRX fallback.")
+                logging.info("⚠️ BTC skipped — trying TRX fallback.")
                 trx_result = handle_symbol(trx_pair["symbol"], trx_pair["threshold"], trx_pair["leverage"])
                 if trx_result == "INSUFFICIENT":
                     logging.warning("⚠️ TRX fallback also insufficient.")
         except KeyboardInterrupt:
-            logging.info("🛑 Stopped manually.")
+            logging.info("🛑 Bot stopped manually.")
             break
         except Exception as e:
             logging.error(f"Unhandled error: {e}")
