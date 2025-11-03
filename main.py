@@ -20,8 +20,8 @@ RISK_NORMAL = 0.1
 RISK_RECOVERY = 0.2
 TP_NORMAL = 0.004
 TP_RECOVERY = 0.004
-SL_PCT = 0.009  # 0.9% Stop loss
-QTY_SL_DIST_PCT = 0.009  # matches SL distance for sizing
+SL_PCT = 0.005
+QTY_SL_DIST_PCT = 0.006
 
 API_KEY = os.getenv("BYBIT_API_KEY")
 API_SECRET = os.getenv("BYBIT_API_SECRET")
@@ -42,7 +42,7 @@ def now_ts():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 def fetch_last_closed_raw(symbol):
-    """Fetch recent candles, compute EMA9, return df."""
+    """Fetch recent candles, compute EMA, and return dataframe."""
     resp = session.get_kline(category="linear", symbol=symbol, interval=INTERVAL, limit=200)
     if "result" not in resp or "list" not in resp["result"]:
         raise RuntimeError(f"Bad kline response: {resp}")
@@ -55,7 +55,7 @@ def fetch_last_closed_raw(symbol):
     df = pd.DataFrame(data).sort_values("time")
     df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
 
-    # Only log last candle's EMA
+    # Log last closed candle's EMA for observability
     ts = datetime.utcfromtimestamp(df.iloc[-2]["time"] / 1000).strftime("%Y-%m-%d %H:%M")
     logging.info(f"{symbol} | {ts} | Close={df.iloc[-2]['close']:.6f} | EMA9={df.iloc[-2]['ema9']:.6f}")
 
@@ -89,6 +89,7 @@ def calc_qty(balance, entry, leverage, risk_percentage, symbol):
     return qty
 
 def close_all_positions(symbol):
+    """Close open positions."""
     try:
         pos_resp = session.get_positions(category="linear", symbol=symbol)
         if "result" in pos_resp and "list" in pos_resp["result"]:
@@ -152,14 +153,15 @@ def handle_symbol(symbol, threshold, leverage):
     raw = df.iloc[-2]
     c_time = raw["time"]
     o, h, l, c = raw["open"], raw["high"], raw["low"], raw["close"]
+    ema9 = df["ema9"].iloc[-2]
 
-    logging.info(f"🕒 {symbol} | O:{o:.6f} H:{h:.6f} L:{l:.6f} C:{c:.6f}")
+    logging.info(f"🕒 {symbol} | O:{o:.6f} H:{h:.6f} L:{l:.6f} C:{c:.6f} | EMA9={ema9:.6f}")
 
     if c_time == last_checked_time[symbol]:
         return False
     last_checked_time[symbol] = c_time
 
-    # Signal detection
+    # Signal detection (raw)
     signal = None
     if c > o and (h - o) / o >= threshold:
         signal = "buy"
@@ -167,8 +169,20 @@ def handle_symbol(symbol, threshold, leverage):
         signal = "sell"
 
     if not signal:
-        logging.info(f"❌ {symbol}: No signal — skipping.")
+        logging.info(f"❌ {symbol}: No raw signal — skipping.")
         return False
+
+    # EMA confirmation step
+    if signal == "buy":
+        if not (o > ema9 and h > ema9):
+            logging.info(f"❌ {symbol}: Buy rejected by EMA9 (open or high not above EMA9). Open={o:.6f}, High={h:.6f}, EMA9={ema9:.6f}")
+            return False
+        logging.info(f"✅ {symbol}: Buy confirmed by EMA9 (open & high above EMA9).")
+    else:  # sell
+        if not (o < ema9 and l < ema9):
+            logging.info(f"❌ {symbol}: Sell rejected by EMA9 (open or low not below EMA9). Open={o:.6f}, Low={l:.6f}, EMA9={ema9:.6f}")
+            return False
+        logging.info(f"✅ {symbol}: Sell confirmed by EMA9 (open & low below EMA9).")
 
     logging.info(f"📉 {symbol}: Confirmed {signal.upper()} — closing all positions.")
     for pair in PAIRS:
