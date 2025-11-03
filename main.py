@@ -9,8 +9,8 @@ from pybit.unified_trading import HTTP
 
 # ================== CONFIG ==================
 PAIRS = [
-    {"symbol": "BTCUSDT", "threshold": 0.008, "leverage": 100},
-    {"symbol": "TRXUSDT", "threshold": 0.008, "leverage": 75}
+    {"symbol": "BTCUSDT", "threshold": 0.0006, "leverage": 100},
+    {"symbol": "TRXUSDT", "threshold": 0.0006, "leverage": 75}
 ]
 
 INTERVAL = "3"  # 3-minute candles
