@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-import os
+import os.
 import time
 import math
 import logging
 from datetime import datetime, timezone
 from pybit.unified_trading import HTTP
+import pandas 
 
 # ================== CONFIG (editable) ==================
 PAIRS = [
-    {"symbol": "BTCUSDT", "threshold": 0.006, "leverage": 100},
-    {"symbol": "TRXUSDT", "threshold": 0.006, "leverage": 75}
+    {"symbol": "BTCUSDT", "threshold": 0.0006, "leverage": 100},
+    {"symbol": "TRXUSDT", "threshold": 0.0006, "leverage": 75}
 ]
 
-INTERVAL = "240"                # timeframe in minutes as string (e.g. "3", "240")
+INTERVAL = "3"                # timeframe in minutes as string (e.g. "3", "240")
 ROUNDING = 5                  # decimals for TP/SL display
 FALLBACK = 0.90               # fallback percentage for affordability
 RISK_NORMAL = 0.1             # risk % of balance in normal mode
@@ -21,7 +22,8 @@ TP_NORMAL = 0.004             # normal TP pct (as fraction)
 TP_RECOVERY = 0.004           # recovery TP pct (as fraction)
 SL_PCT = 0.005                # stop loss percent used when placing trades (0.5% default)
 QTY_SL_DIST_PCT = 0.006       # percent used to compute SL distance for qty calculation (0.6%)
-EMA_LOOKBACK = 20            # how many closes to request (>=9) — small number to reduce payload
+EMA_LOOKBACK = 20
+EMA_PERIOD = 9 # how many closes to request (>=9) — small number to reduce payload
 
 API_KEY = os.getenv("BYBIT_API_KEY")
 API_SECRET = os.getenv("BYBIT_API_SECRET")
@@ -42,48 +44,54 @@ last_checked_time = {p["symbol"]: 0 for p in PAIRS}
 def now_ts():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-def fetch_candles_and_ema(symbol, interval=INTERVAL, limit=EMA_LOOKBACK):
+def fetch_candles_and_ema(symbol, interval=INTERVAL, limit=200):
     """
-    Fetch recent candles (limit) and compute EMA9 from closes.
-    Returns (last_closed, ema9, closes_list)
-      - last_closed: dict with keys time, o,h,l,c (last closed candle = second-to-last returned)
-      - ema9: float
-      - closes: list of closes used
+    Fetch candles from Bybit and calculate EMA using pandas, exactly like the standalone EMA logger.
+    Returns last closed candle data and EMA value.
     """
-    resp = session.get_kline(category="linear", symbol=symbol, interval=interval, limit=limit)
-    if "result" not in resp or "list" not in resp["result"]:
-        raise RuntimeError(f"Bad kline response: {resp}")
-    candles = resp["result"]["list"]
-    if len(candles) < 9:
-        raise RuntimeError(f"Not enough candles for EMA9: got {len(candles)} for {symbol}")
+    try:
+        resp = session.get_kline(category="linear", symbol=symbol, interval=interval, limit=limit)
+        candles = resp["result"]["list"]
 
-    # API returns newest first sometimes — ensure chronological order
-    # Each item: [open_time, open, high, low, close, ...]
-    # Convert to chronological list
-    candles = list(reversed(candles))
+        data = [
+            {
+                "time": int(c[0]),
+                "open": float(c[1]),
+                "high": float(c[2]),
+                "low": float(c[3]),
+                "close": float(c[4])
+            }
+            for c in candles
+        ]
 
-    closes = [float(c[4]) for c in candles]
-    # EMA9 calculation (standard): k = 2/(N+1)
-    period = 9
-    k = 2 / (period + 1)
-    # first EMA seed: SMA of first 'period' closes
-    seed = sum(closes[:period]) / period
-    ema = seed
-    for price in closes[period:]:
-        ema = (price * k) + (ema * (1 - k))
+        df = pd.DataFrame(data).sort_values("time").reset_index(drop=True)
+        ema = calculate_ema(df["close"], EMA_PERIOD)
 
-    # last closed candle is the second-to-last in the original API order (we reversed)
-    # because the last in candles is the current partial candle.
-    last_closed_raw = candles[-2]
-    last_closed = {
-        "time": int(last_closed_raw[0]),
-        "o": float(last_closed_raw[1]),
-        "h": float(last_closed_raw[2]),
-        "l": float(last_closed_raw[3]),
-        "c": float(last_closed_raw[4]),
-    }
+        last_raw = df.iloc[-2]     # last fully closed candle
+        last_ema = float(ema.iloc[-2])
 
-    return last_closed, ema, closes
+        logging.info("=" * 60)
+        logging.info(f"🕒 Candle Time: {pd.to_datetime(last_raw['time'], unit='ms')}")
+        logging.info(f"RAW: O={last_raw['open']}, H={last_raw['high']}, L={last_raw['low']}, C={last_raw['close']}")
+        logging.info(f"EMA{EMA_PERIOD}: {last_ema}")
+        logging.info("=" * 60)
+
+        return {
+            "time": int(last_raw["time"]),
+            "o": last_raw["open"],
+            "h": last_raw["high"],
+            "l": last_raw["low"],
+            "c": last_raw["close"],
+            "ema": last_ema
+        }
+
+    except Exception as e:
+        logging.error(f"Error fetching candles or EMA for {symbol}: {e}")
+        raise
+
+def calculate_ema(series, period):
+    """Calculate EMA using pandas like the EMA logger."""
+    return series.ewm(span=period, adjust=False).mean()
 
 def get_balance_usdt():
     """Return USDT wallet balance (or total equity fallback)."""
@@ -236,7 +244,8 @@ def handle_symbol(symbol, threshold, leverage):
     global losses_count
 
     # 1) candles + ema
-    last_closed, ema9, closes = fetch_candles_and_ema(symbol)
+    last_closed = fetch_candles_and_ema(symbol)
+    ema9 = last_closed["ema"]
     ts = datetime.utcfromtimestamp(last_closed["time"]/1000).strftime("%Y-%m-%d %H:%M")
     o, h, l, c = last_closed["o"], last_closed["h"], last_closed["l"], last_closed["c"]
     logging.info(f"{symbol} | {ts} | Close={c:.8f} | EMA9={ema9:.8f}")
