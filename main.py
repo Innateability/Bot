@@ -5,7 +5,7 @@ import math
 import logging
 from datetime import datetime, timezone
 from pybit.unified_trading import HTTP
-import pandas 
+import pandas as pd
 
 # ================== CONFIG (editable) ==================
 PAIRS = [
