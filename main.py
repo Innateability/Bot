@@ -4,7 +4,6 @@ import time
 import math
 import logging
 from datetime import datetime, timezone
-import pandas as pd
 from pybit.unified_trading import HTTP
 
 # ================== CONFIG (editable) ==================
@@ -14,19 +13,20 @@ PAIRS = [
 ]
 
 INTERVAL = "3"                # timeframe in minutes as string (e.g. "3", "240")
-ROUNDING = 5
-FALLBACK = 0.90
-RISK_NORMAL = 0.1
-RISK_RECOVERY = 0.2
-TP_NORMAL = 0.004
-TP_RECOVERY = 0.004
-SL_PCT = 0.005
-QTY_SL_DIST_PCT = 0.006
-EMA_LOOKBACK = 20
+ROUNDING = 5                  # decimals for TP/SL display
+FALLBACK = 0.90               # fallback percentage for affordability
+RISK_NORMAL = 0.1             # risk % of balance in normal mode
+RISK_RECOVERY = 0.2           # risk % of balance in recovery mode
+TP_NORMAL = 0.004             # normal TP pct (as fraction)
+TP_RECOVERY = 0.004           # recovery TP pct (as fraction)
+SL_PCT = 0.005                # stop loss percent used when placing trades (0.5% default)
+QTY_SL_DIST_PCT = 0.006       # percent used to compute SL distance for qty calculation (0.6%)
+EMA_LOOKBACK = 200            # how many closes to request (>=9) — small number to reduce payload
 
 API_KEY = os.getenv("BYBIT_API_KEY")
 API_SECRET = os.getenv("BYBIT_API_SECRET")
 
+# no testnet as requested
 session = HTTP(testnet=False, api_key=API_KEY, api_secret=API_SECRET)
 
 # ================== LOGGING ==================
@@ -42,6 +42,25 @@ last_checked_time = {p["symbol"]: 0 for p in PAIRS}
 def now_ts():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
+def fetch_candles_and_ema(symbol, interval=INTERVAL, limit=EMA_LOOKBACK):
+    resp = session.get_kline(category="linear", symbol=symbol, interval=interval, limit=limit)
+    candles = list(reversed(resp["result"]["list"]))
+    closes = [float(c[4]) for c in candles]
+    
+    # TradingView-accurate EMA using pandas
+    import pandas as pd
+    ema_series = pd.Series(closes).ewm(span=9, adjust=False).mean()
+    ema9 = ema_series.iloc[-2]  # last closed EMA
+
+    last_closed_raw = candles[-2]
+    last_closed = {
+        "time": int(last_closed_raw[0]),
+        "o": float(last_closed_raw[1]),
+        "h": float(last_closed_raw[2]),
+        "l": float(last_closed_raw[3]),
+        "c": float(last_closed_raw[4]),
+    }
+    return last_closed, ema9, closes
 
 def get_balance_usdt():
     """Return USDT wallet balance (or total equity fallback)."""
@@ -61,52 +80,15 @@ def get_balance_usdt():
                     pass
     except Exception as e:
         logging.error(f"Error fetching balance: {e}")
-
     logging.info("💰 Wallet balance fetched: 0.0 USDT (fallback)")
     return 0.0
 
-
-def fetch_candles_and_ema(symbol, interval=INTERVAL, limit=EMA_LOOKBACK):
-    """
-    Fetch recent candles and compute EMA9 from closes using pandas.
-    Returns (last_closed, ema9, closes_list)
-    """
-    resp = session.get_kline(category="linear", symbol=symbol, interval=interval, limit=limit)
-    if "result" not in resp or "list" not in resp["result"]:
-        raise RuntimeError(f"Bad kline response: {resp}")
-    candles = resp["result"]["list"]
-
-    if len(candles) < 9:
-        raise RuntimeError(f"Not enough candles for EMA9: got {len(candles)} for {symbol}")
-
-    candles = list(reversed(candles))
-    data = [
-        {
-            "time": int(c[0]),
-            "open": float(c[1]),
-            "high": float(c[2]),
-            "low": float(c[3]),
-            "close": float(c[4]),
-        }
-        for c in candles
-    ]
-    df = pd.DataFrame(data)
-    ema_series = df["close"].ewm(span=9, adjust=False).mean()
-    last_closed = df.iloc[-2]
-    ema_value = ema_series.iloc[-2]
-
-    last_closed_dict = {
-        "time": int(last_closed["time"]),
-        "o": last_closed["open"],
-        "h": last_closed["high"],
-        "l": last_closed["low"],
-        "c": last_closed["close"],
-    }
-
-    return last_closed_dict, ema_value, df["close"].tolist()
-
-
 def calc_qty(balance, entry, leverage, risk_percentage, symbol):
+    """
+    Uses QTY_SL_DIST_PCT to compute SL distance for qty_by_risk,
+    max_affordable = (balance * leverage) / entry * FALLBACK
+    Rounds BTC to 0.001 downward, TRX to integer.
+    """
     sl_dist = entry * QTY_SL_DIST_PCT
     if sl_dist <= 0:
         return 0.0
@@ -120,8 +102,10 @@ def calc_qty(balance, entry, leverage, risk_percentage, symbol):
         qty = round(qty)
     return qty
 
-
 def place_order(symbol, signal, entry, sl, tp, qty):
+    """
+    Place market order and save last_order_id.
+    """
     global last_order_id
     if qty is None or qty <= 0:
         raise ValueError("qty must be > 0")
@@ -140,17 +124,23 @@ def place_order(symbol, signal, entry, sl, tp, qty):
             positionIdx=0
         )
         logging.info(f"✅ Order response: {resp}")
-        if isinstance(resp, dict) and "result" in resp and resp["result"].get("orderId"):
-            last_order_id = resp["result"]["orderId"]
-            logging.info(f"🆔 Saved last_order_id = {last_order_id}")
+        try:
+            if isinstance(resp, dict) and "result" in resp and resp["result"].get("orderId"):
+                last_order_id = resp["result"]["orderId"]
+                logging.info(f"🆔 Saved last_order_id = {last_order_id}")
+        except Exception:
+            pass
         return resp
     except Exception as e:
         logging.error(f"Error placing order on {symbol}: {e}")
         raise
 
-
 # ================== PNL retrieval ==================
 def get_pnl_for_order(order_id, symbol, search_limit=50):
+    """
+    Look up closed pnl entries and search for the provided order_id.
+    Returns pnl float if found, else None.
+    """
     try:
         resp = session.get_closed_pnl(category="linear", symbol=symbol, limit=search_limit)
         if "result" in resp and "list" in resp["result"] and resp["result"]["list"]:
@@ -163,9 +153,13 @@ def get_pnl_for_order(order_id, symbol, search_limit=50):
         logging.error(f"Error fetching closed pnl for order_id {order_id} on {symbol}: {e}")
     return None
 
-
 def get_most_recent_pnl_across_pairs():
+    """
+    If last_order_id exists, try to fetch PnL for that order.
+    Otherwise fallback to finding the latest closed trade across pairs and return (symbol, pnl, order_id).
+    """
     global last_pnl, last_order_id
+    # If we have a saved last_order_id, try to fetch its pnl first (preferred).
     if last_order_id:
         for pair in PAIRS:
             p = pair["symbol"]
@@ -176,7 +170,11 @@ def get_most_recent_pnl_across_pairs():
                 return p, pnl, last_order_id
         logging.info("⚠️ last_order_id present but not found in recent closed pnl lists.")
 
-    latest_trade, latest_time, latest_symbol, latest_order = None, 0, None, None
+    # Fallback: find the most recent closed pnl across both pairs
+    latest_trade = None
+    latest_time = 0
+    latest_symbol = None
+    latest_order = None
     for pair in PAIRS:
         symbol = pair["symbol"]
         try:
@@ -202,20 +200,30 @@ def get_most_recent_pnl_across_pairs():
     logging.info("🔎 No closed PnL found for BTC or TRX.")
     return None, None, None
 
-
 # ================== CORE LOGIC ==================
 def handle_symbol(symbol, threshold, leverage):
+    """
+    1) Fetch last closed candle + EMA9
+    2) Determine raw signal (green/red and distance threshold)
+    3) EMA9 confirmation: buy => open & high > EMA9; sell => open & low < EMA9
+    4) Close positions, fetch PnL (from last_order_id preferred), adjust losses_count
+    5) Compute qty (using QTY_SL_DIST_PCT) and enforce min qty rules
+    6) Place market order and log details
+    """
     global losses_count
 
+    # 1) candles + ema
     last_closed, ema9, closes = fetch_candles_and_ema(symbol)
     ts = datetime.utcfromtimestamp(last_closed["time"]/1000).strftime("%Y-%m-%d %H:%M")
     o, h, l, c = last_closed["o"], last_closed["h"], last_closed["l"], last_closed["c"]
     logging.info(f"{symbol} | {ts} | Close={c:.8f} | EMA9={ema9:.8f}")
 
+    # skip if same candle already processed
     if last_closed["time"] == last_checked_time[symbol]:
         return False
     last_checked_time[symbol] = last_closed["time"]
 
+    # 2) raw signal detection
     signal = None
     if c > o and (h - o) / o >= threshold:
         signal = "buy"
@@ -226,18 +234,21 @@ def handle_symbol(symbol, threshold, leverage):
         logging.info(f"❌ {symbol}: No raw signal — skipping.")
         return False
 
+    # 3) EMA confirmation
     if signal == "buy":
         if not (o > ema9 and h > ema9):
-            logging.info(f"❌ {symbol}: Buy rejected by EMA9.")
+            logging.info(f"❌ {symbol}: Buy rejected by EMA9 — Open={o:.8f}, High={h:.8f}, EMA9={ema9:.8f}")
             return False
-        logging.info(f"✅ {symbol}: Buy confirmed by EMA9.")
+        logging.info(f"✅ {symbol}: Buy confirmed by EMA9 (Open & High above EMA9).")
     else:
         if not (o < ema9 and l < ema9):
-            logging.info(f"❌ {symbol}: Sell rejected by EMA9.")
+            logging.info(f"❌ {symbol}: Sell rejected by EMA9 — Open={o:.8f}, Low={l:.8f}, EMA9={ema9:.8f}")
             return False
-        logging.info(f"✅ {symbol}: Sell confirmed by EMA9.")
+        logging.info(f"✅ {symbol}: Sell confirmed by EMA9 (Open & Low below EMA9).")
 
-    logging.info(f"📉 {symbol}: Confirmed {signal.upper()} signal → closing all positions.")
+    # 4) Close positions and check PnL
+    logging.info(f"📉 {symbol}: Confirmed {signal.upper()} signal → closing all positions before new trade.")
+    # close all pairs' positions (per your previous logic)
     for p in PAIRS:
         try:
             pos_resp = session.get_positions(category="linear", symbol=p["symbol"])
@@ -247,6 +258,7 @@ def handle_symbol(symbol, threshold, leverage):
                     side = pos.get("side", "")
                     if size > 0:
                         close_side = "Sell" if side.lower() == "buy" else "Buy"
+                        logging.info(f"🔻 Closing {side} position on {p['symbol']} size={size}")
                         session.place_order(
                             category="linear",
                             symbol=p["symbol"],
@@ -258,15 +270,24 @@ def handle_symbol(symbol, threshold, leverage):
                         )
                         time.sleep(1)
         except Exception as e:
-            logging.error(f"Error closing positions for {p['symbol']}: {e}")
+            logging.error(f"Error while closing positions for {p['symbol']}: {e}")
 
+    # fetch pnl (prefer last_order_id)
     latest_symbol, pnl, order_id = get_most_recent_pnl_across_pairs()
     if pnl is not None:
         if pnl < 0:
             losses_count += 1
+            logging.info(f"➕ Increased losses_count to {losses_count} (PnL loss {pnl:.8f})")
         elif pnl > 0:
+            old = losses_count
             losses_count = max(0, losses_count - 1)
+            logging.info(f"➖ Decremented losses_count {old} → {losses_count} (PnL gain {pnl:.8f})")
+        else:
+            logging.info(f"🔁 losses_count unchanged ({losses_count}) PnL={pnl:.8f}")
+    else:
+        logging.info("🔎 No PnL retrieved (no recent closed trade). losses_count unchanged.")
 
+    # 5) build trade params
     recovery_mode = losses_count > 0
     risk_pct = RISK_RECOVERY if recovery_mode else RISK_NORMAL
     tp_pct = TP_RECOVERY if recovery_mode else TP_NORMAL
@@ -282,15 +303,33 @@ def handle_symbol(symbol, threshold, leverage):
     balance = get_balance_usdt()
     qty = calc_qty(balance, entry, leverage, risk_pct, symbol)
 
+    # minimum qty enforcement
     if "BTC" in symbol and qty < 0.001:
+        logging.warning(f"⚠️ {symbol}: qty {qty:.6f} < 0.001 → skipping trade.")
         return False
     if "TRX" in symbol and qty < 1:
+        # user previously used 16 as min; making it 1 here so smaller balances can attempt trade.
+        # change to 16 if you prefer strict minimum.
+        logging.warning(f"⚠️ {symbol}: qty {qty:.6f} < 1 → skipping trade.")
         return False
 
-    logging.info(f"📊 Preparing order → Entry={entry:.8f} SL={sl:.8f} TP={tp:.8f}")
-    return place_order(symbol, signal, entry, sl, tp, qty)
+    # log trade details
+    logging.info(f"📐 Qty calc → balance={balance:.8f}, risk_pct={risk_pct}, qty={qty:.6f}")
+    logging.info(f"📊 Preparing order → Entry={entry:.8f} SL={sl:.8f} TP={tp:.8f} (mode={'RECOVERY' if recovery_mode else 'NORMAL'})")
 
+    # 6) place order
+    try:
+        resp = place_order(symbol, signal, entry, sl, tp, qty)
+        return True
+    except Exception as e:
+        msg = str(e).lower()
+        logging.error(f"❌ {symbol} order failed: {e}")
+        if any(x in msg for x in ["insufficient", "not enough", "minimum", "exceeds minimum"]):
+            logging.warning(f"⚠️ {symbol} trade insufficient or minimum error.")
+            return "INSUFFICIENT"
+        return False
 
+# ================== SCHEDULER ==================
 def seconds_until_next_candle(interval_minutes):
     now = datetime.now(timezone.utc)
     candle_seconds = int(interval_minutes) * 60
@@ -299,7 +338,6 @@ def seconds_until_next_candle(interval_minutes):
     if wait <= 0:
         wait += candle_seconds
     return wait
-
 
 def main():
     logging.info("🤖 Bot started — BTC priority, TRX fallback if insufficient funds")
@@ -314,6 +352,7 @@ def main():
 
             btc_result = handle_symbol(btc_pair["symbol"], btc_pair["threshold"], btc_pair["leverage"])
             if btc_result == "INSUFFICIENT" or btc_result is False:
+                logging.info("⚠️ BTC skipped or insufficient — trying TRX fallback.")
                 trx_result = handle_symbol(trx_pair["symbol"], trx_pair["threshold"], trx_pair["leverage"])
                 if trx_result == "INSUFFICIENT":
                     logging.warning("⚠️ TRX fallback also insufficient.")
@@ -324,6 +363,6 @@ def main():
             logging.error(f"Unhandled error in main loop: {e}")
             time.sleep(5)
 
-
 if __name__ == "__main__":
     main()
+
