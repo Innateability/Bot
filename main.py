@@ -8,11 +8,11 @@ from pybit.unified_trading import HTTP
 
 # ================== CONFIG (editable) ==================
 PAIRS = [
-    {"symbol": "BTCUSDT", "threshold": 0.0006, "leverage": 100},
-    {"symbol": "TRXUSDT", "threshold": 0.0006, "leverage": 75}
+    {"symbol": "BTCUSDT", "threshold": 0.006, "leverage": 100},
+    {"symbol": "TRXUSDT", "threshold": 0.006, "leverage": 75}
 ]
 
-INTERVAL = "3"                # timeframe in minutes as string (e.g. "3", "240")
+INTERVAL = "240"                # timeframe in minutes as string (e.g. "3", "240")
 ROUNDING = 5                  # decimals for TP/SL display
 FALLBACK = 0.90               # fallback percentage for affordability
 RISK_NORMAL = 0.1             # risk % of balance in normal mode
