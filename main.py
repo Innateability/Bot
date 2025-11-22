@@ -359,15 +359,23 @@ def main():
             logging.info(f"⏳ Waiting {wait}s for next {INTERVAL}m candle close...")
             time.sleep(wait + 1)
 
-            btc_pair = next(p for p in PAIRS if p["symbol"] == "BTCUSDT")
-            trx_pair = next(p for p in PAIRS if p["symbol"] == "TRXUSDT")
-
+            btc_pair = next((p for p in PAIRS if p["symbol"] == "BTCUSDT"), None)
+            trx_pair = next((p for p in PAIRS if p["symbol"] == "TRXUSDT"), None)
+            if not btc_pair:
+                logging.error("BTCUSDT pair missing from PAIRS — cannot continue.")
+                return  # stop the bot
+            if not trx_pair:
+                logging.warning("TRXUSDT pair missing from PAIRS — TRX fallback disabled.")
+                
             btc_result = handle_symbol(btc_pair["symbol"], btc_pair["threshold"], btc_pair["leverage"])
             if btc_result == "INSUFFICIENT" or btc_result is False:
-                logging.info("⚠️ BTC skipped or insufficient — trying TRX fallback.")
-                trx_result = handle_symbol(trx_pair["symbol"], trx_pair["threshold"], trx_pair["leverage"])
-                if trx_result == "INSUFFICIENT":
-                    logging.warning("⚠️ TRX fallback also insufficient.")
+                if trx_pair:  # only fallback if trx_pair exists
+                    logging.info("⚠️ BTC skipped or insufficient — trying TRX fallback.")
+                    trx_result = handle_symbol(trx_pair["symbol"], trx_pair["threshold"], trx_pair["leverage"])
+                    if trx_result == "INSUFFICIENT":
+                        logging.warning("⚠️ TRX fallback also insufficient.")
+                else:
+                    logging.warning("⚠️ TRX fallback disabled — TRXUSDT not in PAIRS.")
         except KeyboardInterrupt:
             logging.info("🛑 Stopped manually by user.")
             break
