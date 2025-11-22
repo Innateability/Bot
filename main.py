@@ -5,23 +5,23 @@ import math
 import logging
 from datetime import datetime, timezone
 from pybit.unified_trading import HTTP
+import pandas as pd  # moved import here for clarity
 
 # ================== CONFIG (editable) ==================
-PAIRS = [
-    {"symbol": "BTCUSDT", "threshold": 0.006, "leverage": 100},
-    {"symbol": "TRXUSDT", "threshold": 0.006, "leverage": 75}
-]
 
-INTERVAL = "240"                # timeframe in minutes as string (e.g. "3", "240")
-ROUNDING = 5                  # decimals for TP/SL display
-FALLBACK = 0.90               # fallback percentage for affordability
-RISK_NORMAL = 0.1             # risk % of balance in normal mode
-RISK_RECOVERY = 0.2           # risk % of balance in recovery mode
-TP_NORMAL = 0.004             # normal TP pct (as fraction)
-TP_RECOVERY = 0.004           # recovery TP pct (as fraction)
-SL_PCT = 0.005                # stop loss percent used when placing trades (0.5% default)
-QTY_SL_DIST_PCT = 0.006       # percent used to compute SL distance for qty calculation (0.6%)
-EMA_LOOKBACK = 200            # how many closes to request (>=9) — small number to reduce payload
+PAIRS = [
+    {"symbol": "BTCUSDT", "threshold": 0.006, "leverage": 100}
+]
+INTERVAL = "240"           # timeframe in minutes as string (e.g. "3", "240")
+ROUNDING = 5               # decimals for TP/SL display
+FALLBACK = 0.90            # fallback percentage for affordability
+RISK_NORMAL = 0.1          # risk % of balance in normal mode
+RISK_RECOVERY = 0.2        # risk % of balance in recovery mode
+TP_NORMAL = 0.004          # normal TP pct (as fraction)
+TP_RECOVERY = 0.004        # recovery TP pct (as fraction)
+SL_PCT = 0.005             # stop loss percent used when placing trades (0.5% default)
+QTY_SL_DIST_PCT = 0.006    # percent used to compute SL distance for qty calculation (0.6%)
+EMA_LOOKBACK = 200         # how many closes to request (>=9)
 
 API_KEY = os.getenv("BYBIT_API_KEY")
 API_SECRET = os.getenv("BYBIT_API_SECRET")
@@ -30,25 +30,28 @@ API_SECRET = os.getenv("BYBIT_API_SECRET")
 session = HTTP(testnet=False, api_key=API_KEY, api_secret=API_SECRET)
 
 # ================== LOGGING ==================
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 
 # ================== GLOBAL STATE ==================
+
 losses_count = 0
 last_pnl = 0.0
 last_order_id = None
 last_checked_time = {p["symbol"]: 0 for p in PAIRS}
 
 # ================== HELPERS ==================
+
 def now_ts():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
 
 def fetch_candles_and_ema(symbol, interval=INTERVAL, limit=EMA_LOOKBACK):
     resp = session.get_kline(category="linear", symbol=symbol, interval=interval, limit=limit)
     candles = list(reversed(resp["result"]["list"]))
     closes = [float(c[4]) for c in candles]
-    
+
     # TradingView-accurate EMA using pandas
-    import pandas as pd
     ema_series = pd.Series(closes).ewm(span=9, adjust=False).mean()
     ema9 = ema_series.iloc[-2]  # last closed EMA
 
@@ -61,6 +64,7 @@ def fetch_candles_and_ema(symbol, interval=INTERVAL, limit=EMA_LOOKBACK):
         "c": float(last_closed_raw[4]),
     }
     return last_closed, ema9, closes
+
 
 def get_balance_usdt():
     """Return USDT wallet balance (or total equity fallback)."""
@@ -80,8 +84,10 @@ def get_balance_usdt():
                     pass
     except Exception as e:
         logging.error(f"Error fetching balance: {e}")
+
     logging.info("💰 Wallet balance fetched: 0.0 USDT (fallback)")
     return 0.0
+
 
 def calc_qty(balance, entry, leverage, risk_percentage, symbol):
     """
@@ -101,6 +107,7 @@ def calc_qty(balance, entry, leverage, risk_percentage, symbol):
     elif "TRX" in symbol:
         qty = round(qty)
     return qty
+
 
 def place_order(symbol, signal, entry, sl, tp, qty):
     """
@@ -135,7 +142,9 @@ def place_order(symbol, signal, entry, sl, tp, qty):
         logging.error(f"Error placing order on {symbol}: {e}")
         raise
 
+
 # ================== PNL retrieval ==================
+
 def get_pnl_for_order(order_id, symbol, search_limit=50):
     """
     Look up closed pnl entries and search for the provided order_id.
@@ -152,6 +161,7 @@ def get_pnl_for_order(order_id, symbol, search_limit=50):
     except Exception as e:
         logging.error(f"Error fetching closed pnl for order_id {order_id} on {symbol}: {e}")
     return None
+
 
 def get_most_recent_pnl_across_pairs():
     """
@@ -200,21 +210,23 @@ def get_most_recent_pnl_across_pairs():
     logging.info("🔎 No closed PnL found for BTC or TRX.")
     return None, None, None
 
+
 # ================== CORE LOGIC ==================
+
 def handle_symbol(symbol, threshold, leverage):
     """
     1) Fetch last closed candle + EMA9
     2) Determine raw signal (green/red and distance threshold)
-    3) EMA9 confirmation: buy => open & high > EMA9; sell => open & low < EMA9
-    4) Close positions, fetch PnL (from last_order_id preferred), adjust losses_count
-    5) Compute qty (using QTY_SL_DIST_PCT) and enforce min qty rules
+    3) EMA9 confirmation
+    4) Close positions, fetch PnL, adjust losses_count
+    5) Compute qty and enforce min qty
     6) Place market order and log details
     """
     global losses_count
 
     # 1) candles + ema
     last_closed, ema9, closes = fetch_candles_and_ema(symbol)
-    ts = datetime.utcfromtimestamp(last_closed["time"]/1000).strftime("%Y-%m-%d %H:%M")
+    ts = datetime.utcfromtimestamp(last_closed["time"] / 1000).strftime("%Y-%m-%d %H:%M")
     o, h, l, c = last_closed["o"], last_closed["h"], last_closed["l"], last_closed["c"]
     logging.info(f"{symbol} | {ts} | Close={c:.8f} | EMA9={ema9:.8f}")
 
@@ -236,19 +248,18 @@ def handle_symbol(symbol, threshold, leverage):
 
     # 3) EMA confirmation
     if signal == "buy":
-        if not (o > ema9 and h > ema9):
-            logging.info(f"❌ {symbol}: Buy rejected by EMA9 — Open={o:.8f}, High={h:.8f}, EMA9={ema9:.8f}")
+        if not (c > ema9):
+            logging.info(f"❌ {symbol}: Buy rejected — Close={c:.8f} not above EMA9={ema9:.8f}")
             return False
-        logging.info(f"✅ {symbol}: Buy confirmed by EMA9 (Open & High above EMA9).")
+        logging.info(f"✅ {symbol}: Buy confirmed → Close above EMA9.")
     else:
-        if not (o < ema9 and l < ema9):
-            logging.info(f"❌ {symbol}: Sell rejected by EMA9 — Open={o:.8f}, Low={l:.8f}, EMA9={ema9:.8f}")
+        if not (c < ema9):
+            logging.info(f"❌ {symbol}: Sell rejected — Close={c:.8f} not below EMA9={ema9:.8f}")
             return False
-        logging.info(f"✅ {symbol}: Sell confirmed by EMA9 (Open & Low below EMA9).")
+        logging.info(f"✅ {symbol}: Sell confirmed → Close below EMA9.")
 
     # 4) Close positions and check PnL
     logging.info(f"📉 {symbol}: Confirmed {signal.upper()} signal → closing all positions before new trade.")
-    # close all pairs' positions (per your previous logic)
     for p in PAIRS:
         try:
             pos_resp = session.get_positions(category="linear", symbol=p["symbol"])
@@ -272,7 +283,7 @@ def handle_symbol(symbol, threshold, leverage):
         except Exception as e:
             logging.error(f"Error while closing positions for {p['symbol']}: {e}")
 
-    # fetch pnl (prefer last_order_id)
+    # fetch pnl
     latest_symbol, pnl, order_id = get_most_recent_pnl_across_pairs()
     if pnl is not None:
         if pnl < 0:
@@ -308,8 +319,6 @@ def handle_symbol(symbol, threshold, leverage):
         logging.warning(f"⚠️ {symbol}: qty {qty:.6f} < 0.001 → skipping trade.")
         return False
     if "TRX" in symbol and qty < 1:
-        # user previously used 16 as min; making it 1 here so smaller balances can attempt trade.
-        # change to 16 if you prefer strict minimum.
         logging.warning(f"⚠️ {symbol}: qty {qty:.6f} < 1 → skipping trade.")
         return False
 
@@ -329,7 +338,9 @@ def handle_symbol(symbol, threshold, leverage):
             return "INSUFFICIENT"
         return False
 
+
 # ================== SCHEDULER ==================
+
 def seconds_until_next_candle(interval_minutes):
     now = datetime.now(timezone.utc)
     candle_seconds = int(interval_minutes) * 60
@@ -338,6 +349,7 @@ def seconds_until_next_candle(interval_minutes):
     if wait <= 0:
         wait += candle_seconds
     return wait
+
 
 def main():
     logging.info("🤖 Bot started — BTC priority, TRX fallback if insufficient funds")
@@ -363,6 +375,6 @@ def main():
             logging.error(f"Unhandled error in main loop: {e}")
             time.sleep(5)
 
+
 if __name__ == "__main__":
     main()
-
