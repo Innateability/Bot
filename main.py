@@ -106,7 +106,7 @@ def calc_qty(balance, entry, leverage, risk_percentage, symbol):
         qty = math.floor(qty * 1000) / 1000.0
     elif "TRX" in symbol:
         qty = round(qty)
-    return qty
+    return max(qty,0.001)
 
 
 def place_order(symbol, signal, entry, sl, tp, qty):
