@@ -103,7 +103,7 @@ def calc_qty(balance, entry, leverage, risk_percentage, symbol):
     max_affordable = (balance * leverage) / entry * FALLBACK if entry > 0 else 0.0
     qty = min(qty_by_risk, max_affordable)
     if "BTC" in symbol:
-        qty = math.floor(qty * 1000) / 1000.0
+        qty = math.ceil(qty * 1000) / 1000.0
     elif "TRX" in symbol:
         qty = round(qty)
     return max(qty,0.001)
