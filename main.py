@@ -15,8 +15,8 @@ PAIRS = [
 INTERVAL = "240"           # timeframe in minutes as string (e.g. "3", "240")
 ROUNDING = 5               # decimals for TP/SL display
 FALLBACK = 0.90            # fallback percentage for affordability
-RISK_NORMAL = 0.1          # risk % of balance in normal mode
-RISK_RECOVERY = 0.2        # risk % of balance in recovery mode
+RISK_NORMAL = 0.2          # risk % of balance in normal mode
+RISK_RECOVERY = 0.4        # risk % of balance in recovery mode
 TP_NORMAL = 0.004          # normal TP pct (as fraction)
 TP_RECOVERY = 0.004        # recovery TP pct (as fraction)
 SL_PCT = 0.005             # stop loss percent used when placing trades (0.5% default)
@@ -302,13 +302,18 @@ def handle_symbol(symbol, threshold, leverage):
     recovery_mode = losses_count > 0
     risk_pct = RISK_RECOVERY if recovery_mode else RISK_NORMAL
     tp_pct = TP_RECOVERY if recovery_mode else TP_NORMAL
-
+    
+    SL_BUFFER_PCT = 0.0001
+    
     entry = c
+    
     if signal == "buy":
-        sl = entry * (1 - SL_PCT)
+    # place SL slightly below the sequence low
+        sl = last_closed["l"] * (1 - SL_BUFFER_PCT)
         tp = entry * (1 + tp_pct)
     else:
-        sl = entry * (1 + SL_PCT)
+    # place SL slightly above the sequence high
+        sl = last_closed["h"] * (1 + SL_BUFFER_PCT)
         tp = entry * (1 - tp_pct)
 
     balance = get_balance_usdt()
