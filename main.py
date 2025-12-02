@@ -329,7 +329,7 @@ def handle_symbol(symbol, threshold, leverage):
         tp = entry * (1 - tp_pct)
 
     balance = get_balance_usdt()
-    qty =  calc_qty(balance, entry, sl, leverage, risk_percentage, symbol)
+    qty =  calc_qty(balance, entry, sl, leverage, risk_pct, symbol)
     # minimum qty enforcement
     if "BTC" in symbol and qty < 0.001:
         logging.warning(f"⚠️ {symbol}: qty {qty:.6f} < 0.001 → skipping trade.")
