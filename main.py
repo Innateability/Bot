@@ -89,24 +89,36 @@ def get_balance_usdt():
     return 0.0
 
 
-def calc_qty(balance, entry, leverage, risk_percentage, symbol):
+def calc_qty(balance, entry, sl, leverage, risk_percentage, symbol):
     """
-    Uses QTY_SL_DIST_PCT to compute SL distance for qty_by_risk,
+    QTY is calculated using the REAL stop-loss distance = abs(entry - sl)
     max_affordable = (balance * leverage) / entry * FALLBACK
-    Rounds BTC to 0.001 downward, TRX to integer.
+    Rounds BTC to nearest 0.001 (UP), TRX to whole number.
     """
-    sl_dist = entry * QTY_SL_DIST_PCT
+    sl_dist = abs(entry - sl)
     if sl_dist <= 0:
         return 0.0
+
+    # How much money we are willing to lose
     risk_amount = balance * risk_percentage
+
+    # Quantity based on risk
     qty_by_risk = risk_amount / sl_dist
+
+    # Maximum quantity the account can open
     max_affordable = (balance * leverage) / entry * FALLBACK if entry > 0 else 0.0
+
+    # Choose the smaller of the two
     qty = min(qty_by_risk, max_affordable)
+
+    # Rounding rules
     if "BTC" in symbol:
+        # Round UP to nearest 0.001
         qty = math.ceil(qty * 1000) / 1000.0
     elif "TRX" in symbol:
         qty = round(qty)
-    return max(qty,0.001)
+
+    return max(qty, 0.001)
 
 
 def place_order(symbol, signal, entry, sl, tp, qty):
@@ -317,8 +329,7 @@ def handle_symbol(symbol, threshold, leverage):
         tp = entry * (1 - tp_pct)
 
     balance = get_balance_usdt()
-    qty = calc_qty(balance, entry, leverage, risk_pct, symbol)
-
+    qty =  calc_qty(balance, entry, sl, leverage, risk_percentage, symbol)
     # minimum qty enforcement
     if "BTC" in symbol and qty < 0.001:
         logging.warning(f"⚠️ {symbol}: qty {qty:.6f} < 0.001 → skipping trade.")
