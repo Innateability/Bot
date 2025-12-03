@@ -322,12 +322,11 @@ def handle_symbol(symbol, threshold, leverage):
     if signal == "buy":
     # place SL slightly below the sequence low
         sl = last_closed["l"] * (1 - SL_BUFFER_PCT)
-        tp = entry * (1 + tp_pct)
+        tp = (entry * 1.0011) + (abs(entry - sl)/2)
     else:
     # place SL slightly above the sequence high
         sl = last_closed["h"] * (1 + SL_BUFFER_PCT)
-        tp = entry * (1 - tp_pct)
-
+        tp = (entry * 0.9989) - (abs(entry - sl)/2)
     balance = get_balance_usdt()
     qty =  calc_qty(balance, entry, sl, leverage, risk_pct, symbol)
     # minimum qty enforcement
