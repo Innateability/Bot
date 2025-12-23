@@ -10,7 +10,7 @@ import pandas as pd  # moved import here for clarity
 # ================== CONFIG (editable) ==================
 
 PAIRS = [
-    {"symbol": "BTCUSDT", "threshold": 0.006, "leverage": 100}
+    {"symbol": "BTCUSDT", "threshold": 0.00006, "leverage": 100}
 ]
 INTERVAL = "3"           # timeframe in minutes as string (e.g. "3", "240")
 ROUNDING = 5               # decimals for TP/SL display
@@ -336,11 +336,11 @@ def handle_symbol(symbol, threshold, leverage):
     if signal == "buy":
     # place SL slightly below the sequence low
         sl = last_closed["l"]
-        tp = entry + max((entry - sl) / 2, entry * 0.004)
+        tp = entry + max((entry - sl) / 2, entry * 0.0004)
     else:
     # place SL slightly above the sequence high
         sl = last_closed["h"]
-        tp = entry - max((sl - entry) / 2, entry * 0.004)
+        tp = entry - max((sl - entry) / 2, entry * 0.0004)
 
     sl_hit = (
         (signal == "buy" and nl <= sl) or
@@ -354,10 +354,10 @@ def handle_symbol(symbol, threshold, leverage):
         
         if reverse_signal == "buy":
             sl = next_closed["l"]
-            tp = entry + max((entry - sl) / 2, entry * 0.004)
+            tp = entry + max((entry - sl) / 2, entry * 0.0004)
         else:
             sl = next_closed["h"]
-            tp = entry - max((sl - entry) / 2, entry * 0.004)
+            tp = entry - max((sl - entry) / 2, entry * 0.0004)
             
         balance = get_balance_usdt()
         qty = calc_qty(balance, entry, sl, leverage, RISK_NORMAL, symbol)
