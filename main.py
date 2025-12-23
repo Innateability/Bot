@@ -333,7 +333,7 @@ def handle_symbol(symbol, threshold, leverage):
     
     entry = last_closed["c"]
     
-    if signal == "buy":
+    if signal == "sell":
     # place SL slightly below the sequence low
         sl = last_closed["l"]
         tp = entry + max((entry - sl) / 2, entry * 0.0004)
@@ -352,7 +352,7 @@ def handle_symbol(symbol, threshold, leverage):
       
         entry = next_closed["c"]
         
-        if reverse_signal == "buy":
+        if reverse_signal == "sell":
             sl = next_closed["l"]
             tp = entry + max((entry - sl) / 2, entry * 0.0004)
         else:
