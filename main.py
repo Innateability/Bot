@@ -1,4 +1,4 @@
-!/usr/bin/env python3
+#!/usr/bin/env python3
 import os
 import time
 import math
@@ -12,7 +12,7 @@ import pandas as pd  # moved import here for clarity
 PAIRS = [
     {"symbol": "BTCUSDT", "threshold": 0.006, "leverage": 100}
 ]
-INTERVAL = "240"           # timeframe in minutes as string (e.g. "3", "240")
+INTERVAL = "3"           # timeframe in minutes as string (e.g. "3", "240")
 ROUNDING = 5               # decimals for TP/SL display
 FALLBACK = 0.90            # fallback percentage for affordability
 RISK_NORMAL = 0.2          # risk % of balance in normal mode
@@ -21,7 +21,8 @@ TP_NORMAL = 0.004          # normal TP pct (as fraction)
 TP_RECOVERY = 0.004        # recovery TP pct (as fraction)
 SL_PCT = 0.005             # stop loss percent used when placing trades (0.5% default)
 QTY_SL_DIST_PCT = 0.006    # percent used to compute SL distance for qty calculation (0.6%)
-EMA_LOOKBACK = 200         # how many closes to request (>=9)
+EMA_LOOKBACK = 200      
+recovery_mode = False  # add this near the top of the file# how many closes to request (>=9)
 
 API_KEY = os.getenv("BYBIT_API_KEY")
 API_SECRET = os.getenv("BYBIT_API_SECRET")
@@ -63,7 +64,15 @@ def fetch_candles_and_ema(symbol, interval=INTERVAL, limit=EMA_LOOKBACK):
         "l": float(last_closed_raw[3]),
         "c": float(last_closed_raw[4]),
     }
-    return last_closed, ema9, closes
+    prev_closed_raw = candles[-3]
+
+    prev_closed = {
+        "o": float(prev_closed_raw[1]),
+        "h": float(prev_closed_raw[2]),
+        "l": float(prev_closed_raw[3]),
+        "c": float(prev_closed_raw[4]),
+    }
+    return last_closed, prev_closed, ema9
 
 
 def get_balance_usdt():
@@ -237,7 +246,7 @@ def handle_symbol(symbol, threshold, leverage):
     global losses_count
 
     # 1) candles + ema
-    last_closed, ema9, closes = fetch_candles_and_ema(symbol)
+    last_closed, prev_closed, ema9 = fetch_candles_and_ema(symbol)
     ts = datetime.utcfromtimestamp(last_closed["time"] / 1000).strftime("%Y-%m-%d %H:%M")
     o, h, l, c = last_closed["o"], last_closed["h"], last_closed["l"], last_closed["c"]
     logging.info(f"{symbol} | {ts} | Close={c:.8f} | EMA9={ema9:.8f}")
@@ -248,10 +257,33 @@ def handle_symbol(symbol, threshold, leverage):
     last_checked_time[symbol] = last_closed["time"]
 
     # 2) raw signal detection
+    po, ph, pl, pc = (
+    prev_closed["o"],
+    prev_closed["h"],
+    prev_closed["l"],
+    prev_closed["c"],
+    )
+    
     signal = None
-    if c > o and (h - o) / o >= threshold:
+
+# BUY
+    if (
+        c > o and                       # green candle
+        pc > po and                     # previous candle green
+        (h - o) / o >= threshold and    # ≥ 0.4% strength
+        (h - o) > (ph - po) and         # stronger than previous
+        c > ema9
+    ):
         signal = "buy"
-    elif c < o and (o - l) / o >= threshold:
+
+# SELL
+    elif (
+        c < o and                       # red candle
+        pc < po and                     # previous candle red
+        (o - l) / o >= threshold and    # ≥ 0.4% strength
+        (o - l) > (po - pl) and         # stronger than previous
+        c < ema9
+    ):
         signal = "sell"
 
     if not signal:
@@ -294,7 +326,41 @@ def handle_symbol(symbol, threshold, leverage):
                         time.sleep(1)
         except Exception as e:
             logging.error(f"Error while closing positions for {p['symbol']}: {e}")
+    
+    next_closed, _, _ = fetch_candles_and_ema(symbol)
+    nh = next_closed["h"]
+    nl = next_closed["l"]
+    
+    entry = last_closed["c"]
+    
+    if signal == "buy":
+    # place SL slightly below the sequence low
+        sl = last_closed["l"]
+        tp = entry + max((entry - sl) / 2, entry * 0.004)
+    else:
+    # place SL slightly above the sequence high
+        sl = last_closed["h"]
+        tp = entry - max((sl - entry) / 2, entry * 0.004)
 
+    sl_hit = (
+        (signal == "buy" and nl <= sl) or
+        (signal == "sell" and nh >= sl)
+    )
+    if sl_hit:
+        logging.warning("🔥 SL hit on next candle — reversing trade")
+        reverse_signal = "sell" if signal == "buy" else "buy"
+      
+        entry = next_closed["c"]
+        
+        if reverse_signal == "buy":
+            sl = next_closed["l"]
+            tp = entry + max((entry - sl) / 2, entry * 0.004)
+        else:
+            sl = next_closed["h"]
+            tp = entry - max((sl - entry) / 2, entry * 0.004)
+            
+        balance = get_balance_usdt()
+        qty = calc_qty(balance, entry, sl, leverage, RISK_NORMAL, symbol)
     # fetch pnl
     latest_symbol, pnl, order_id = get_most_recent_pnl_across_pairs()
     if pnl is not None:
@@ -311,22 +377,12 @@ def handle_symbol(symbol, threshold, leverage):
         logging.info("🔎 No PnL retrieved (no recent closed trade). losses_count unchanged.")
 
     # 5) build trade params
-    recovery_mode = losses_count > 0
-    risk_pct = RISK_RECOVERY if recovery_mode else RISK_NORMAL
-    tp_pct = TP_RECOVERY if recovery_mode else TP_NORMAL
+    risk_pct = RISK_NORMAL
     
-    SL_BUFFER_PCT = 0.0001
     
-    entry = c
     
-    if signal == "buy":
-    # place SL slightly below the sequence low
-        sl = last_closed["l"] * (1 - SL_BUFFER_PCT)
-        tp = (entry * 1.0011) + (abs(entry - sl)/2)
-    else:
-    # place SL slightly above the sequence high
-        sl = last_closed["h"] * (1 + SL_BUFFER_PCT)
-        tp = (entry * 0.9989) - (abs(entry - sl)/2)
+    
+    
     balance = get_balance_usdt()
     qty =  calc_qty(balance, entry, sl, leverage, risk_pct, symbol)
     # minimum qty enforcement
@@ -401,3 +457,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
