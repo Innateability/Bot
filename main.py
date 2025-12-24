@@ -10,12 +10,12 @@ import pandas as pd  # moved import here for clarity
 # ================== CONFIG (editable) ==================
 
 PAIRS = [
-    {"symbol": "BTCUSDT", "threshold": 0.00006, "leverage": 100}
+    {"symbol": "BTCUSDT", "threshold": 0.006, "leverage": 100}
 ]
-INTERVAL = "3"           # timeframe in minutes as string (e.g. "3", "240")
+INTERVAL = "240"           # timeframe in minutes as string (e.g. "3", "240")
 ROUNDING = 5               # decimals for TP/SL display
 FALLBACK = 0.90            # fallback percentage for affordability
-RISK_NORMAL = 0.01         # risk % of balance in normal mode
+RISK_NORMAL = 0.2         # risk % of balance in normal mode
 RISK_RECOVERY = 0.4        # risk % of balance in recovery mode
 TP_NORMAL = 0.004          # normal TP pct (as fraction)
 TP_RECOVERY = 0.004        # recovery TP pct (as fraction)
@@ -385,11 +385,11 @@ def handle_symbol(symbol, threshold, leverage):
     
     if signal == "buy":
         sl = last_closed["l"]
-        tp = entry + max((entry - sl) / 2, entry * 0.0004)
+        tp = entry + max((entry - sl) / 2, entry * 0.004)
         
     else:  # sell
         sl = last_closed["h"]
-        tp = entry - max((sl - entry) / 2, entry * 0.0004)
+        tp = entry - max((sl - entry) / 2, entry * 0.004)
         
     balance = get_balance_usdt()
     qty =  calc_qty(balance, entry, sl, leverage, risk_pct, symbol)
