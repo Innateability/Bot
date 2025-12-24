@@ -40,6 +40,7 @@ losses_count = 0
 last_pnl = 0.0
 last_order_id = None
 last_checked_time = {p["symbol"]: 0 for p in PAIRS}
+pending_sl_check = {}
 
 # ================== HELPERS ==================
 
@@ -245,6 +246,41 @@ def handle_symbol(symbol, threshold, leverage):
     """
     global losses_count
 
+    # 🔁 Check SL hit from previous candle's trade
+    if symbol in pending_sl_check:
+        state = pending_sl_check[symbol]
+
+        last_closed, _, _ = fetch_candles_and_ema(symbol)
+        nh = last_closed["h"]
+        nl = last_closed["l"]
+
+        sl_hit = (
+            (state["signal"] == "buy" and nl <= state["sl"]) or
+            (state["signal"] == "sell" and nh >= state["sl"])
+        )
+
+        if sl_hit:
+            logging.warning("🔥 SL hit on next candle — reversing trade")
+
+            signal = "sell" if state["signal"] == "buy" else "buy"
+            entry = last_closed["c"]
+
+            if signal == "buy":
+                sl = last_closed["l"]
+                tp = entry + max((entry - sl) / 2, entry * 0.004)
+            else:
+                sl = last_closed["h"]
+                tp = entry - max((sl - entry) / 2, entry * 0.004)
+
+            balance = get_balance_usdt()
+            qty = calc_qty(balance, entry, sl, leverage, RISK_NORMAL, symbol)
+
+            del pending_sl_check[symbol]
+            place_order(symbol, signal, entry, sl, tp, qty)
+            return True
+        else:
+            # SL not hit → clear check
+            del pending_sl_check[symbol]
     # 1) candles + ema
     last_closed, prev_closed, ema9 = fetch_candles_and_ema(symbol)
     ts = datetime.utcfromtimestamp(last_closed["time"] / 1000).strftime("%Y-%m-%d %H:%M")
@@ -327,40 +363,6 @@ def handle_symbol(symbol, threshold, leverage):
         except Exception as e:
             logging.error(f"Error while closing positions for {p['symbol']}: {e}")
     
-    next_closed, _, _ = fetch_candles_and_ema(symbol)
-    nh = next_closed["h"]
-    nl = next_closed["l"]
-    
-    entry = last_closed["c"]
-    
-    if signal == "sell":
-    # place SL slightly below the sequence low
-        sl = last_closed["l"]
-        tp = entry + max((entry - sl) / 2, entry * 0.0004)
-    else:
-    # place SL slightly above the sequence high
-        sl = last_closed["h"]
-        tp = entry - max((sl - entry) / 2, entry * 0.0004)
-
-    sl_hit = (
-        (signal == "buy" and nl <= sl) or
-        (signal == "sell" and nh >= sl)
-    )
-    if sl_hit:
-        logging.warning("🔥 SL hit on next candle — reversing trade")
-        reverse_signal = "sell" if signal == "buy" else "buy"
-      
-        entry = next_closed["c"]
-        
-        if reverse_signal == "sell":
-            sl = next_closed["l"]
-            tp = entry + max((entry - sl) / 2, entry * 0.0004)
-        else:
-            sl = next_closed["h"]
-            tp = entry - max((sl - entry) / 2, entry * 0.0004)
-            
-        balance = get_balance_usdt()
-        qty = calc_qty(balance, entry, sl, leverage, RISK_NORMAL, symbol)
     # fetch pnl
     latest_symbol, pnl, order_id = get_most_recent_pnl_across_pairs()
     if pnl is not None:
@@ -378,11 +380,7 @@ def handle_symbol(symbol, threshold, leverage):
 
     # 5) build trade params
     risk_pct = RISK_NORMAL
-    
-    
-    
-    
-    
+
     balance = get_balance_usdt()
     qty =  calc_qty(balance, entry, sl, leverage, risk_pct, symbol)
     # minimum qty enforcement
@@ -400,6 +398,11 @@ def handle_symbol(symbol, threshold, leverage):
     # 6) place order
     try:
         resp = place_order(symbol, signal, entry, sl, tp, qty)
+        pending_sl_check[symbol] = {
+            "signal": signal,
+            "sl": sl,
+            "leverage": leverage
+        }
         return True
     except Exception as e:
         msg = str(e).lower()
@@ -457,4 +460,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
     
