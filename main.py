@@ -380,7 +380,17 @@ def handle_symbol(symbol, threshold, leverage):
 
     # 5) build trade params
     risk_pct = RISK_NORMAL
-
+    
+    entry = last_closed["c"]
+    
+    if signal == "buy":
+        sl = last_closed["l"]
+        tp = entry + max((entry - sl) / 2, entry * 0.0004)
+        
+    else:  # sell
+        sl = last_closed["h"]
+        tp = entry - max((sl - entry) / 2, entry * 0.0004)
+        
     balance = get_balance_usdt()
     qty =  calc_qty(balance, entry, sl, leverage, risk_pct, symbol)
     # minimum qty enforcement
