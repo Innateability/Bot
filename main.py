@@ -15,8 +15,8 @@ PAIRS = [
 INTERVAL = "240"           # timeframe in minutes as string (e.g. "3", "240")
 ROUNDING = 5               # decimals for TP/SL display
 FALLBACK = 0.90            # fallback percentage for affordability
-RISK_NORMAL = 0.2         # risk % of balance in normal mode
-RISK_RECOVERY = 0.4        # risk % of balance in recovery mode
+RISK_NORMAL = 0.1         # risk % of balance in normal mode
+RISK_RECOVERY = 0.1        # risk % of balance in recovery mode
 TP_NORMAL = 0.004          # normal TP pct (as fraction)
 TP_RECOVERY = 0.004        # recovery TP pct (as fraction)
 SL_PCT = 0.005             # stop loss percent used when placing trades (0.5% default)
@@ -274,7 +274,15 @@ def handle_symbol(symbol, threshold, leverage):
 
             balance = get_balance_usdt()
             qty = calc_qty(balance, entry, sl, leverage, RISK_NORMAL, symbol)
-
+          
+            expected_loss = abs(entry - sl) * qty
+            max_allowed_loss = balance * 0.30
+            if expected_loss > max_allowed_loss:
+                logging.warning(
+                    f"🚫 {symbol}: Expected SL loss {expected_loss:.6f} USDT "
+                    f"exceeds 30% of balance ({max_allowed_loss:.6f}). Skipping trade."
+                )
+                return False
             del pending_sl_check[symbol]
             place_order(symbol, signal, entry, sl, tp, qty)
             return True
@@ -393,6 +401,17 @@ def handle_symbol(symbol, threshold, leverage):
         
     balance = get_balance_usdt()
     qty =  calc_qty(balance, entry, sl, leverage, risk_pct, symbol)
+
+    expected_loss = abs(entry - sl) * qty
+    max_allowed_loss = balance * 0.30
+    
+    if expected_loss > max_allowed_loss:
+        logging.warning(
+            f"🚫 {symbol}: Expected SL loss {expected_loss:.6f} USDT "
+            f"exceeds 30% of balance ({max_allowed_loss:.6f}). Skipping trade."
+        )
+        return False
+        
     # minimum qty enforcement
     if "BTC" in symbol and qty < 0.001:
         logging.warning(f"⚠️ {symbol}: qty {qty:.6f} < 0.001 → skipping trade.")
